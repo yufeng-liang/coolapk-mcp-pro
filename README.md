@@ -168,7 +168,18 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 └── LICENSE             # MIT（承自上游）
 ```
 
-agent 侧使用指南（何时用酷安搜资料、话题映射表、风控礼仪）见 [skills/coolapk-research/SKILL.md](../skills/coolapk-research/SKILL.md)。
+agent 侧使用指南（何时用酷安搜资料、话题映射表、风控礼仪）见 [skills/coolapk-research/SKILL.md](skills/coolapk-research/SKILL.md)。
+
+## 参与贡献
+
+众人拾柴火焰高，欢迎大家提 PR 一起完善！无论是新工具、话题映射表补充、风控经验，还是文档纠错，都欢迎。
+
+1. Fork 本仓并创建特性分支；
+2. 保持纯只读定位——任何写操作（点赞 / 回复 / 关注 / 发帖）的改动不会被接受；
+3. 提交前跑通冒烟：`.venv\Scripts\coolapk search "Magisk"` 与 `python -m coolapk_mcp.server` 可正常启动；
+4. 注释与 commit message 用中文，遵循现有代码风格。
+
+发现酷安接口或风控行为有变化也欢迎开 Issue 反馈实测记录。
 
 ## 许可
 
