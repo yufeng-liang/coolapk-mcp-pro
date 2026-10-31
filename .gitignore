@@ -2,3 +2,7 @@ __pycache__/
 *.py[cod]
 .venv/
 *.egg-info/
+
+# 本地验收脚本
+accept_task4.py
+wpf_smoke.runtimeconfig.json
