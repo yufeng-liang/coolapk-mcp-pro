@@ -333,6 +333,7 @@ def _run_web_login() -> str | None:
     def poll(window):
         jar: dict[str, str] = {}
         deadline = time.time() + WEB_LOGIN_TIMEOUT
+        error_count = 0
         while time.time() < deadline and not result["closed"]:
             try:
                 for sc in window.get_cookies() or []:
@@ -340,8 +341,19 @@ def _run_web_login() -> str | None:
                         value = getattr(morsel, "value", None)
                         if value:
                             jar[key] = value
-            except Exception:
-                pass
+                error_count = 0
+            except Exception as exc:
+                # 连续失败按异常计数，超限提前终止而不是让用户干等整个超时窗口
+                error_count += 1
+                if error_count >= 20:
+                    click.echo(
+                        json.dumps({"error": f"读取登录窗口 Cookie 连续失败: {exc}"},
+                                   ensure_ascii=False),
+                        err=True,
+                    )
+                    break
+            else:
+                error_count = 0
             sessid = jar.get("SESSID", "")
             if (
                 sessid
@@ -471,7 +483,9 @@ async def login(web, cookie, status, adb, sms, phone, captcha, code, sessid, val
                 result["message"] = data.get("message", "")
                 _output(result)
             else:
-                _output(data)
+                # 失败响应可能带 _cookies（含 token），剥离后再回显
+                safe = {k: v for k, v in data.items() if k != "_cookies"} if isinstance(data, dict) else data
+                _output(safe)
             return
 
         # 第一步：发送验证码

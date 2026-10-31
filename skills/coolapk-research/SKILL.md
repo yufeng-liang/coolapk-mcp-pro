@@ -36,7 +36,7 @@ coolapk_topic         刷话题：with_feeds=true 拿话题下最新动态，跟
 要点：
 
 - `coolapk_search` 保持默认 `strict=true`（滤掉机型名单广告与不相关结果）；结果太少再试 `strict=false` 或换同义词；
-- `coolapk_feed_detail` 优先传 `author_uid`（从搜索结果里带出来），详情接口被风控时回落更快；
+- `coolapk_feed_detail` 内置风控回落（自动从作者动态取全文），无需额外参数；
 - 查「某模块翻车了吗」类舆情，用 `comment_keyword` 检索评论而不是通读全部回复，省 token；
 - `coolapk_home` 只在需要「最近社区整体在聊什么」时用；
 - `coolapk_get_url` 是逃生舱：需要上表工具没覆盖的只读接口时才用，路径以 Coolapk-API-Collect（github.com/XiaoMengXinX/Coolapk-API-Collect 等社区整理） 实测可用清单为准。
@@ -92,7 +92,7 @@ coolapk_topic         刷话题：with_feeds=true 拿话题下最新动态，跟
 - **不要高频连续调用**：一次任务里工具调用控制在个位数；同一关键词换不同词而不是连续翻很多页；列表页翻页 ≤3 页一般够用；
 - **优先命中缓存与已有信息**：同一话题/帖子在一次会话内不要重复拉详情；
 - **遇到 `error_type: captcha`**：不要立刻重试同一调用。换信息源（改用话题动态或搜索其它关键词），仍不行就告知用户稍后再试；
-- **遇到 `error_type: auth_expired`**：不要反复重试受登录态影响的调用，直接引导用户在终端运行 `mcp-server\.venv\Scripts\coolapk login --web`（或 `--sms` / `--cookie`）重新登录，登录完成后再继续；
+- **遇到 `error_type: auth_expired`**：不要反复重试受登录态影响的调用，直接引导用户在仓库目录终端运行 `.venv\Scripts\coolapk login --web`（或 `--sms` / `--cookie`）重新登录，登录完成后再继续；
 - **不做写操作**：本 MCP 是纯只读的，任何点赞 / 回复 / 关注 / 发帖请求都应拒绝并说明。
 
 ## 输出建议

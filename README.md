@@ -14,7 +14,7 @@
 - **风控回落**：帖子详情接口被验证码拦截时自动改从作者动态列表取全文（`fetch_source` 字段标注来源），回复走独立接口
 - **请求节制**：全局限速（相邻请求 ≥1.2 s）、GET 按 TTL 缓存、瞬态错误指数退避重试、验证码端点负缓存冷却
 - **搜索净化**：严格关键词过滤 + 去重 + 疑似广告标记，滤掉酷安搜索混入的不相关结果
-- **登录态增强（0.2.0）**：auto 模式直接复用酷安桌面端登录态，失效时结构化 `auth_expired` 报错，支持 `login --web / --sms / --cookie` 重登
+- **登录态增强（0.2.0）**：auto 模式直接复用酷安桌面端登录态，失效时结构化 `auth_expired` 报错，支持 `login --web / --sms / --cookie / --adb` 重登
 
 ## 安装
 
@@ -32,9 +32,11 @@ py -m venv .venv
 .venv\Scripts\python -m coolapk_mcp.server          # 启动 MCP（stdio，Ctrl+C 退出）
 ```
 
-> **前置**：token V3 签名需要设备指纹 blob（`~/.coolapk-mcp/auth_blob.bin`），仓库不携带该二进制。首次配置建议直接运行 `.venv\Scripts\coolapk login --cookie "<完整Cookie>"`（或 `--sms`），会引导完成设备码与 blob 初始化；仅使用 `login --web` 时如报 blob 缺失，按提示先走一次 `--sms`/`--cookie` 即可。
+> **前置**：token V3 签名需要设备指纹 blob（`~/.coolapk-mcp/auth_blob.bin`），仓库不携带该二进制，登录命令本身不会生成 blob。获取方式任选其一：
+> 1. 把酷安 APK 改名为 `coolapk.apk` 放到 `~/.coolapk-mcp/`，客户端启动后自动提取 blob 并缓存；
+> 2. 从已有可用环境把 `auth_blob.bin` 复制到 `~/.coolapk-mcp/`。
 
-## 登录（三通道）
+## 登录（四通道）
 
 MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie：
 
@@ -52,7 +54,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | 工具 | 作用 | 关键参数 |
 | - | - | - |
 | `coolapk_search` | 搜索帖子 / 用户 / 话题 / 应用，严格过滤 + 去重 + 广告标记 | `keyword`、`type=feed\|user\|feedTopic\|app`、`page`、`strict` |
-| `coolapk_feed_detail` | 帖子详情 + 回复（风控自动回落） | `feed_id`、`all_replies`（拉全部一级评论）、`comment_keyword`（评论关键词检索）、`author_uid`（加速回落） |
+| `coolapk_feed_detail` | 帖子详情 + 回复（风控自动回落） | `feed_id`、`all_replies`（拉全部一级评论）、`comment_keyword`（评论关键词检索） |
 | `coolapk_topic` | 话题详情 / 话题下动态 | `tag`、`with_feeds`、`page` |
 | `coolapk_user_profile` | 用户资料 | `uid` |
 | `coolapk_user_feeds` | 用户发布的帖子 | `uid`、`page` |
@@ -69,7 +71,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 
 | 变量 | 默认 | 说明 |
 | - | - | - |
-| `COOLAPK_LOGIN_MODE` | `auto` | 登录态来源：`auto` = 优先桌面端 accounts.json，回落本地配置；`native` = 仅用本地配置。取值以 auth 实现为准 |
+| `COOLAPK_LOGIN_MODE` | `auto` | 登录态来源：`auto` = 优先桌面端 accounts.json，回落本地配置；`desktop` = 锁定仅用桌面端；`native` = 仅用本地配置 |
 | `COOLAPK_MIN_INTERVAL` | `1.2` | 相邻 API 请求最小间隔（秒） |
 | `COOLAPK_MAX_RETRIES` | `2` | 瞬态错误（超时 / 5xx / 429）重试次数 |
 | `COOLAPK_NO_CACHE` | 未设 | 设为 `1` 禁用 GET 缓存（调试用） |
@@ -133,7 +135,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 ### 登录失效（`error_type: auth_expired`）
 
 1. 让 agent 调 `coolapk_login_status` 或运行 `coolapk login --status` 确认失效；
-2. 推荐运行 `coolapk login --web` 重新登录（也可 `--sms` / `--cookie`）；
+2. 推荐运行 `coolapk login --web` 重新登录（也可 `--sms` / `--cookie` / `--adb`）；
 3. stdio 模式下 MCP 服务进程随客户端会话重启，重登后新会话自动带上新登录态。
 
 ### 验证码（`error_type: captcha`）
@@ -142,7 +144,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 
 ### 图片打不开（HTTP 567）
 
-酷安图片 CDN `image.coolapk.com` 对非官方直连请求返回 HTTP 567（2026-08 实测），把图片 URL 直接丢给浏览器或下载工具大概率拿不到图。请让 agent 使用 `coolapk_read_image` 工具（带 Referer 下载后返回本地文件）读取关键截图。
+酷安图片 CDN `image.coolapk.com` 对非官方直连请求返回 HTTP 567（2026-08 实测），把图片 URL 直接丢给浏览器或下载工具大概率拿不到图。请让 agent 使用 `coolapk_read_image` 工具（带 Referer 下载后以图片形式返回给多模态模型）读取关键截图。
 
 ### 其它
 

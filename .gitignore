@@ -6,3 +6,4 @@ __pycache__/
 # 本地验收脚本
 accept_task4.py
 wpf_smoke.runtimeconfig.json
+regression_probe.py

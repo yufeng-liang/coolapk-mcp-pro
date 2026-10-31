@@ -1,6 +1,7 @@
 """HTTP 客户端 + API 封装 — 合并网络层和业务端点"""
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,8 @@ from coolapk_mcp.config import AppConfig, has_valid_sessid
 # 登录态失效统一提示（error_type=auth_expired，AI 客户端据此引导用户重登）
 AUTH_EXPIRED_MESSAGE = (
     "登录态已失效：请在酷安桌面端重新登录后再试，"
-    "或运行 py -m coolapk_mcp login --web 重新导入登录 Cookie（也可用 login --sms 短信登录）"
+    "或运行 coolapk login --web 重新导入登录 Cookie（也可用 login --sms 短信登录、"
+    "login --cookie 手动导入）"
 )
 
 
@@ -73,7 +75,10 @@ class CoolapkClient:
         try:
             self.INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
             trimmed = dict(list(self._uid_index.items())[-self.INDEX_MAX:])
-            self.INDEX_FILE.write_text(json.dumps(trimmed), encoding="utf-8")
+            # 原子写：先落临时文件再 replace，防止中断产生半截 JSON 被 load 静默清空
+            tmp = self.INDEX_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(trimmed), encoding="utf-8")
+            os.replace(tmp, self.INDEX_FILE)
         except OSError:
             pass
 
@@ -138,13 +143,15 @@ class CoolapkClient:
     def _check_local_auth(self) -> None:
         """登录前本地校验：未登录或完整 Cookie 串 SESSID 已失效直接抛 auth_expired，不发探测请求
 
-        仅当 Cookie 串里带 SESSID 键而值无效时判失效；SMS 登录只落三键串（无
-        SESSID），不算失效。检查用「;SESSID=」前缀匹配，避免误伤值里的子串。
+        桌面端导出串形如 "; SESSID=..."（分号后可能带空格，config.py 同款注释），
+        判定统一交给 has_valid_sessid（按键解析、strip 处理），不用子串匹配，
+        避免漏检 "; SESSID=deleted" 这类带空格变体；SMS 登录只落三键串（无
+        SESSID），不算失效。
         """
         if not self.config.is_logged_in:
             raise CoolapkError(AUTH_EXPIRED_MESSAGE, kind="auth_expired")
         cookie = self.config.desktop_cookie
-        if cookie and not has_valid_sessid(cookie) and ";SESSID=" in f";{cookie}":
+        if cookie and not has_valid_sessid(cookie) and "sessid=" in cookie.lower():
             raise CoolapkError(AUTH_EXPIRED_MESSAGE, kind="auth_expired")
 
     async def _request(self, method: str, path: str, **kwargs) -> Any:
@@ -200,16 +207,32 @@ class CoolapkClient:
 
         try:
             result = resp.json()
-        except json.JSONDecodeError:
-            # 风控页/网关错误页常返回 HTML
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            # 风控页/网关错误页常返回 HTML；编码异常按同类处理
             raise CoolapkError("响应解析失败", kind="parse")
 
-        # 检查业务错误
-        if "data" not in result and "message" in result:
+        # 检查业务错误。V6 错误响应两种形态：
+        # ① 顶层 {error, message, ...}（无 data 键）；
+        # ② {status: 非0, message, data: null}（风控/网络环境异常，status 字段必须读，
+        #    只看「无 data 键」会把 status=1004/-415 的风控响应当成功，data=None
+        #    还会被写进缓存造成缓存投毒）
+        status_code = result.get("status") if isinstance(result, dict) else None
+        failed = (
+            not isinstance(result, dict)
+            or ("data" not in result and "message" in result)
+            or (status_code is not None and status_code not in (0, 1, "0", "1"))
+        )
+        if failed and isinstance(result, dict):
             error_code = result.get("error", -1)
             message = result.get("message", "未知错误")
             if isinstance(error_code, str):
                 error_code = int(error_code) if error_code.lstrip("-").isdigit() else -1
+            if status_code is not None and status_code not in (0, 1, "0", "1"):
+                # status 字段优先：1004=网络环境异常（风控）、-415=设备码被拉黑
+                if isinstance(status_code, str) and status_code.lstrip("-").isdigit():
+                    status_code = int(status_code)
+                if isinstance(status_code, int):
+                    error_code = error_code if error_code != -1 else status_code
             if "验证码" in message or "captcha" in message.lower():
                 # 负缓存：该端点短期内已被风控，冷却期内不再请求
                 base = path.split("?", 1)[0]
@@ -217,11 +240,24 @@ class CoolapkClient:
                 raise CoolapkError(message, error_code, kind="captcha")
             if error_code == 403 or "captchaRequired" in str(result):
                 raise CoolapkError(AUTH_EXPIRED_MESSAGE, error_code=403, kind="auth_expired")
+            if error_code == -415:
+                raise CoolapkError(
+                    f"设备码被风控拉黑({message})，请更换登录态设备码", error_code, kind="api",
+                )
+            if error_code == 1004:
+                raise CoolapkError(
+                    f"请求被风控拦截({message})，请稍后再试", error_code, kind="api",
+                )
             raise CoolapkError(message, error_code)
-        data = result.get("data")
+        if not isinstance(result, dict):
+            # 部分接口（如搜索、话题动态）顶层直接返回 list，是预期形态
+            data = result
+        else:
+            data = result.get("data")
         if isinstance(data, list):
             self._index_feeds(data)
-        if cache_key is not None:
+        # data 为 None 视为失败残余，不写入缓存，避免风控响应污染缓存
+        if cache_key is not None and data is not None:
             self._cache.put(cache_key, data, throttle.ttl_for(path))
         return data
 
@@ -235,6 +271,8 @@ class CoolapkClient:
     async def get(self, path: str, params: dict | None = None) -> Any:
         return await self._request("GET", path, params=params)
 
+    # post/post_multipart 仅登录流程（login --sms 等）内部使用，
+    # MCP 工具层与 get_url 均不触达，属于客户端必需的底层能力而非写接口暴露
     async def post(self, path: str, data: dict | None = None) -> Any:
         return await self._request("POST", path, data=data or {})
 
@@ -248,11 +286,6 @@ class CoolapkClient:
         )
 
     # ---- 只读透传与图片下载（MCP 工具专用，不用于业务写入） ----
-
-    # get_url 允许的响应字段白名单（服务端可能返回的敏感/系统字段）
-    _GET_URL_BLOCKED_KEYS = frozenset(
-        {"cookie", "cookies", "token", "session", "sessid", "config"}
-    )
 
     @classmethod
     def _check_get_url_path(cls, path: str) -> str:
@@ -280,19 +313,38 @@ class CoolapkClient:
                 f"仅允许 /v6/ 开头的接口路径，收到: {path}",
                 error_code=403, kind="api",
             )
-        # 写端点黑名单：含写动作关键词的路径一律拒绝
-        # （酷安写接口全部走 GET 传参，必须拦在客户端）
-        lowered = path.lower()
+        # 写端点黑名单：按「query 之前的路径部分」的独立段匹配，拒绝写动作端点。
+        # （酷安写接口全部走 GET 传参，必须拦在客户端；docs/coolapk-api.md:574
+        # /v6/feed/like 即 GET。）不能裸子串匹配——/v6/feed/replyList 含 "/reply"、
+        # /v6/message-like 含 "/message" 这类只读端点会被误伤；
+        # 校验前先循环 unquote 防双重编码绕过（%64igg、%2564igg）。
+        from urllib.parse import unquote
+
+        decoded = path
+        for _ in range(3):
+            unquoted = unquote(decoded)
+            if unquoted == decoded:
+                break
+            decoded = unquoted
+        lowered = decoded.lower()
+        path_part = lowered.split("?", 1)[0]
+        segs = [seg for seg in path_part.strip("/").split("/") if seg]
+        # 单段 + 相邻两段拼接两种形态：/v6/reply/add 这类写端点
+        # 靠 "/reply/add" 两段项命中，且不会误伤单段只读端点（replyList/message-like）
+        path_segments = {f"/{s}" for s in segs}
+        path_segments |= {f"/{segs[i]}/{segs[i+1]}" for i in range(len(segs) - 1)}
         blocked_segments = (
-            "/like", "/unlike", "/digg", "/reply", "/replyadd", "/replyaddpush",
-            "/follow", "/unfollow", "/followuser", "/createFeed", "/publish",
+            "/like", "/unlike", "/digg", "/replyadd", "/replyaddpush",
+            "/reply/add", "/reply/delete", "/reply/edit",
+            "/follow", "/unfollow", "/followuser", "/createfeed", "/publish",
             "/deletefeed", "/deletecomment", "/delete", "/edit", "/update",
-            "/message", "/chat", "/sendmessage", "/upload", "/report",
+            "/sendmessage", "/message/send", "/message/delete",
+            "/upload", "/report",
             "/block", "/blacklist", "/favorite", "/collection", "/subscribe",
             "/checkin", "/sign", "/vote", "/apply", "/modify", "/set",
         )
         for seg in blocked_segments:
-            if seg in lowered:
+            if seg in path_segments:
                 raise CoolapkError(
                     f"拒绝写操作端点: {path}",
                     error_code=403, kind="api",
@@ -624,12 +676,14 @@ class CoolapkClient:
 
     async def get_topic_detail(self, tag: str) -> dict | list:
         """话题详情"""
-        return await self.get(f"/v6/topic/newTagDetail?tag={tag}")
+        # tag 必须显式 quote：话题名常含 #（如 #小米15#），不编码会被
+        # httpx 当 fragment 截断，query 实际发送为 tag=（空值）
+        return await self.get(f"/v6/topic/newTagDetail?tag={quote(tag, safe='')}")
 
     async def get_topic_feeds(self, tag: str, page: int = 1) -> list[dict]:
         """话题下的帖子"""
         return await self.get(
-            f"/v6/topic/tagFeedList?tag={tag}&page={page}"
+            f"/v6/topic/tagFeedList?tag={quote(tag, safe='')}&page={page}"
         )
 
     # ---- 应用 ----
@@ -857,16 +911,14 @@ class CoolapkClient:
 
         # validate_url 是路径格式 /auth/validateLogin?key=xxx
         path = validate_url
-        if validate_url.startswith("https://"):
-            path = validate_url
-            if validate_url.startswith("https://"):
-                # 去掉 host 部分
-                for host in ("account.coolapk.com", "www.coolapk.com"):
-                    if host in validate_url:
-                        path = validate_url.split(host, 1)[-1]
-                        break
-        elif not validate_url.startswith("/"):
-            path = f"/{validate_url}"
+        if not validate_url.startswith("/"):
+            # 整段 URL 输入时剥掉 host 部分
+            for host in ("https://account.coolapk.com", "https://www.coolapk.com"):
+                if validate_url.startswith(host):
+                    path = validate_url[len(host):]
+                    break
+            else:
+                path = f"/{validate_url}"
 
         # 1. GET validate 页面获取新的 requestHash
         resp = await self._auth_request("GET", path, sessid=sessid)

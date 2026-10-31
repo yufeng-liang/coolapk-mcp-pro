@@ -27,6 +27,9 @@ from coolapk_mcp.config import CONFIG_DIR
 BLOB_CACHE_FILE = CONFIG_DIR / "auth_blob.bin"
 APK_CACHE_FILE = CONFIG_DIR / "coolapk.apk"
 
+# 进程内 blob 内存缓存（避免每请求读盘）
+_BLOB_MEM_CACHE: bytes | None = None
+
 # XOR 常量
 _XOR_KEY = 0x5A
 
@@ -117,7 +120,7 @@ def load_blob(apk_path: str | Path | None = None) -> bytes:
     if not apk_path.exists():
         raise RuntimeError(
             f"未找到 libauth blob 缓存 ({BLOB_CACHE_FILE})，也未找到 APK ({apk_path})。"
-            " 请通过 `coolapk login --adb` 或手动提取 libauth.so blob。"
+            " 请把酷安 APK 放到上述 APK 路径后重试（自动提取 libauth.so blob）。"
         )
 
     blob = extract_blob_from_apk(apk_path)
@@ -139,14 +142,28 @@ def cache_apk(apk_path: str | Path) -> None:
 
 
 def get_blob() -> bytes:
-    """获取已加载的 blob，若未缓存则报错。
+    """获取 blob：内存缓存 → 磁盘缓存 → 从备份 APK 自愈提取。
 
-    不同于 load_blob，这个方法不会尝试提取，只读缓存。
-    用于 token_v3 生成时的快速路径。
+    不同于裸读缓存，这里在磁盘缓存缺失时会尝试从 ~/.coolapk-mcp/coolapk.apk
+    现场提取并落盘（load_blob 同款路径），避免用户只差一步却无法自修复。
     """
-    if not BLOB_CACHE_FILE.exists():
+    global _BLOB_MEM_CACHE
+    if _BLOB_MEM_CACHE is not None:
+        return _BLOB_MEM_CACHE
+    blob: bytes | None = None
+    if BLOB_CACHE_FILE.exists():
+        blob = BLOB_CACHE_FILE.read_bytes()
+    else:
+        # 自愈：APK 备份存在时现场提取缓存，等价于 load_blob()
+        try:
+            blob = load_blob()
+        except (RuntimeError, OSError):
+            blob = None
+    if blob is None:
         raise RuntimeError(
-            "libauth blob 未缓存。请先运行 `coolapk login --adb` 从手机提取，"
-            "或手动指定 APK 路径运行 `coolapk auth --extract <apk_path>`。"
+            "libauth blob 未缓存（token V3 签名必需）。修复方式任选其一：\n"
+            f"  1. 把酷安 APK 放到 {APK_CACHE_FILE}，之后自动提取；\n"
+            f"  2. 手动把 libauth.so 提取出的 blob 放到 {BLOB_CACHE_FILE}。"
         )
-    return BLOB_CACHE_FILE.read_bytes()
+    _BLOB_MEM_CACHE = blob
+    return blob

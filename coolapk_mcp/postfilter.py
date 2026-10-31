@@ -85,7 +85,10 @@ def filter_search_results(
     seen_ids: set[int] = set()
     seen_content: set[str] = set()
 
-    for item in entities:
+    for raw_item in entities:
+        # 浅拷贝后操作：条目对象与 TTLCache 缓存同引用，
+        # 原地写广告标记会把标记带进缓存，二次命中重复计数
+        item = dict(raw_item) if isinstance(raw_item, dict) else raw_item
         et = item.get("entityType", "")
         item_id = item.get("id")
         if isinstance(item_id, str) and item_id.isdigit():

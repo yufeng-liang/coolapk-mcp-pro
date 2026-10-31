@@ -41,14 +41,20 @@ def _get_client() -> CoolapkClient:
     return _client
 
 
-def _dump(obj: Any) -> Any:
-    """递归 dump：模型转 dict，list/dict 逐项处理，其余原样。"""
+def _dump(obj: Any, _seen: frozenset = frozenset()) -> Any:
+    """递归 dump：模型转 dict，list/dict 逐项处理，其余原样。
+
+    _seen 按对象 id 防循环引用（响应来自 resp.json() 理论上无环，防御性兜底）。
+    """
     if hasattr(obj, "model_dump"):
         return obj.model_dump(mode="json", exclude_defaults=True)
     if isinstance(obj, list):
-        return [_dump(item) for item in obj]
+        return [_dump(item, _seen) for item in obj]
     if isinstance(obj, dict):
-        return {k: _dump(v) for k, v in obj.items()}
+        if id(obj) in _seen:
+            return "…(循环引用)"
+        seen = _seen | {id(obj)}
+        return {k: _dump(v, seen) for k, v in obj.items()}
     return obj
 
 

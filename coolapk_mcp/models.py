@@ -428,8 +428,8 @@ _REPLY_FIELDS = (
 # 其余键对应各工具名；feed_detail 的顶层与评论走同一套动态/评论字段
 _TOOL_FIELDS: dict[str, tuple[str, ...]] = {
     "search_feed": _FEED_FIELDS,
-    "search_user": ("uid", "username", "bio", "level", "fans", "follow", "feed",
-                    "verify_title", "city", "gender"),
+    "search_user": ("uid", "username", "bio", "level", "fans_num", "follow_num",
+                    "feed_num", "verify_title", "city", "gender"),
     "search_topic": ("id", "title", "tag", "follow_num", "comment_num", "description"),
     "search_app": ("id", "title", "package_name", "description", "follow_num",
                    "download_num", "version"),
@@ -442,10 +442,13 @@ _TOOL_FIELDS: dict[str, tuple[str, ...]] = {
     "topic": ("id", "title", "tag", "follow_num", "comment_num", "description"),
     "topic_feeds": _FEED_FIELDS,
 }
-# get_url 透传响应里必须剔除的敏感字段（递归匹配，键名小写比较）
+# get_url 透传响应里必须剔除的敏感字段（递归匹配，键名小写比较）；
+# 键名含敏感词也算（accessToken/sessionId/userToken 等变体），config 可能
+# 内嵌服务端配置同样剔除
 _GET_URL_SENSITIVE_KEYS = frozenset(
-    {"cookie", "cookies", "set-cookie", "token", "session", "sessid"}
+    {"cookie", "cookies", "set-cookie", "token", "session", "sessid", "config"}
 )
+_GET_URL_SENSITIVE_SUBSTR = ("token", "session", "cookie", "sessid", "passwd", "secret")
 
 
 def _apply_whitelist(obj: Any, fields: tuple[str, ...]) -> Any:
@@ -533,12 +536,16 @@ def apply_tool_whitelist(tool: str, data: Any) -> Any:
 def _strip_sensitive(obj: Any) -> Any:
     """递归剔除敏感字段（get_url 透传响应用）。
 
-    键名小写后整键匹配；匹配到的键整个丢弃。list 逐项递归。
+    键名小写后整键匹配敏感名单；命中敏感子串（accessToken/sessionId 等
+    变体键）也剔除。匹配到的键整个丢弃。list 逐项递归。
     """
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
-            if str(k).lower() in _GET_URL_SENSITIVE_KEYS:
+            key = str(k).lower()
+            if key in _GET_URL_SENSITIVE_KEYS or any(
+                s in key for s in _GET_URL_SENSITIVE_SUBSTR
+            ):
                 continue
             out[k] = _strip_sensitive(v)
         return out

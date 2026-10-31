@@ -69,6 +69,9 @@ def _load_desktop_login() -> dict[str, str] | None:
         data = json.loads(DESKTOP_ACCOUNTS_FILE.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, ValueError):
         return None
+    # 桌面端文件被写坏时可能是 null/list/str 等非法结构，不能让 AttributeError 崩穿 load()
+    if not isinstance(data, dict):
+        return None
 
     accounts = data.get("accounts")
     if not isinstance(accounts, list) or not accounts:
@@ -78,11 +81,15 @@ def _load_desktop_login() -> dict[str, str] | None:
     account: dict | None = None
     if last_uid:
         for acc in accounts:
+            if not isinstance(acc, dict):
+                continue
             if str(acc.get("uid", "")) == str(last_uid):
                 account = acc
                 break
     if account is None:
-        account = accounts[0]
+        account = next((acc for acc in accounts if isinstance(acc, dict)), None)
+    if not isinstance(account, dict):
+        return None
 
     cookie = str(account.get("cookie", "") or "")
     if not has_valid_sessid(cookie):
@@ -188,19 +195,20 @@ class AppConfig:
         return config
 
     def save(self) -> None:
+        """原子写：先落临时文件再 replace，防止并发/中断产生半截 JSON"""
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(
-            json.dumps(
-                {
-                    "device_code": self.device_code,
-                    "uid": self.uid,
-                    "username": self.username,
-                    "token": self.token,
-                    "api_base": self.api_base,
-                    "desktop_cookie": self.desktop_cookie,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        payload = json.dumps(
+            {
+                "device_code": self.device_code,
+                "uid": self.uid,
+                "username": self.username,
+                "token": self.token,
+                "api_base": self.api_base,
+                "desktop_cookie": self.desktop_cookie,
+            },
+            ensure_ascii=False,
+            indent=2,
         )
+        tmp = CONFIG_FILE.with_suffix(".json.tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, CONFIG_FILE)
