@@ -89,13 +89,24 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 
 数据文件（自动生成，勿提交仓库）：`~/.coolapk-mcp/config.json`（设备码与登录态）、`~/.coolapk-mcp/uid_index.json`（feed_id → 作者 uid 索引，供详情回落）。
 
-## 三端接入
+## Agent 接入（给 harness 的自助指引）
 
-命令统一指向本仓 venv：下文以克隆目录 `D:/coolapk-mcp-pro` 为例，替换为你的实际克隆路径。
+如果你是 AI agent（运行在某个 harness / MCP 客户端里），本节就是写给你的：照着下面的指令自己完成接入，不需要用户动手。
 
-### dsh
+**给 agent 的话**：请按顺序完成以下六步，每步失败时参照「故障排查」一节；完成后向用户报告接入结果（工具数量、登录状态、一次冒烟检索的摘要）。执行过程中产生的配置文件修改属于常规接入操作，直接进行即可；只有涉及用户凭据（Cookie / 短信验证码）的步骤才需要用户配合。
 
-编辑你的 dsh profile 配置目录下的 `cordis.patch.yml`，追加一个 MCP client 插件行，重启 dsh 会话生效：
+1. **确认前置**：本机 Windows / macOS / Linux 均可，Python ≥3.10（3.14 可用，但 `login --web` 在 3.14 下不可用）。检查用户是否已装[酷安第三方桌面端](https://github.com/coolapk-desktop/coolapk-desktop)（官方只有手机 App，桌面端是社区维护项目）：已装则登录态走 auto 模式自动复用；未装则准备一个酷安安卓 APK 改名 `coolapk.apk` 放到 `~/.coolapk-mcp/`（用于提取签名 blob）。
+2. **安装**：`git clone https://github.com/yufeng-liang/coolapk-mcp-pro.git && cd coolapk-mcp-pro && py -m venv .venv && .venv/Scripts/python -m pip install -e .`（Linux / macOS 为 `.venv/bin/`）。记住克隆目录的绝对路径，第 4 步要写进配置。
+3. **建立登录态**：优先让用户在已装桌面端里登录一次（零配置）；否则跑 `.venv/Scripts/coolapk login --sms --phone <手机号>`（需要用户提供手机号与短信验证码）或 `.venv/Scripts/coolapk login --cookie "uid=…;username=…;token=…"`。用 `coolapk login --status` 确认成功。
+4. **注册到你的 MCP 客户端**：按你的客户端类型选下方对应示例；都不匹配则参考「远程部署」一节的配置结构自行适配——stdio 形态核心三要素：`command` 指向 venv 的 python 可执行文件、`args` 为 `["-m", "coolapk_mcp.server"]`、工作目录或路径前缀指向克隆目录；远程形态核心三要素：`url` 指向服务端 `/mcp`、`headers.Authorization` 为 `Bearer <token>`、transport 为 `streamable-http`。
+5. **验证**：重启 / 重载客户端后确认 `coolapk_*` 工具族（9 个）已挂载，调 `coolapk_login_status` 确认登录态，再跑一次 `coolapk_search`（keyword 任选，如 "Magisk 模块"）作为冒烟。
+6. **学会使用**：阅读 [skills/coolapk-research/SKILL.md](skills/coolapk-research/SKILL.md)——那是给 agent 的完整使用手册（何时用酷安搜资料、调用策略链路、话题映射表、风控礼仪）。遵守其中的限频约束；遇到 `error_type` 按「工具一览」末尾的说明处置，不要盲目重试。
+
+下面三个示例覆盖最常见的三种客户端，其余客户端按第 4 步的要素自行适配。
+
+### 示例一：DeepSeek Harness（dsh）
+
+编辑 dsh profile 配置目录下的 `cordis.patch.yml`，追加一个 MCP client 插件行（stdio 本地形态；远程形态写法见「远程部署 → 客户端接入」），重启 dsh 会话生效：
 
 ```yaml
 - id: mcp-coolapk
@@ -111,7 +122,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 
 写完后可用 `dsh --profile web --dump-config` 核对新行已合入。
 
-### Claude Desktop
+### 示例二：Claude Desktop
 
 编辑 `%APPDATA%\Claude\claude_desktop_config.json`（Windows 路径 JSON 内用 `\\` 转义）：
 
@@ -126,7 +137,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 }
 ```
 
-### Cursor
+### 示例三：Cursor
 
 编辑项目或全局 `.cursor/mcp.json`（正斜杠路径即可）：
 
@@ -143,7 +154,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 
 ## 远程部署
 
-前面的三端接入都是 stdio 形态：MCP 进程跑在本机、随客户端会话启动退出。如果你有一台云服务器，想让家里和公司的电脑、多台设备甚至多个同事共用同一个部署（登录态与缓存也只有一份），就把服务跑成远程形态：服务端以 streamable-http 启动，客户端通过 URL + Bearer Token 远程连接。
+前面的「Agent 接入」示例都是 stdio 形态：MCP 进程跑在本机、随客户端会话启动退出。如果你有一台云服务器，想让家里和公司的电脑、多台设备甚至多个同事共用同一个部署（登录态与缓存也只有一份），就把服务跑成远程形态：服务端以 streamable-http 启动，客户端通过 URL + Bearer Token 远程连接。
 
 ### 快速启动
 

@@ -10,7 +10,8 @@
 - HTTP 模式内置 Bearer Token 鉴权（`COOLAPK_HTTP_TOKEN`）：绑定非回环地址且未设 token 时拒绝启动；`/health` 健康检查免鉴权
 - HTTP 启动时登录态检查：未检测到登录态时在 stderr 打印 native 登录通道指引（不拒绝启动）
 - 显式声明 uvicorn 依赖
-- 新增 Dockerfile 与 README「远程部署」章（TLS 反代 / systemd / dsh、Claude Desktop、Cursor 三端接入）
+- 新增 Dockerfile 与 README「远程部署」章（TLS 反代 / systemd / 客户端 URL 直连接入）
+- README 重构接入文档：新增「Agent 接入（给 harness 的自助指引）」节——六步自助流程（前置 → 安装 → 登录 → 注册 → 验证 → 学会使用）+ DeepSeek Harness / Claude Desktop / Cursor 三个完整配置示例，任意 agent 可照此自行完成接入，原「三端接入」节并入其中
 
 ## 0.2.0
 
