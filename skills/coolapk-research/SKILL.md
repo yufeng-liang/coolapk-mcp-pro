@@ -24,18 +24,30 @@ description: 用酷安 MCP 工具检索酷安社区资料的使用指南——�
 
 ## 工具调用策略
 
-标准检索链路，按需截断：
+**语义搜索策略（重要）**：酷安搜索只认关键词，不认自然语言长句。用户需求是
+「手机变卡怎么办」「想要更省电」这类口语时，按下面的策略链走：
+
+1. **拆关键词**：把需求语义拆成 1–2 个酷安社区常用词（"手机变卡" → `卡顿 优化`、"更省电" → `省电 续航`）。
+2. **话题优先**：先 `coolapk_search`（type=feedTopic）搜话题——酷安话题是最准的语义匹配器（"省电" 直接命中「省电」「MIUI省电」话题），看 follow_num 判断活跃度。
+3. **联想词改写**：`coolapk_suggest` 拿酷安建议的规范搜索词，修正生造词。
+4. **进话题抓干货**：`coolapk_topic`（with_feeds=true）已默认按热度排序（like+reply*3），前排是高价值帖。
+5. **全站搜帖**：`coolapk_search`（type=feed）默认 sort=hot，直接返回高赞干货帖而非低互动点评；结果带 like_num/reply_num，可再按热度筛选。
+6. **读帖收图**：`coolapk_feed_detail` 读正文与回复（需要完整舆情时用 all_replies 或 comment_keyword）；关键截图用 `coolapk_read_image` 看。
+
+标准检索链路（按需截断）：
 
 ```text
-coolapk_search        先定位：搜关键词拿帖子列表，选 1–3 个高价值帖
+coolapk_search        先定位（默认 sort=hot 高赞优先；type=feedTopic 找话题）
+coolapk_suggest       联想词改写：口语 → 酷安习惯用词
+coolapk_topic         刷话题：with_feeds=true 默认热度排序，前排即干货
 coolapk_feed_detail   读帖：拿正文与回复；需要完整舆情时用 all_replies 或 comment_keyword
 coolapk_read_image    看关键截图：教程帖的步骤截图、模块配置截图（image.coolapk.com 直连 567，必须走此工具）
-coolapk_topic         刷话题：with_feeds=true 拿话题下最新动态，跟踪持续讨论
 ```
 
 要点：
 
 - `coolapk_search` 保持默认 `strict=true`（滤掉机型名单广告与不相关结果）；结果太少再试 `strict=false` 或换同义词；
+- `coolapk_search` 默认 `sort=hot`（实测高赞干货帖优先，默认综合排序多为低互动点评）；要最新动态才用 `sort=default`；
 - `coolapk_feed_detail` 内置风控回落（自动从作者动态取全文），无需额外参数；
 - 查「某模块翻车了吗」类舆情，用 `comment_keyword` 检索评论而不是通读全部回复，省 token；
 - `coolapk_home` 只在需要「最近社区整体在聊什么」时用；

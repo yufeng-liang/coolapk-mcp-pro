@@ -682,20 +682,26 @@ class CoolapkClient:
     # ---- 搜索 ----
 
     async def search(
-        self, keyword: str, search_type: str = "feed", page: int = 1
+        self,
+        keyword: str,
+        search_type: str = "feed",
+        page: int = 1,
+        sort: str = "default",
     ) -> list[dict]:
         """通用搜索
         search_type: feed / user / feedTopic / app
+        sort: feed 专用排序，hot(热门)/reply(回复数)/default(综合)；
+            实测 hot 显著提升结果质量（默认排序多为低互动点评）
         """
-        return await self.get(
-            "/v6/search",
-            {
-                "type": search_type,
-                "searchValue": keyword,
-                "page": page,
-                "showAnonymous": "-1",
-            },
-        )
+        params: dict[str, Any] = {
+            "type": search_type,
+            "searchValue": keyword,
+            "page": page,
+            "showAnonymous": "-1",
+        }
+        if search_type == "feed":
+            params["sort"] = sort
+        return await self.get("/v6/search", params)
 
     async def search_feeds(
         self,
@@ -747,6 +753,12 @@ class CoolapkClient:
         """话题下的帖子"""
         return await self.get(
             f"/v6/topic/tagFeedList?tag={quote(tag, safe='')}&page={page}"
+        )
+
+    async def get_topic_suggest(self, keyword: str) -> list[dict]:
+        """搜索联想词（查询改写积木：返回酷安建议的搜索词卡片）"""
+        return await self.get(
+            f"/v6/search/suggestSearchWordsNew?searchValue={quote(keyword, safe='')}"
         )
 
     # ---- 应用 ----

@@ -10,7 +10,7 @@
 
 ## 特性
 
-- **9 个只读工具**：搜索、帖子详情、话题、用户资料、用户动态、首页动态、图片读取、登录状态、URL 透传
+- **10 个只读工具**：搜索、帖子详情、话题、用户资料、用户动态、首页动态、图片读取、登录状态、搜索联想词、URL 透传
 - **风控回落**：帖子详情接口被验证码拦截时自动改从作者动态列表取全文（`fetch_source` 字段标注来源），回复走独立接口
 - **请求节制**：全局限速（相邻请求 ≥1.2 s）、GET 按 TTL 缓存、瞬态错误指数退避重试、验证码端点负缓存冷却
 - **搜索净化**：严格关键词过滤 + 去重 + 疑似广告标记，滤掉酷安搜索混入的不相关结果
@@ -64,14 +64,15 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 
 | 工具 | 作用 | 关键参数 |
 | - | - | - |
-| `coolapk_search` | 搜索帖子 / 用户 / 话题 / 应用，严格过滤 + 去重 + 广告标记 | `keyword`、`type=feed\|user\|feedTopic\|app`、`page`、`strict` |
+| `coolapk_search` | 搜索帖子 / 用户 / 话题 / 应用，严格过滤 + 去重 + 广告标记；结果带热度字段 | `keyword`、`type=feed\|user\|feedTopic\|app`、`page`、`strict`、`sort=hot\|reply\|default`（默认 hot，结果质量显著更好） |
 | `coolapk_feed_detail` | 帖子详情 + 回复（风控自动回落） | `feed_id`、`all_replies`（拉全部一级评论）、`comment_keyword`（评论关键词检索） |
-| `coolapk_topic` | 话题详情 / 话题下动态 | `tag`、`with_feeds`、`page` |
+| `coolapk_topic` | 话题详情 / 话题下动态（默认按热度排序） | `tag`、`with_feeds`、`page`、`hot_first`（默认 true） |
 | `coolapk_user_profile` | 用户资料 | `uid` |
 | `coolapk_user_feeds` | 用户发布的帖子 | `uid`、`page` |
 | `coolapk_home` | 首页动态 | `tab=recommend\|hot\|latest`、`page` |
 | `coolapk_read_image` | 读取图片消息（带 Referer 下载，解决图片 CDN 直连 567） | 图片 URL |
 | `coolapk_login_status` | 查询当前登录态与登录方式 | 无 |
+| `coolapk_suggest` | 搜索联想词（把口语化需求改写成酷安习惯用词） | `keyword` |
 | `coolapk_get_url` | 只读 GET 透传（访问上表未覆盖的酷安只读接口） | 接口路径与参数 |
 
 前 6 个工具基座已实现；`coolapk_read_image` / `coolapk_login_status` / `coolapk_get_url` 为 0.2.0 新增。
@@ -99,7 +100,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 2. **安装**：`git clone https://github.com/yufeng-liang/coolapk-mcp-pro.git && cd coolapk-mcp-pro && py -m venv .venv && .venv/Scripts/python -m pip install -e .`（Linux / macOS 为 `.venv/bin/`）。记住克隆目录的绝对路径，第 4 步要写进配置。
 3. **建立登录态**：优先让用户在已装桌面端里登录一次（零配置）；否则跑 `.venv/Scripts/coolapk login --sms --phone <手机号>`（需要用户提供手机号与短信验证码）或 `.venv/Scripts/coolapk login --cookie "uid=…;username=…;token=…"`。用 `coolapk login --status` 确认成功。
 4. **注册到你的 MCP 客户端**：按你的客户端类型选下方对应示例；都不匹配则参考「远程部署」一节的配置结构自行适配——stdio 形态核心三要素：`command` 指向 venv 的 python 可执行文件、`args` 为 `["-m", "coolapk_mcp.server"]`、工作目录或路径前缀指向克隆目录；远程形态核心三要素：`url` 指向服务端 `/mcp`、`headers.Authorization` 为 `Bearer <token>`、transport 为 `streamable-http`。
-5. **验证**：重启 / 重载客户端后确认 `coolapk_*` 工具族（9 个）已挂载，调 `coolapk_login_status` 确认登录态，再跑一次 `coolapk_search`（keyword 任选，如 "Magisk 模块"）作为冒烟。
+5. **验证**：重启 / 重载客户端后确认 `coolapk_*` 工具族（10 个）已挂载，调 `coolapk_login_status` 确认登录态，再跑一次 `coolapk_search`（keyword 任选，如 "Magisk 模块"）作为冒烟。
 6. **学会使用**：阅读 [skills/coolapk-research/SKILL.md](skills/coolapk-research/SKILL.md)——那是给 agent 的完整使用手册（何时用酷安搜资料、调用策略链路、话题映射表、风控礼仪）。遵守其中的限频约束；遇到 `error_type` 按「工具一览」末尾的说明处置，不要盲目重试。
 
 下面三个示例覆盖最常见的三种客户端，其余客户端按第 4 步的要素自行适配。
@@ -360,7 +361,7 @@ docker run -d --name coolapk-mcp \
 （仓库根）
 ├── pyproject.toml
 ├── coolapk_mcp/
-│   ├── server.py       # MCP 服务与 9 个工具
+│   ├── server.py       # MCP 服务与 10 个工具
 │   ├── cli.py          # coolapk 命令行（搜索 / 详情 / login 等）
 │   ├── client.py       # API 客户端（风控回落、全量评论检索）
 │   ├── config.py       # 登录态持久化（~/.coolapk-mcp）

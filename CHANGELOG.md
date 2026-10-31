@@ -1,5 +1,15 @@
 # 更新日志
 
+## 0.4.0（2026-10-31）
+
+### 新增
+
+- `coolapk_search` 新增 `sort` 参数（`hot`/`reply`/`default`），feed 搜索默认 `hot`：实测默认综合排序多为低互动点评，热门排序直接返回高赞干货帖
+- 新增 `coolapk_suggest` 搜索联想词工具：把口语化需求改写成酷安习惯用词
+- `coolapk_topic` 话题动态默认按热度排序（点赞 + 评论×3，`hot_first=false` 可关）：酷安话题接口不支持服务端排序参数，改为客户端重排
+- 搜索结果热度字段（`like_num`/`reply_num`/`forward_num`）零值不再省略：AI 可依据热度判断结果质量并筛选
+- SKILL.md 新增语义搜索策略链：拆词 → 话题优先 → 联想词改写 → 热度排序
+
 本文件记录本仓库相对基座的增强与修复。基座为 zjy2968466837/coolapk-mcp（2026-10-24 master 快照，承自 Lniosy/coolapk-mcp，MIT License），引入时的基座能力见 [NOTICE.md](NOTICE.md)。
 
 ## 0.3.1（2026-10-31）

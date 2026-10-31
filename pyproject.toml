@@ -1,6 +1,6 @@
 [project]
 name = "coolapk-mcp-pro"
-version = "0.3.1"
+version = "0.4.0"
 description = "酷安社区 MCP Server — AI 原生搜索工具"
 requires-python = ">=3.10"
 dependencies = [

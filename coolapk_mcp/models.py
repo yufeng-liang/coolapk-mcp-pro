@@ -59,6 +59,9 @@ class FeedModel(BaseModel):
     username: str = ""
     uid: int = 0
     user_level: int = Field(default=0)
+    # 热度三字段 0 值也输出：exclude_defaults 对"非默认值"生效的判断无法区分
+    # 「0 赞」与「字段缺失」，而 AI 依赖热度判断结果质量与排序——改为 dump 前
+    # 由 model_serializer 补回（见 convert_search_items 注释）
     like_num: int = Field(alias="likenum", default=0)
     reply_num: int = Field(alias="replynum", default=0)
     forward_num: int = Field(alias="forwardnum", default=0)

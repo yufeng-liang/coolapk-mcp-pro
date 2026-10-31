@@ -106,7 +106,11 @@ def _catch_api_error(fn):
 @mcp.tool()
 @_catch_api_error
 async def coolapk_search(
-    keyword: str, type: str = "feed", page: int = 1, strict: bool = True
+    keyword: str,
+    type: str = "feed",
+    page: int = 1,
+    strict: bool = True,
+    sort: str = "hot",
 ) -> str:
     """搜索酷安社区内容（自动去重 + 严格关键词过滤 + 疑似广告标记）。
 
@@ -116,9 +120,12 @@ async def coolapk_search(
         page: 页码
         strict: 严格过滤（默认开）：归一化后每个关键词都必须出现在标题/正文/作者名里，
             可滤掉酷安搜索混入的不相关结果与机型名单广告；关闭则返回原始结果
+        sort: 帖子排序，hot(热门，默认)/reply(回复数)/default(综合)。
+            强烈建议保持默认 hot：酷安默认排序混入大量低互动点评，
+            实测 hot 直接返回高赞干货帖；结果带 like_num/reply_num 可再筛选
     """
     client = _get_client()
-    data = await client.search(keyword, type, page)
+    data = await client.search(keyword, type, page, sort=sort)
     if not isinstance(data, list):
         return _json(data)
     # feed 走严格过滤，user/feedTopic/app 仅剔除非实体卡片
@@ -227,13 +234,17 @@ async def coolapk_home(tab: str = "recommend", page: int = 1) -> str:
 
 @mcp.tool()
 @_catch_api_error
-async def coolapk_topic(tag: str, with_feeds: bool = False, page: int = 1) -> str:
+async def coolapk_topic(
+    tag: str, with_feeds: bool = False, page: int = 1, hot_first: bool = True
+) -> str:
     """查看酷安话题详情或话题下的帖子。
 
     Args:
         tag: 话题标签名
         with_feeds: 是否获取话题下的帖子列表
         page: 帖子页码
+        hot_first: 话题帖子按热度排序（点赞+评论*3，默认开）；
+            关闭则保持酷安默认顺序（时间流，多为最新低互动帖）
     """
     client = _get_client()
     result: dict[str, Any] = {}
@@ -246,8 +257,43 @@ async def coolapk_topic(tag: str, with_feeds: bool = False, page: int = 1) -> st
     if with_feeds:
         feeds = await client.get_topic_feeds(tag, page)
         if isinstance(feeds, list):
-            result["feeds"] = _parse_feed_list(feeds)
+            parsed = _parse_feed_list(feeds)
+            if hot_first:
+                # 话题动态服务端不支持排序参数（实测 listType/sort 均无效），
+                # 客户端按热度重排：like + reply*3（评论权重更高，对齐
+                # 酷安官方热门评论的互动口径），纯水动态沉底
+                parsed.sort(
+                    key=lambda f: f.like_num + f.reply_num * 3,
+                    reverse=True,
+                )
+            result["feeds"] = parsed
     return _json(result, whitelist="topic")
+
+
+@mcp.tool()
+@_catch_api_error
+async def coolapk_suggest(keyword: str) -> str:
+    """获取酷安搜索联想词（查询改写积木）。
+
+    输入自然语言或半成品关键词，返回酷安建议的规范搜索词，
+    可用于把口语化需求改写成酷安搜索习惯用词后再搜。
+
+    Args:
+        keyword: 查询词（可以是口语化长句）
+    """
+    client = _get_client()
+    data = await client.get_topic_suggest(keyword)
+    words: list[str] = []
+    if isinstance(data, list):
+        for card in data:
+            # 联想卡字段是 title（显示词）+ url（searchTab://all?keyword=），
+            # 没有 searchWord 键；取 title、剔除「搜索用户：」类前缀卡
+            if not isinstance(card, dict):
+                continue
+            word = str(card.get("title") or "").strip()
+            if word and not word.startswith("搜索"):
+                words.append(word)
+    return json.dumps({"suggests": words[:8]}, ensure_ascii=False)
 
 
 @mcp.tool()

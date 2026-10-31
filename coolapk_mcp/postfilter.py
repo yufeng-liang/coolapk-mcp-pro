@@ -155,6 +155,10 @@ def convert_search_items(items: list[dict]) -> list[dict]:
         if model is None:
             continue
         dumped = model.model_dump(mode="json", exclude_defaults=True)
+        # 热度字段 0 值补回：exclude_defaults 会把 0 赞/0 评裁掉，但 AI 依赖
+        # 热度数据判断结果质量与排序筛选，0 与缺失语义不同
+        for k in ("like_num", "reply_num", "forward_num"):
+            dumped.setdefault(k, getattr(model, k))
         if item.get(_ADS_KEY):
             dumped["suspected_ad"] = True
         results.append(dumped)
