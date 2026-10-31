@@ -2,9 +2,9 @@
 
 纯只读的酷安社区资料检索 MCP Server——让 Claude Desktop / Cursor / dsh 等 AI 助手直接检索酷安帖子、话题与用户资料。
 
-> **声明**：本项目基于 [Lniosy/coolapk-mcp](https://github.com/Lniosy/coolapk-mcp)（经 [zjy2968466837/coolapk-mcp](https://github.com/zjy2968466837/coolapk-mcp) 增强后平铺引入）二次增强，详见 [NOTICE.md](NOTICE.md)。感谢两位上游作者。
+> **声明**：本项目基于 [Lniosy/coolapk-mcp](https://github.com/Lniosy/coolapk-mcp)（经 [zjy2968466837/coolapk-mcp](https://github.com/zjy2968466837/coolapk-mcp) 增强后平铺引入）二次增强，详见 [NOTICE.md](NOTICE.md)。感谢两位上游作者。登录态复用的「酷安桌面端」同样是第三方社区项目，声明见下节。
 
-登录态复用酷安桌面端、失效检测与重登、风控回落、图片读取。Python 3.10+（实测 3.14）+ FastMCP。
+登录态复用酷安第三方桌面端（见下方准备清单）、失效检测与重登、风控回落、图片读取。Python 3.10+（实测 3.14）+ FastMCP。
 
 > 仅用于学习与测试，请勿滥用酷安官方接口。本服务不提供任何写操作（点赞 / 回复 / 关注 / 发帖）。
 
@@ -14,7 +14,18 @@
 - **风控回落**：帖子详情接口被验证码拦截时自动改从作者动态列表取全文（`fetch_source` 字段标注来源），回复走独立接口
 - **请求节制**：全局限速（相邻请求 ≥1.2 s）、GET 按 TTL 缓存、瞬态错误指数退避重试、验证码端点负缓存冷却
 - **搜索净化**：严格关键词过滤 + 去重 + 疑似广告标记，滤掉酷安搜索混入的不相关结果
-- **登录态增强（0.2.0）**：auto 模式直接复用酷安桌面端登录态，失效时结构化 `auth_expired` 报错，支持 `login --web / --sms / --cookie / --adb` 重登
+- **登录态增强（0.2.0）**：auto 模式直接复用[酷安第三方桌面端](https://github.com/coolapk-desktop/coolapk-desktop)的登录态（官方没有桌面端，此为社区项目），失效时结构化 `auth_expired` 报错，支持 `login --web / --sms / --cookie / --adb` 重登
+
+## 准备清单（开始前先看这个）
+
+酷安**官方只有手机 App，没有桌面端**。本 MCP 的登录态能力依赖社区维护的第三方桌面客户端，需要自行准备：
+
+| 你的情况 | 需要准备 |
+| - | - |
+| 路径一（推荐）：安装桌面端 | ① 下载并安装[酷安第三方桌面端](https://github.com/coolapk-desktop/coolapk-desktop/releases)（Windows / macOS / Linux / Android / iOS 均有安装包；原项目 [daimiaopeng/coolapk-desktop](https://github.com/daimiaopeng/coolapk-desktop) 已归档，由社区组织接续维护）→ ② 打开桌面端完成登录（官方授权页扫码或短信）→ ③ 没了，auto 模式自动复用其登录态 |
+| 路径二：不装桌面端 | ① 一个酷安**安卓 APK**（任意渠道版本，改名 `coolapk.apk` 放到 `~/.coolapk-mcp/`，用于提取签名 blob）→ ② 用下文短信登录或 Cookie 导入建立登录态 |
+
+> 说明：桌面端登录解决的是**登录态**（accounts.json），签名 blob 仍需安卓 APK（见下节前置）——桌面端的 exe/dmg 安装包提不了 blob。已装桌面端的用户可以顺手把手机上的酷安 APK 也放进来，两步就绪。
 
 ## 安装
 
@@ -42,8 +53,8 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 
 | 方式 | 命令 | 说明 |
 | - | - | - |
-| auto 模式（默认） | 无需操作 | 优先读酷安桌面端 `%APPDATA%\com.coolapk.desktop\accounts.json` 中 `lastLoginUid` 对应账户的完整 Cookie（含 SESSID），无效时回落 `~/.coolapk-mcp/config.json` 的原生三键 token；设备码优先复用 accounts.json 的 `deviceCode` |
-| 网页登录 | `.venv\Scripts\coolapk login --web` | 拉起登录窗口，人工完成登录（含滑块 / 验证码）后自动提取 Cookie 写入本地配置 |
+| auto 模式（默认） | 无需操作 | 优先读酷安第三方桌面端 `%APPDATA%\com.coolapk.desktop\accounts.json` 中 `lastLoginUid` 对应账户的完整 Cookie（含 SESSID），无效时回落 `~/.coolapk-mcp/config.json` 的原生三键 token；设备码优先复用 accounts.json 的 `deviceCode` |
+| 网页登录 | `.venv\Scripts\coolapk login --web` | 拉起登录窗口，人工完成登录（含滑块 / 验证码）后自动提取 Cookie 写入本地配置。**Python 3.14 下已知不可用**（依赖 pythonnet≥3.3，当前 3.2.1 只支持到 3.12），3.10–3.12 可用；3.14 用户请改用 --sms / --cookie |
 | 短信登录 | `.venv\Scripts\coolapk login --sms --phone <手机号>` | 按提示两步完成：识别图形验证码 → 提交短信验证码 |
 | Cookie 导入 | `.venv\Scripts\coolapk login --cookie "uid=…;username=…;token=…"` | 从浏览器或桌面端日志手动粘贴 Cookie |
 
@@ -63,7 +74,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `coolapk_login_status` | 查询当前登录态与登录方式 | 无 |
 | `coolapk_get_url` | 只读 GET 透传（访问上表未覆盖的酷安只读接口） | 接口路径与参数 |
 
-前 6 个工具基座已实现；`coolapk_read_image` / `coolapk_login_status` / `coolapk_get_url` 为 0.2.0 新增，参数名以集成后代码为准。
+前 6 个工具基座已实现；`coolapk_read_image` / `coolapk_login_status` / `coolapk_get_url` 为 0.2.0 新增。
 
 所有工具返回 JSON；出错时返回 `{"error": "…", "error_type": "…"}`，`error_type` 取值：`api`（业务错误）、`captcha`（风控验证码）、`auth_expired`（登录失效）、`network` / `transient`（可重试）、`http`、`parse`。agent 应据 `error_type` 决定重试或引导用户，不要盲目重试。
 

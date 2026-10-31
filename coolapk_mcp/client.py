@@ -16,7 +16,8 @@ from coolapk_mcp.config import AppConfig, has_valid_sessid
 
 # 登录态失效统一提示（error_type=auth_expired，AI 客户端据此引导用户重登）
 AUTH_EXPIRED_MESSAGE = (
-    "登录态已失效：请在酷安桌面端重新登录后再试，"
+    "登录态已失效：若已安装酷安第三方桌面端（github.com/coolapk-desktop/coolapk-desktop），"
+    "在桌面端重新登录后直接重试即可（本服务 auto 模式会自动复用其登录态，无需重启）；"
     "或运行 coolapk login --web 重新导入登录 Cookie（也可用 login --sms 短信登录、"
     "login --cookie 手动导入）"
 )
