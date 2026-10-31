@@ -6,6 +6,7 @@ import os
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.transport_security import TransportSecuritySettings
 
 from coolapk_mcp import postfilter
 from coolapk_mcp.client import CoolapkClient, CoolapkError
@@ -20,6 +21,10 @@ from coolapk_mcp.config import AppConfig
 
 mcp = FastMCP(
     "coolapk",
+    # 显式关闭 DNS rebinding 保护：FastMCP 在 host 为 127.0.0.1 时会自动开启，
+    # 该校验按 Host 头白名单拦截，「Host: <公网IP>:端口」的合法直连（远程部署常态）
+    # 会被误判 421；Bearer 鉴权已由 _build_http_app 强制，防护足够
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     instructions=(
         "酷安社区只读工具集：搜索帖子/用户/话题/应用、查看帖子详情与评论、"
         "用户资料与动态、话题详情、首页动态、登录状态、图片下载、通用只读接口透传。"

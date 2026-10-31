@@ -13,6 +13,10 @@
 - 新增 Dockerfile 与 README「远程部署」章（TLS 反代 / systemd / 客户端 URL 直连接入）
 - README 重构接入文档：新增「Agent 接入（给 harness 的自助指引）」节——六步自助流程（前置 → 安装 → 登录 → 注册 → 验证 → 学会使用）+ DeepSeek Harness / Claude Desktop / Cursor 三个完整配置示例，任意 agent 可照此自行完成接入，原「三端接入」节并入其中
 
+### 修复
+
+- 关闭 FastMCP 的 DNS rebinding Host 校验（`transport_security=False`）：该校验按 Host 头白名单拦截，客户端用公网 IP 直连服务时合法请求被误判 421 Misdirected Request；Bearer 鉴权已由本服务强制，防护足够
+
 ## 0.2.0
 
 ### 新增
