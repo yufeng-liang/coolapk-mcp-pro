@@ -2,6 +2,16 @@
 
 本文件记录本仓库相对基座的增强与修复。基座为 zjy2968466837/coolapk-mcp（2026-10-24 master 快照，承自 Lniosy/coolapk-mcp，MIT License），引入时的基座能力见 [NOTICE.md](NOTICE.md)。
 
+## 0.3.0（2026-10-31）
+
+### 新增
+
+- 远程 streamable-http 传输：`COOLAPK_MCP_TRANSPORT=streamable-http`，可部署到云服务器供多端直连（默认仍为 stdio，不影响现有用户）
+- HTTP 模式内置 Bearer Token 鉴权（`COOLAPK_HTTP_TOKEN`）：绑定非回环地址且未设 token 时拒绝启动；`/health` 健康检查免鉴权
+- HTTP 启动时登录态检查：未检测到登录态时在 stderr 打印 native 登录通道指引（不拒绝启动）
+- 显式声明 uvicorn 依赖
+- 新增 Dockerfile 与 README「远程部署」章（TLS 反代 / systemd / dsh、Claude Desktop、Cursor 三端接入）
+
 ## 0.2.0
 
 ### 新增

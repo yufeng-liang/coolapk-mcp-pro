@@ -2,6 +2,7 @@
 
 import functools
 import json
+import os
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP, Image
@@ -294,8 +295,124 @@ async def coolapk_get_url(path: str) -> str:
     return _json(data, whitelist="get_url")
 
 
+def _warn_login_state() -> None:
+    """HTTP 服务启动前检查登录态，缺失时打印修复指引（不拒绝启动）。"""
+    import sys
+
+    try:
+        config = AppConfig.load()
+    except Exception as exc:  # 配置文件损坏等，不让启动挂掉
+        print(
+            f"[coolapk-mcp] 登录态读取失败（{exc}），服务照常启动但所有工具将返回 auth_expired。",
+            file=sys.stderr,
+        )
+        return
+    if not config.is_logged_in:
+        print(
+            "[coolapk-mcp] 未检测到有效登录态（远程服务器无酷安桌面端，auto 模式读不到 accounts.json）。\n"
+            "  请在服务器上建立 native 登录态，三选一：\n"
+            "    1. coolapk login --sms    # 服务器直接收验证码\n"
+            "    2. coolapk login --cookie # 从手机抓包导入 Cookie\n"
+            "    3. 本地 coolapk login --adb 后，把 ~/.coolapk-mcp/config.json 上传到服务器\n"
+            "  并把酷安 APK 放到 ~/.coolapk-mcp/coolapk.apk（用于提取 auth_blob）。",
+            file=sys.stderr,
+        )
+
+
+def _build_http_app():
+    """构造带 Bearer Token 鉴权的 streamable-http ASGI 应用。"""
+    import ipaddress
+    import socket
+
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+    from starlette.routing import Mount, Route
+
+    host = os.environ.get("COOLAPK_HTTP_HOST", "127.0.0.1")
+    port = int(os.environ.get("COOLAPK_HTTP_PORT", "8000"))
+    token = os.environ.get("COOLAPK_HTTP_TOKEN", "")
+
+    # 非回环地址必须显式配 token，防止登录态裸奔公网
+    try:
+        addr = ipaddress.ip_address(socket.gethostbyname(host))
+        is_loopback = addr.is_loopback
+    except (socket.gaierror, ValueError):
+        is_loopback = False  # 解析不出就按公网对待，从严
+    if not is_loopback and not token:
+        raise SystemExit(
+            "[coolapk-mcp] 拒绝启动：COOLAPK_HTTP_HOST 绑定非回环地址（"
+            f"{host}）但未设置 COOLAPK_HTTP_TOKEN。\n"
+            "  HTTP 服务不设防 = 任何人都能用你的酷安登录态查数据。\n"
+            "  设置 COOLAPK_HTTP_TOKEN=<随机长随机串> 后重试，"
+            "公网部署请务必用 Nginx/Caddy 反代加 TLS（见 README 远程部署章）。"
+        )
+
+    state = {"token": token}
+
+    def _bearer_endpoint(inner_app):
+        """Bearer Token 校验包裹 MCP 端点：/health 免鉴权，MCP 一律校验。"""
+
+        async def _endpoint(scope, receive, send):
+            if state["token"]:
+                headers = dict(scope.get("headers") or [])
+                auth = headers.get(b"authorization", b"").decode("latin-1")
+                if auth != f"Bearer {state['token']}":
+                    resp = JSONResponse(
+                        {"error": "unauthorized", "detail": "缺少或错误的 Bearer Token"},
+                        status_code=401,
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+                    await resp(scope, receive, send)
+                    return
+            await inner_app(scope, receive, send)
+
+        return _endpoint
+
+    def _health(request):
+        # 不暴露任何状态细节，只证明服务活着
+        return JSONResponse({"status": "ok"})
+
+    http_app = mcp.streamable_http_app()
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(app):
+        # 等价于 streamable_http_app() 内置 lifespan：驱动 session_manager.run()
+        async with mcp.session_manager.run():
+            yield
+
+    routes = [
+        Route("/health", _health, methods=["GET"]),
+        Mount(
+            "/",
+            app=_bearer_endpoint(http_app),
+        ),
+    ]
+    # Bearer 校验包住整个 streamable-http 子应用（原生 /mcp 端点原样可达，
+    # 含 GET/POST/DELETE 与 GET /mcp 建流），/health 在子应用外免鉴权。
+    return Starlette(routes=routes, lifespan=_lifespan), host, port
+
+
 def main():
-    mcp.run()
+    transport = os.environ.get("COOLAPK_MCP_TRANSPORT", "stdio").strip().lower()
+    if transport in ("http", "streamable-http", "streamable_http"):
+        _warn_login_state()
+        app, host, port = _build_http_app()
+        import uvicorn
+
+        # lifespan 驱动 session_manager.run()，缺了会报
+        # "Task group is not initialized. Make sure to use run()."
+        config = uvicorn.Config(app, host=host, port=port, log_level="warning", lifespan="on")
+        server = uvicorn.Server(config)
+        server.run()
+    elif transport == "stdio":
+        mcp.run()
+    else:
+        raise SystemExit(
+            f"[coolapk-mcp] 未知 COOLAPK_MCP_TRANSPORT={transport!r}，"
+            "可选 stdio（默认）或 streamable-http。"
+        )
 
 
 if __name__ == "__main__":

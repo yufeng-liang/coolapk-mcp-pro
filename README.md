@@ -141,6 +141,179 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 }
 ```
 
+## 远程部署
+
+前面的三端接入都是 stdio 形态：MCP 进程跑在本机、随客户端会话启动退出。如果你有一台云服务器，想让家里和公司的电脑、多台设备甚至多个同事共用同一个部署（登录态与缓存也只有一份），就把服务跑成远程形态：服务端以 streamable-http 启动，客户端通过 URL + Bearer Token 远程连接。
+
+### 快速启动
+
+```bash
+py -m venv .venv
+.venv/Scripts/python -m pip install .
+
+# 生成一个随机 token（服务端与客户端共用）
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+
+# 四个环境变量，然后启动（bash / Linux 服务器写法）
+export COOLAPK_MCP_TRANSPORT=streamable-http   # 启用远程形态（http / streamable_http 别名等效）
+export COOLAPK_HTTP_HOST=127.0.0.1             # 一般绑回环，由反代对外；确要直连公网见下方安全一节
+export COOLAPK_HTTP_PORT=8000
+export COOLAPK_HTTP_TOKEN=<上一步生成的随机串>
+
+coolapk-mcp
+```
+
+启动后先自检：`curl http://127.0.0.1:8000/health` 返回 `{"status":"ok"}` 即说明服务已就绪（该端点免鉴权，仅供探活）；MCP 端点在 `/mcp`，一律要求 Bearer Token。
+
+### 环境变量（远程形态）
+
+| 变量 | 默认 | 说明 |
+| - | - | - |
+| `COOLAPK_MCP_TRANSPORT` | `stdio` | 传输形态：`streamable-http`（别名 `http` / `streamable_http` 等效）启用远程 HTTP 服务；不设或设 `stdio` 即本地形态 |
+| `COOLAPK_HTTP_HOST` | `127.0.0.1` | HTTP 监听地址。绑 `0.0.0.0` 等非回环地址时**必须**同时设置 `COOLAPK_HTTP_TOKEN`，否则服务拒绝启动 |
+| `COOLAPK_HTTP_PORT` | `8000` | HTTP 监听端口 |
+| `COOLAPK_HTTP_TOKEN` | 空 | Bearer Token。客户端请求须带 `Authorization: Bearer <token>`；校验失败返回 401 |
+
+### 安全
+
+- **强制 Bearer Token**：绑非回环地址而未设 `COOLAPK_HTTP_TOKEN` 时服务直接拒绝启动；token 用随机长串（生成命令见快速启动），不要用可猜的短串。
+- **必须走 TLS**：Bearer Token 是明文凭据，裸 HTTP 公网传输会被中间人截获。请勿把 `8000` 端口直接暴露公网，务必套一层 TLS 反向代理（Nginx 或 Caddy 示例如下），并在防火墙 / 云安全组里关闭直连端口。
+- Nginx 反代示例（假设已有 `your-domain` 的证书配置）：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;   # MCP 流式响应需要关闭缓冲
+    proxy_read_timeout 300s;
+}
+```
+
+- Caddy 反代示例（自动申请证书，两行即可）：
+
+```caddyfile
+your-domain {
+    reverse_proxy 127.0.0.1:8000
+}
+```
+
+### systemd 常驻
+
+```ini
+# /etc/systemd/system/coolapk-mcp.service
+[Unit]
+Description=Coolapk MCP Server (streamable-http)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/coolapk-mcp-pro
+Environment=COOLAPK_MCP_TRANSPORT=streamable-http
+Environment=COOLAPK_HTTP_HOST=127.0.0.1
+Environment=COOLAPK_HTTP_PORT=8000
+Environment=COOLAPK_HTTP_TOKEN=换成你的随机长串
+ExecStart=/opt/coolapk-mcp-pro/.venv/bin/coolapk-mcp
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now coolapk-mcp
+systemctl status coolapk-mcp        # 确认 active (running)
+```
+
+### Docker 部署
+
+仓库根自带 `Dockerfile`（`python:3.14-slim` 基础镜像，默认以 streamable-http 形态启动）：
+
+```bash
+docker build -t coolapk-mcp .
+
+docker run -d --name coolapk-mcp \
+  -p 127.0.0.1:8000:8000 \
+  -e COOLAPK_HTTP_TOKEN=<你的随机长串> \
+  -v ~/.coolapk-mcp:/root/.coolapk-mcp \
+  coolapk-mcp
+```
+
+`-e` 只需覆盖 `COOLAPK_HTTP_TOKEN`（传输形态与监听地址已内置默认值）；`-v` 挂载持久化目录后，设备码、登录态与 `auth_blob.bin` 重启容器不丢。同样建议只映射到 `127.0.0.1`，交给 TLS 反代对外。
+
+### 客户端接入（远程形态）
+
+服务端 URL 统一为 `https://your-domain/mcp`（即反代后的地址加 MCP 端点路径），请求头带 `Authorization: Bearer <token>`。
+
+#### dsh
+
+编辑 dsh profile 配置目录下的 `cordis.patch.yml`：
+
+```yaml
+- id: mcp-coolapk-remote
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: coolapk
+    transport: streamable-http
+    url: https://your-domain/mcp
+    headers:
+      Authorization: Bearer <token>
+    toolCallTimeoutMs: 120000
+```
+
+#### Claude Desktop
+
+远程 MCP 建议用官方的 Custom Connector（设置 → Connectors → Add custom connector，填远程 URL），或用 `mcp-remote` 桥接为 stdio：
+
+```json
+{
+  "mcpServers": {
+    "coolapk-remote": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://your-domain/mcp",
+               "--header", "Authorization: Bearer <token>"]
+    }
+  }
+}
+```
+
+远程接入的具体设置项以 [Claude 官方文档](https://support.claude.com/) 为准。
+
+#### Cursor
+
+编辑项目或全局 `.cursor/mcp.json`，用 `url` 方式直连远程 MCP：
+
+```json
+{
+  "mcpServers": {
+    "coolapk-remote": {
+      "url": "https://your-domain/mcp",
+      "headers": {
+        "Authorization": "Bearer <token>"
+      }
+    }
+  }
+}
+```
+
+远程字段的最新写法以 [Cursor 官方文档](https://docs.cursor.com/) 为准。
+
+### 服务端登录态
+
+远程形态的服务端登录态与本地完全同源，都在服务器的 `~/.coolapk-mcp/`：
+
+- native 模式：`~/.coolapk-mcp/config.json` 的三键 token（`uid` / `username` / `token`）与设备码（`device_code`），通过 `coolapk login --sms`（短信）/ `--cookie`（Cookie 导入）/ `--adb`（从已连接的安卓设备提取）建立；
+- `auth_blob.bin` 签名 blob 仍从酷安安卓 APK 提取：把 APK 改名 `coolapk.apk` 放到 `~/.coolapk-mcp/` 自动提取，或手动放置已有的 `auth_blob.bin`；
+- 桌面端 accounts.json 复用（auto 模式）仅在**服务器本机装有酷安桌面端**时生效，纯服务器环境一般用 native 通道。
+
+具体命令与两步验证流程见上文[登录（四通道）](#登录四通道)一节，blob 获取方式见[安装](#安装)一节的前置说明——两者在服务器上同样适用，不赘述。
+
+> ⚠️ **风控提示**：多端 / 多人共享同一部署时，所有请求都从服务器出口 IP 发出，且共用同一设备码——对酷安侧表现为**同一设备高频调用**，比单机 stdio 更容易触发风控。好在缓存与全局限速（默认开启，`COOLAPK_MIN_INTERVAL` / `COOLAPK_NO_CACHE` 可调）会兜底；如出现 `captcha` 风控回落，优先降低多端调用频率，详见[故障排查](#故障排查)。
+
 ## 故障排查
 
 ### 登录失效（`error_type: auth_expired`）

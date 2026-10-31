@@ -1,6 +1,6 @@
 [project]
 name = "coolapk-mcp-pro"
-version = "0.2.0"
+version = "0.3.0"
 description = "酷安社区 MCP Server — AI 原生搜索工具"
 requires-python = ">=3.10"
 dependencies = [
@@ -10,6 +10,8 @@ dependencies = [
     "pydantic>=2.0",
     "beautifulsoup4>=4.12",
     "pywebview>=5.0; sys_platform == 'win32'",
+    # uvicorn：server.py HTTP 模式直接 import，不能依赖 mcp 包的传递依赖保证
+    "uvicorn>=0.23",
 ]
 
 [project.scripts]

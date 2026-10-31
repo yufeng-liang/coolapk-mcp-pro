@@ -1,0 +1,21 @@
+# 虚拟环境与本地构建产物
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 版本控制
+.git/
+.gitignore
+
+# 本地验收 / 冒烟脚本（不参与运行）
+regression_probe.py
+accept_task4.py
+wpf_smoke.runtimeconfig.json
+
+# 本地临时目录
+.tmp*/
+dimc3_lpc3mt88/
+
+# 文档与 skill（不进入镜像）
+skills/
