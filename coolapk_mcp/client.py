@@ -418,20 +418,22 @@ class CoolapkClient:
         if not data:
             raise CoolapkError("图片下载失败: 响应体为空", kind="http")
 
-        # 从 Content-Type 或 URL 扩展名推断格式（FastMCP Image 需要）
+        # 从 Content-Type 或 URL 扩展名推断格式（FastMCP Image 需要）。
+        # FastMCP 直接 f"image/{format}" 拼 MIME，必须用标准名 "jpeg"，
+        # "jpg" 会生成非法的 image/jpg 被客户端拒绝渲染。
         ctype = (resp.headers.get("content-type") or "").lower()
         for fmt in ("webp", "jpeg", "jpg", "png", "gif"):
             if fmt in ctype:
-                return data, ("jpg" if fmt == "jpeg" else fmt)
+                return data, "jpeg" if fmt in ("jpeg", "jpg") else fmt
         lower_url = url.lower().split("?", 1)[0]
         for ext in (".webp", ".jpg", ".jpeg", ".png", ".gif"):
             if lower_url.endswith(ext):
-                return data, ("jpg" if ext in (".jpg", ".jpeg") else ext[1:])
+                return data, "jpeg" if ext in (".jpg", ".jpeg") else ext[1:]
         # 未见扩展名时按魔数判断
         if data.startswith(b"\x89PNG"):
             return data, "png"
         if data.startswith(b"\xff\xd8"):
-            return data, "jpg"
+            return data, "jpeg"
         if data.startswith((b"GIF87a", b"GIF89a")):
             return data, "gif"
         if data[:4] == b"RIFF" and data[8:12] == b"WEBP":

@@ -435,8 +435,8 @@ _TOOL_FIELDS: dict[str, tuple[str, ...]] = {
                    "download_num", "version"),
     "feed_detail": (*_FEED_FIELDS, "source_feed", "replies", "reply_count",
                     "fetch_source", "comment_search"),
-    "user_profile": ("uid", "username", "bio", "level", "fans", "follow", "feed",
-                     "verify_title", "reg_date", "city", "gender"),
+    "user_profile": ("uid", "username", "bio", "level", "fans_num", "follow_num",
+                     "feed_num", "verify_title", "reg_date", "city", "gender"),
     "user_feeds": _FEED_FIELDS,
     "home": _FEED_FIELDS,
     "topic": ("id", "title", "tag", "follow_num", "comment_num", "description"),
@@ -452,12 +452,24 @@ _GET_URL_SENSITIVE_SUBSTR = ("token", "session", "cookie", "sessid", "passwd", "
 
 
 def _apply_whitelist(obj: Any, fields: tuple[str, ...]) -> Any:
-    """按白名单保留 dict 字段；list 逐项递归；其余类型原样返回。"""
+    """按白名单保留 dict 字段；list 逐项递归（裁剪后为空的占位条目丢弃）；
+    其余类型原样返回。"""
     if isinstance(obj, dict):
         return {k: obj[k] for k in fields if k in obj}
     if isinstance(obj, list):
-        return [_apply_whitelist(v, fields) for v in obj]
+        pruned = [_apply_whitelist(v, fields) for v in obj]
+        # 酷安列表常混广告位/占位条目，裁剪后成空 dict，直接丢弃避免输出 {} 噪声
+        return [v for v in pruned if not (isinstance(v, dict) and not v)]
     return obj
+
+
+def _prune_list(items: Any, fields: tuple[str, ...]) -> list[Any]:
+    """按白名单裁剪动态/评论列表，丢弃裁剪后为空的占位条目（酷安列表
+    常混广告位/空位条目，留着只会输出 {} 噪声）。"""
+    if not isinstance(items, list):
+        return items  # type: ignore[return-value]
+    pruned = [_apply_whitelist(v, fields) for v in items]
+    return [v for v in pruned if not (isinstance(v, dict) and not v)]
 
 
 def apply_tool_whitelist(tool: str, data: Any) -> Any:
@@ -480,7 +492,10 @@ def apply_tool_whitelist(tool: str, data: Any) -> Any:
         if isinstance(data, dict):
             out = _apply_whitelist(data, _TOOL_FIELDS["feed_detail"])
             if "replies" in data:
-                out["replies"] = [_prune_reply(r) for r in data["replies"]]
+                out["replies"] = [
+                    pruned for pruned in (_prune_reply(r) for r in data["replies"])
+                    if not (isinstance(pruned, dict) and not pruned)
+                ]
             return out
         return data
 
@@ -488,13 +503,13 @@ def apply_tool_whitelist(tool: str, data: Any) -> Any:
         return _strip_sensitive(data)
 
     if tool == "user_feeds":
-        return [_apply_whitelist(v, _TOOL_FIELDS["user_feeds"]) for v in data]
+        return _prune_list(data, _TOOL_FIELDS["user_feeds"])
 
     if tool == "home":
-        return [_apply_whitelist(v, _TOOL_FIELDS["home"]) for v in data]
+        return _prune_list(data, _TOOL_FIELDS["home"])
 
     if tool == "topic_feeds":
-        return [_apply_whitelist(v, _TOOL_FIELDS["topic_feeds"]) for v in data]
+        return _prune_list(data, _TOOL_FIELDS["topic_feeds"])
 
     if tool == "topic":
         # server 传入 {"topic": {...}, "feeds": [...]} 包装结构，分别裁剪
@@ -505,16 +520,12 @@ def apply_tool_whitelist(tool: str, data: Any) -> Any:
                 out["topic"] = _apply_whitelist(topic, _TOOL_FIELDS["topic"])
             feeds = data.get("feeds")
             if feeds is not None:
-                out["feeds"] = [
-                    _apply_whitelist(v, _TOOL_FIELDS["topic_feeds"]) for v in feeds
-                ]
+                out["feeds"] = _prune_list(feeds, _TOOL_FIELDS["topic_feeds"])
             return out
         out = _apply_whitelist(data, _TOOL_FIELDS["topic"])
         feeds = data.get("feeds") if isinstance(data, dict) else None
         if feeds is not None:
-            out["feeds"] = [
-                _apply_whitelist(v, _TOOL_FIELDS["topic_feeds"]) for v in feeds
-            ]
+            out["feeds"] = _prune_list(feeds, _TOOL_FIELDS["topic_feeds"])
         return out
 
     if tool == "user_profile":
@@ -584,5 +595,8 @@ def _prune_reply(reply: dict) -> dict:
     out = _apply_whitelist(reply, _REPLY_FIELDS)
     subs = reply.get("sub_replies")
     if subs:
-        out["sub_replies"] = [_prune_reply(s) for s in subs]
+        out["sub_replies"] = [
+            pruned for pruned in (_prune_reply(s) for s in subs)
+            if not (isinstance(pruned, dict) and not pruned)
+        ]
     return out
