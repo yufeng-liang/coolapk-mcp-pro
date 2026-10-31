@@ -420,6 +420,8 @@ _FEED_FIELDS = (
     "id", "title", "content", "tag", "feed_type", "username", "uid",
     "user_level", "like_num", "reply_num", "forward_num", "read_num",
     "dateline", "device", "ip_location", "images",
+    # 质量派生字段（scoring 模块计算，服务端补进条目）
+    "post_score", "discussion_ratio",
 )
 _REPLY_FIELDS = (
     "id", "content", "username", "uid", "like_num", "dateline",
@@ -441,6 +443,15 @@ _TOOL_FIELDS: dict[str, tuple[str, ...]] = {
     "user_profile": ("uid", "username", "bio", "level", "fans_num", "follow_num",
                      "feed_num", "verify_title", "reg_date", "city", "gender"),
     "user_feeds": _FEED_FIELDS,
+    # 作者画像：UserModel 字段 + scoring 派生字段（author_tier 等）
+    "author": ("uid", "username", "bio", "level", "fans_num", "follow_num",
+               "feed_num", "verify_title", "reg_date", "city", "gender",
+               "author_tier", "author_tier_label", "is_expert",
+               "fans_per_feed", "expertise"),
+    # 作者领域聚合：作者画像 + 过滤后的高赞帖列表
+    "author_digest": ("uid", "username", "author", "keyword", "pages",
+                      "fetched", "matched", "posts"),
+
     "home": _FEED_FIELDS,
     "topic": ("id", "title", "tag", "follow_num", "comment_num", "description"),
     "topic_feeds": _FEED_FIELDS,
@@ -452,6 +463,9 @@ _GET_URL_SENSITIVE_KEYS = frozenset(
     {"cookie", "cookies", "set-cookie", "token", "session", "sessid", "config"}
 )
 _GET_URL_SENSITIVE_SUBSTR = ("token", "session", "cookie", "sessid", "passwd", "password", "secret")
+
+# user_feeds 新版包装结构的元数据字段（feeds 列表单独按动态白名单裁剪）
+_USER_FEEDS_META = ("uid", "pages", "fetched", "matched", "sort", "keyword")
 
 
 def _apply_whitelist(obj: Any, fields: tuple[str, ...]) -> Any:
@@ -506,7 +520,30 @@ def apply_tool_whitelist(tool: str, data: Any) -> Any:
         return _strip_sensitive(data)
 
     if tool == "user_feeds":
+        # 新版返回 {"uid","pages","fetched","matched","sort","keyword","feeds":[...]}
+        # 包装结构；纯 list 输出保持兼容
+        if isinstance(data, dict) and "feeds" in data:
+            out = {k: data[k] for k in _USER_FEEDS_META if k in data}
+            out["feeds"] = _prune_list(data["feeds"], _TOOL_FIELDS["user_feeds"])
+            return out
         return _prune_list(data, _TOOL_FIELDS["user_feeds"])
+
+    if tool == "author":
+        return _apply_whitelist(data, _TOOL_FIELDS["author"])
+
+    if tool == "author_digest":
+        if isinstance(data, dict):
+            out = {
+                k: data[k]
+                for k in _TOOL_FIELDS["author_digest"]
+                if k in data and k not in ("author", "posts")
+            }
+            if isinstance(data.get("author"), dict):
+                out["author"] = _apply_whitelist(data["author"], _TOOL_FIELDS["author"])
+            if "posts" in data:
+                out["posts"] = _prune_list(data["posts"], _TOOL_FIELDS["user_feeds"])
+            return out
+        return data
 
     if tool == "home":
         return _prune_list(data, _TOOL_FIELDS["home"])

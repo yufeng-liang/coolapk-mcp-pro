@@ -133,6 +133,7 @@ def filter_search_results(
 
 def convert_search_items(items: list[dict]) -> list[dict]:
     """原始条目 → 精简模型 dict，广告标记带过去"""
+    from coolapk_mcp import scoring
     from coolapk_mcp.models import (
         AppModel,
         FeedModel,
@@ -161,6 +162,8 @@ def convert_search_items(items: list[dict]) -> list[dict]:
         if isinstance(model, FeedModel):
             for k in ("like_num", "reply_num", "forward_num"):
                 dumped.setdefault(k, getattr(model, k))
+            # 质量分：搜索结果的排序与筛选依据（点赞+评论×3+转发×2，见 scoring）
+            scoring.annotate_post(dumped)
         if item.get(_ADS_KEY):
             dumped["suspected_ad"] = True
         results.append(dumped)

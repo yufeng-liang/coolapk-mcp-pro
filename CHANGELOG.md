@@ -1,5 +1,22 @@
 # 更新日志
 
+## 0.5.0（2026-10-31）
+
+作者质量锚定：解决「帖子火 ≠ 作者权威」「热门主题搜不全」两个实测暴露的问题。
+
+### 新增
+
+- `coolapk_author` 作者画像工具：返回 `author_tier`（`top`/`expert`/`active`/`normal`）、`is_expert`、`fans_per_feed`（粉丝/帖数，衡量精发度）、`expertise`（从签名推断的专长领域），用于判断「这人是不是该领域大佬」
+- `coolapk_author_digest` 作者深挖聚合工具：一次抓取多页该作者的帖子（默认 2 页、上限 5 页），按主题关键词过滤并按热度排序，返回完整攻略链——实测「莫离然然」的解锁相关前 6 名是 v1.4→v2.2 工具与解锁节 1.0/2.0 全系教程
+- 新增 `scoring` 模块：`post_score`（点赞 + 评论×3 + 转发×2）、`discussion_ratio`（评论/点赞）、作者分级阈值（top ≥3 万粉且 ≥10 级，expert ≥1 万粉且 ≥8 级，active ≥1000 粉且 ≥5 级）、`infer_expertise` 关键词分类（解锁/Root、刷机/救砖、模块/内核、美化/主题、省电/性能）
+- 帖子类结果统一带 `post_score` 与 `discussion_ratio`（搜索、用户动态、话题动态、作者聚合），可直接用于排序与筛选
+- SKILL.md 新增「作者质量锚定」章节：判断教程可信度的四步法、典型解锁 BL 检索链路、召回瓶颈说明（全站搜帖召回不全，热门主题优先走话题通道）
+
+### 变更
+
+- `coolapk_user_feeds` 支持多页聚合与质量筛选：新增 `pages`（1-5）、`keyword`（空格分词任一命中）、`sort`（`default`/`hot`/`latest`），返回结构改为包装对象（`uid`/`pages`/`fetched`/`matched`/`sort`/`keyword`/`feeds`）
+- 作者多页聚合按 `id` 去重：实测置顶帖会因 `isIncludeTop=1` 在每页重复出现，3 页 60 条中有 1 条重复
+
 ## 0.4.0（2026-10-31）
 
 ### 新增

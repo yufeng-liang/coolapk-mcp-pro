@@ -10,7 +10,7 @@
 
 ## 特性
 
-- **10 个只读工具**：搜索、帖子详情、话题、用户资料、用户动态、首页动态、图片读取、登录状态、搜索联想词、URL 透传
+- **12 个只读工具**：搜索、帖子详情、话题、用户资料、用户动态、首页动态、图片读取、登录状态、搜索联想词、URL 透传、作者画像、作者深挖聚合
 - **风控回落**：帖子详情接口被验证码拦截时自动改从作者动态列表取全文（`fetch_source` 字段标注来源），回复走独立接口
 - **请求节制**：全局限速（相邻请求 ≥1.2 s）、GET 按 TTL 缓存、瞬态错误指数退避重试、验证码端点负缓存冷却
 - **搜索净化**：严格关键词过滤 + 去重 + 疑似广告标记，滤掉酷安搜索混入的不相关结果
@@ -68,14 +68,18 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `coolapk_feed_detail` | 帖子详情 + 回复（风控自动回落） | `feed_id`、`all_replies`（拉全部一级评论）、`comment_keyword`（评论关键词检索） |
 | `coolapk_topic` | 话题详情 / 话题下动态（默认按热度排序） | `tag`、`with_feeds`、`page`、`hot_first`（默认 true） |
 | `coolapk_user_profile` | 用户资料 | `uid` |
-| `coolapk_user_feeds` | 用户发布的帖子 | `uid`、`page` |
+| `coolapk_user_feeds` | 用户发布的帖子（支持多页聚合 + 关键词过滤 + 热度排序） | `uid`、`page`、`pages=1-5`、`keyword`、`sort=default\|hot\|latest` |
 | `coolapk_home` | 首页动态 | `tab=recommend\|hot\|latest`、`page` |
 | `coolapk_read_image` | 读取图片消息（带 Referer 下载，解决图片 CDN 直连 567） | 图片 URL |
 | `coolapk_login_status` | 查询当前登录态与登录方式 | 无 |
 | `coolapk_suggest` | 搜索联想词（把口语化需求改写成酷安习惯用词） | `keyword` |
 | `coolapk_get_url` | 只读 GET 透传（访问上表未覆盖的酷安只读接口） | 接口路径与参数 |
+| `coolapk_author` | 作者画像与权威度评分（`author_tier` / `is_expert` / `fans_per_feed` / `expertise`），判断「这人是不是该领域大佬」 | `uid` |
+| `coolapk_author_digest` | 作者深挖聚合：一次抓多页他的帖子、按主题过滤并按热度排序，拿到完整攻略链 | `uid`、`keyword`、`pages=1-5`（默认 2）、`top`（默认 10） |
 
-前 6 个工具基座已实现；`coolapk_read_image` / `coolapk_login_status` / `coolapk_get_url` 为 0.2.0 新增。
+前 6 个工具基座已实现；`coolapk_read_image` / `coolapk_login_status` / `coolapk_get_url` 为 0.2.0 新增；`coolapk_suggest` 为 0.4.0 新增；`coolapk_author` / `coolapk_author_digest` 为 0.5.0 新增。
+
+帖子类结果统一带质量分：`post_score`（点赞 + 评论×3 + 转发×2）与 `discussion_ratio`（评论/点赞），可直接用于排序和判断「这条是干货还是凑数」。
 
 所有工具返回 JSON；出错时返回 `{"error": "…", "error_type": "…"}`，`error_type` 取值：`api`（业务错误）、`captcha`（风控验证码）、`auth_expired`（登录失效）、`network` / `transient`（可重试）、`http`、`parse`。agent 应据 `error_type` 决定重试或引导用户，不要盲目重试。
 

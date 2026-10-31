@@ -1,4 +1,4 @@
-"""MCP Server — 酷安社区只读工具集（9 个工具）"""
+"""MCP Server — 酷安社区只读工具集（12 个工具）"""
 
 import functools
 import hmac
@@ -10,6 +10,7 @@ from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.transport_security import TransportSecuritySettings
 
 from coolapk_mcp import postfilter
+from coolapk_mcp import scoring
 from coolapk_mcp.client import CoolapkClient, CoolapkError
 from coolapk_mcp.models import (
     FeedDetail,
@@ -28,13 +29,17 @@ mcp = FastMCP(
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     instructions=(
         "酷安社区只读工具集：搜索帖子/用户/话题/应用、查看帖子详情与评论、"
-        "用户资料与动态、话题详情、首页动态、登录状态、图片下载、通用只读接口透传。"
+        "用户资料与动态、话题详情、首页动态、登录状态、图片下载、通用只读接口透传、"
+        "作者画像与作者深挖聚合。"
         "全部工具只读，不会发帖、点赞或关注。"
         "搜索默认启用严格关键词过滤与去重（strict=False 可关闭）；"
         "帖子详情在详情接口被风控时会自动回落到作者动态列表（fetch_source 字段标注来源）；"
         "评论搜索（comment_keyword）会自动拉全量评论并按关键词命中过滤。"
         "所有输出均经过白名单裁剪，只保留 agent 需要的核心字段；"
         "接口返回中的 cookie/token 等敏感字段一律剔除。"
+        "帖子结果带 post_score（点赞+评论×3+转发×2）与 discussion_ratio，可直接用于排序筛选；"
+        "判断教程可信度先看作者 author_tier（top/expert/active/normal），再决定是否用 "
+        "coolapk_author_digest 深挖该作者的全部攻略。"
     ),
 )
 
@@ -79,6 +84,39 @@ def _parse_feed_list(raw: Any) -> list[FeedModel]:
     if not isinstance(raw, list):
         return []
     return [FeedModel.from_api(f) for f in raw if isinstance(f, dict)]
+
+
+def _prepare_feeds(
+    raw: Any, keyword: str = "", sort: str = "default"
+) -> tuple[list[dict], int]:
+    """把原始动态列表加工成带质量分的输出：过模型 → 关键词过滤 → 打分 → 排序。
+
+    keyword 空格分隔多词，任一命中标题或正文即保留（与 search 的 strict 语义一致）。
+    sort=hot 按 post_score（点赞+评论×3+转发×2）降序，latest 按发布时间降序。
+    """
+    if not isinstance(raw, list):
+        return [], 0
+    items = [
+        _dump(FeedModel.from_api(f)) for f in raw if isinstance(f, dict)
+    ]
+    total = len(items)
+    words = [w for w in (keyword or "").lower().split() if w]
+    if words:
+        items = [
+            it
+            for it in items
+            if any(
+                w in f"{it.get('title') or ''} {it.get('content') or ''}".lower()
+                for w in words
+            )
+        ]
+    for it in items:
+        scoring.annotate_post(it)
+    if sort == "hot":
+        items.sort(key=lambda x: x.get("post_score") or 0, reverse=True)
+    elif sort == "latest":
+        items.sort(key=lambda x: str(x.get("dateline") or ""), reverse=True)
+    return items, total
 
 
 def _catch_api_error(fn):
@@ -197,18 +235,122 @@ async def coolapk_user_profile(uid: int) -> str:
 
 @mcp.tool()
 @_catch_api_error
-async def coolapk_user_feeds(uid: int, page: int = 1) -> str:
-    """查看酷安用户发布的帖子。
+async def coolapk_user_feeds(
+    uid: int,
+    page: int = 1,
+    pages: int = 1,
+    keyword: str = "",
+    sort: str = "default",
+) -> str:
+    """查看酷安用户发布的帖子（支持多页聚合、关键词过滤与热度排序）。
 
     Args:
         uid: 用户UID
-        page: 页码
+        page: 起始页码（pages>1 时从该页开始连续抓取）
+        pages: 连续抓取页数 1-5，默认 1；想看某作者的历史干货时设 2-3
+        keyword: 只保留标题或正文含该词的帖子（空格分隔多词=任一命中）
+        sort: 排序，default(接口原始顺序) / hot(互动热度) / latest(发布时间)
     """
     client = _get_client()
-    data = await client.get_user_feeds(uid, page)
-    if isinstance(data, list):
-        return _json(_parse_feed_list(data), whitelist="user_feeds")
-    return _json(data)
+    start = max(1, int(page or 1))
+    wanted = max(1, min(int(pages or 1), 5))
+    if wanted > 1:
+        raw = await client.get_user_feeds_pages(uid, pages=wanted, start_page=start)
+    else:
+        raw = await client.get_user_feeds(uid, start)
+    if not isinstance(raw, list):
+        return _json(raw)
+    items, total = _prepare_feeds(raw, keyword, sort)
+    return _json(
+        {
+            "uid": uid,
+            "pages": wanted,
+            "fetched": total,
+            "matched": len(items),
+            "sort": sort,
+            "keyword": keyword or None,
+            "feeds": items,
+        },
+        whitelist="user_feeds",
+    )
+
+
+@mcp.tool()
+@_catch_api_error
+async def coolapk_author(uid: int) -> str:
+    """查看酷安作者的画像与权威度评分（判断「这人是不是该领域大佬」）。
+
+    返回基础资料 + author_tier(top/expert/active/normal)、is_expert、
+    fans_per_feed(精发度)、expertise(从 bio 推断的专长领域)。
+    搜到高赞帖后先看作者 tier，再决定要不要用 coolapk_author_digest 深挖他的其他帖。
+
+    Args:
+        uid: 用户UID
+    """
+    client = _get_client()
+    data = await client.get_user_space(uid)
+    if isinstance(data, list) and data:
+        data = data[0]
+    if not isinstance(data, dict):
+        return _json(data)
+    profile = _dump(UserModel.from_api(data))
+    profile.update(scoring.summarize_author(profile))
+    return _json(profile, whitelist="author")
+
+
+@mcp.tool()
+@_catch_api_error
+async def coolapk_author_digest(
+    uid: int, keyword: str = "", pages: int = 2, top: int = 10
+) -> str:
+    """深挖某作者：一次调用拿到他在指定主题下的全部高赞帖（按热度排序）。
+
+    适合发现领域大佬（author_tier=top/expert）后，一次性抓出他关于该主题的
+    完整攻略链（例如「莫离然然」的解锁工具 v1.4→v2.2 全系教程）。
+    内部按 id 去重（置顶帖会跨页重复），关键词空格分隔多词=任一命中。
+
+    Args:
+        uid: 作者UID
+        keyword: 主题关键词（空格分隔多词=任一命中），留空返回全部帖子
+        pages: 抓取页数 1-5，默认 2（约 40 条）
+        top: 返回条数上限，默认 10，最多 50
+    """
+    client = _get_client()
+    wanted = max(1, min(int(pages or 1), 5))
+    raw = await client.get_user_feeds_pages(uid, pages=wanted)
+    posts, total = _prepare_feeds(raw, keyword, "hot")
+    limit = max(1, min(int(top or 10), 50))
+    posts = posts[:limit]
+    space = await client.get_user_space(uid)
+    if isinstance(space, list) and space:
+        space = space[0]
+    author: dict = {}
+    if isinstance(space, dict):
+        author = _dump(UserModel.from_api(space))
+        author.update(
+            scoring.summarize_author(
+                {
+                    **author,
+                    "posts_texts": [
+                        f"{p.get('title') or ''} {p.get('content') or ''}" for p in posts
+                    ],
+                }
+            )
+        )
+    return _json(
+        {
+            "uid": uid,
+            "username": author.get("username"),
+            "author": author,
+            "keyword": keyword or None,
+            "pages": wanted,
+            "fetched": total,
+            "matched": len(posts),
+            "posts": posts,
+        },
+        whitelist="author_digest",
+    )
+
 
 
 @mcp.tool()

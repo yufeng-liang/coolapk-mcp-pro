@@ -741,6 +741,45 @@ class CoolapkClient:
             f"/v6/user/{feed_type}List?uid={uid}&page={page}&isIncludeTop=1"
         )
 
+    async def get_user_feeds_pages(
+        self, uid: int, pages: int = 2, start_page: int = 1, feed_type: str = "feed"
+    ) -> list[dict]:
+        """用户动态多页聚合，按 id 去重。
+
+        置顶帖带 isIncludeTop=1 时每页都会带一次（实测 3 页 60 条里只有 1 条重复），
+        所以去重是必需的。首页失败照常抛错；后续页失败只保留已抓到的部分，
+        避免因为翻到底或被限流把整次聚合废掉。
+        """
+        pages = max(1, min(int(pages or 1), 5))
+        start = max(1, int(start_page or 1))
+        seen: set[object] = set()
+        out: list[dict] = []
+        for offset in range(pages):
+            page = start + offset
+            try:
+                items = await self.get_user_feeds(uid, page, feed_type)
+            except CoolapkError:
+                if offset == 0:
+                    raise
+                break
+            if not isinstance(items, list) or not items:
+                break
+            fresh = 0
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                fid = item.get("id")
+                if fid is not None:
+                    if fid in seen:
+                        continue
+                    seen.add(fid)
+                out.append(item)
+                fresh += 1
+            if fresh == 0:
+                # 整页都是重复，说明已经翻到底（置顶帖重复页）
+                break
+        return out
+
     # ---- 话题 ----
 
     async def get_topic_detail(self, tag: str) -> dict | list:

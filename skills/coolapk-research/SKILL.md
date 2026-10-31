@@ -1,6 +1,6 @@
 ---
 name: coolapk-research
-description: 用酷安 MCP 工具检索酷安社区资料的使用指南——何时用酷安搜资料（玩机教程、root/解锁 BL、Magisk 模块、ROM/刷机等）、工具调用策略（search → feed_detail → read_image → topic）、分类→话题映射表、风控礼仪。当需要从酷安社区找玩机资料、了解酷友讨论、查机型相关帖子时使用。
+description: 用酷安 MCP 工具检索酷安社区资料的使用指南——何时用酷安搜资料（玩机教程、root/解锁 BL、Magisk 模块、ROM/刷机等）、工具调用策略（search → feed_detail → read_image → topic）、语义搜索策略链、作者质量锚定、分类→话题映射表、风控礼仪。当需要从酷安社区找玩机资料、了解酷友讨论、查机型相关帖子时使用。
 ---
 
 # 酷安资料检索指南
@@ -52,6 +52,36 @@ coolapk_read_image    看关键截图：教程帖的步骤截图、模块配置�
 - 查「某模块翻车了吗」类舆情，用 `comment_keyword` 检索评论而不是通读全部回复，省 token；
 - `coolapk_home` 只在需要「最近社区整体在聊什么」时用；
 - `coolapk_get_url` 是逃生舱：需要上表工具没覆盖的只读接口时才用，路径以 Coolapk-API-Collect（github.com/XiaoMengXinX/Coolapk-API-Collect 等社区整理） 实测可用清单为准。
+- 结果里的 `post_score`（点赞+评论×3+转发×2）与 `discussion_ratio`（评论/点赞）是现成的质量分：排序、筛「干货还是凑数」直接用它，不用自己算。
+
+## 作者质量锚定（判断「这帖可信吗」）
+
+**核心事实：帖子火 ≠ 作者权威。** 实测样本里有过单帖 3100 赞但只发过 19 帖、5 级的普通用户；也有 79,166 粉、233 帖、常年更新解锁工具的领域顶流。只看点赞数会把一次性爆款当成教程来源。
+
+判断一个帖子值不值得照做，按这个顺序：
+
+1. **先看作者等级与粉丝**：搜索结果条目里带作者 uid，用 `coolapk_author` 拿画像：
+   - `author_tier=top`（≥3 万粉且 ≥10 级）→ 领域顶流，教程可信度高；
+   - `author_tier=expert`（≥1 万粉且 ≥8 级）→ 该领域大佬；
+   - `author_tier=active`（≥1000 粉且 ≥5 级）→ 活跃创作者，可参考；
+   - `author_tier=normal` → 普通用户，翻车风险高，需要交叉验证。
+2. **看 `fans_per_feed`**（粉丝/帖数）：数值高说明「精发」，内容密度大；数值低但粉丝多，可能是搬运或水帖多。
+3. **看 `expertise`**：作者专长领域列表，与你要找的主题对不上就别当权威。
+4. **确认是同一主题的老手**：`coolapk_author_digest`（uid + keyword）一次抓 2 页并按热度排序，能看出他是否在这个主题上持续输出（例如「莫离然然」的解锁工具从 v1.4 迭代到 v2.2，还有解锁节 1.0/2.0 教程）。
+
+**典型用法（用户问「怎么解锁 BL」）**：
+
+```text
+1. coolapk_search(type=feedTopic, keyword=解锁BL)    找话题，看哪个话题活跃
+2. coolapk_topic(tag=小米解锁BL, with_feeds=true)     热度序拿前排帖
+3. coolapk_author(uid=<高赞帖作者>)                   确认是不是大佬
+4. coolapk_author_digest(uid, keyword=解锁, pages=2)  拉他全套教程（工具版本链）
+5. coolapk_feed_detail(feed_id=...)                  读最新那篇的正文与踩坑回复
+```
+
+注意：`coolapk_author_digest` 会抓多页（默认 2 页约 40 条），是按需深挖的工具，不要对每个作者都调用；只有在前 3 步已经判断「这人是大佬」时才用。
+
+**召回瓶颈的真相**：全站搜帖（type=feed）对热门话题的召回并不完整——实测搜「小米解锁BL」只回 6 条、点赞最高的那条 6907 赞的帖子根本不在结果里，而话题抓帖（`coolapk_topic` with_feeds）第一条就是它。所以找热门主题时**优先走话题通道**，搜帖只用来发现长尾关键词。
 
 ## 分类 → 话题映射表
 
