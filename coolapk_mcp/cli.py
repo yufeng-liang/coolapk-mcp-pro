@@ -1,0 +1,563 @@
+"""CLI 入口 — 精简 JSON 输出，节省 token"""
+
+import asyncio
+import json
+import sys
+import tempfile
+from functools import wraps
+from pathlib import Path
+from urllib.parse import unquote
+
+import click
+
+from coolapk_mcp.boards import BOARD_URLS
+from coolapk_mcp.client import CoolapkClient, CoolapkError
+from coolapk_mcp.config import AppConfig, has_valid_sessid, parse_cookie_str
+from coolapk_mcp.models import (
+    FeedDetail,
+    FeedModel,
+    ReplyModel,
+    TopicModel,
+    UserModel,
+)
+
+
+def _dump(obj):
+    """模型 → dict，排除默认值"""
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump(mode="json", exclude_defaults=True)
+    return obj
+
+
+def _output(data):
+    """统一 JSON 输出，紧凑格式节省 token"""
+    if data is None:
+        click.echo(json.dumps({"error": "无数据"}, ensure_ascii=False))
+        sys.exit(1)
+    if isinstance(data, list):
+        data = [_dump(item) for item in data]
+    else:
+        data = _dump(data)
+    click.echo(json.dumps(data, ensure_ascii=False))
+
+
+def _output_error(err: CoolapkError):
+    """错误输出（error_type 供调用方区分 captcha/网络/业务错误，避免盲目重试）"""
+    click.echo(json.dumps(
+        {"error": err.message, "code": err.error_code, "error_type": err.kind},
+        ensure_ascii=False,
+    ))
+    sys.exit(1)
+
+
+def async_command(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        try:
+            asyncio.run(f(*args, **kwargs))
+        except CoolapkError as e:
+            _output_error(e)
+        except KeyboardInterrupt:
+            sys.exit(130)
+    return wrapper
+
+
+def _parse_feeds(raw) -> list[FeedModel]:
+    """从 dataList 原始响应解析 feed 列表，自动过滤 card 条目"""
+    if not isinstance(raw, list):
+        return []
+    feeds = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        if item.get("entityType") == "feed":
+            feeds.append(FeedModel.from_api(item))
+        # card 内嵌的 entities 也可能是 feed
+        elif item.get("entityType") == "card":
+            for sub in item.get("entities") or []:
+                if isinstance(sub, dict) and sub.get("entityType") == "feed":
+                    feeds.append(FeedModel.from_api(sub))
+    return feeds
+
+
+@click.group()
+def cli():
+    """酷安社区 CLI — AI 原生搜索工具"""
+    pass
+
+
+# ---- 浏览 ----
+
+
+@cli.command("home")
+@click.option("--tab", type=click.Choice(["recommend", "hot", "latest"]), default="recommend")
+@click.option("--page", default=1, type=int)
+@async_command
+async def home(tab, page):
+    """首页动态"""
+    async with CoolapkClient() as client:
+        if tab == "hot":
+            raw = await client.get_hot_feeds(page)
+        elif tab == "latest":
+            raw = await client.get_latest_feeds(page)
+        else:
+            raw = await client.get_home_feeds(page)
+    _output(_parse_feeds(raw))
+
+
+@cli.command("main")
+@click.option("--page", default=1, type=int)
+@async_command
+async def main(page):
+    """首页推荐（main/indexV8）"""
+    async with CoolapkClient() as client:
+        raw = await client.get_main_feeds(page)
+    _output(_parse_feeds(raw))
+
+
+@cli.command("hot")
+@click.option("--page", default=1, type=int)
+@async_command
+async def hot(page):
+    """热榜"""
+    async with CoolapkClient() as client:
+        raw = await client.get_board_feeds("hot", page)
+    _output(_parse_feeds(raw))
+
+
+@cli.command("boards")
+def boards():
+    """列出所有板块"""
+    result = [
+        {"id": bid, "title": title, "url": url}
+        for bid, (title, url) in BOARD_URLS.items()
+    ]
+    _output(result)
+
+
+@cli.command("board")
+@click.argument("board_id")
+@click.option("--page", default=1, type=int)
+@async_command
+async def board(board_id, page):
+    """浏览板块（board_id 可用板块ID/page_name/url）"""
+    async with CoolapkClient() as client:
+        raw = await client.get_board_feeds(board_id, page)
+    _output(_parse_feeds(raw))
+
+
+@cli.command("secondhand")
+@click.option("--brand", type=int, default=None, help="品牌ID（1005=苹果）")
+@click.option("--page", default=1, type=int)
+@async_command
+async def secondhand(brand, page):
+    """二手交易"""
+    async with CoolapkClient() as client:
+        raw = await client.get_secondhand_feeds(brand, page)
+    _output(_parse_feeds(raw))
+
+
+@cli.command("feed")
+@click.argument("feed_id", type=int)
+@click.option("--replies/--no-replies", default=True)
+@click.option("--reply-page", default=1, type=int)
+@click.option("--feed-type", default="feed",
+              type=click.Choice(["feed", "trade", "feedArticle"]))
+@click.option("--uid", "author_uid", type=int, default=None,
+              help="作者UID（详情接口被风控时用于回落，不提供则自动查本地索引）")
+@click.option("--all-replies", is_flag=True,
+              help="拉全部一级评论（自动翻页，含内联楼中楼）")
+@click.option("--grep", "comment_keyword", default=None,
+              help="按关键词检索评论/楼中楼（隐含 --all-replies；空格分隔多词=任一命中）")
+@async_command
+async def feed(feed_id, replies, reply_page, feed_type, author_uid, all_replies, comment_keyword):
+    """动态详情（详情接口被验证码拦截时自动从作者动态列表回落）"""
+    async with CoolapkClient() as client:
+        smart = await client.get_feed_detail_smart(
+            feed_id, author_uid=author_uid,
+            with_replies=replies or bool(comment_keyword),
+            reply_page=reply_page,
+            all_replies=all_replies or bool(comment_keyword),
+        )
+        detail = FeedDetail.from_api(
+            smart["data"],
+            smart["replies"] if isinstance(smart["replies"], list) else None,
+            fetch_source=smart["source"],
+        )
+    data = _dump(detail)
+    if comment_keyword:
+        from coolapk_mcp import postfilter
+        data = postfilter.filter_comments(data, comment_keyword)
+    _output(data)
+
+
+# ---- 搜索 ----
+
+
+@cli.command("search")
+@click.argument("keyword")
+@click.option("--type", "search_type", default="feed",
+              type=click.Choice(["feed", "user", "feedTopic", "app"]))
+@click.option("--page", default=1, type=int)
+@click.option("--strict/--no-strict", default=True,
+              help="严格关键词过滤（默认开）：归一化后每个关键词都需命中标题/正文/作者名")
+@click.option("--meta", is_flag=True, help="输出过滤统计信息（默认只输出结果列表）")
+@async_command
+async def search(keyword, search_type, page, strict, meta):
+    """搜索内容（自动去重 + 严格过滤 + 疑似广告标记）"""
+    from coolapk_mcp import postfilter
+
+    async with CoolapkClient() as client:
+        raw = await client.search(keyword, search_type, page)
+    if not isinstance(raw, list):
+        _output(raw)
+        return
+    use_strict = strict and search_type == "feed"
+    kept, counts = postfilter.filter_search_results(raw, keyword, strict=use_strict)
+    results = postfilter.convert_search_items(kept)
+    if meta:
+        _output({"counts": counts, "results": results})
+    else:
+        _output(results)
+
+
+# ---- 用户 ----
+
+
+@cli.command("user")
+@click.argument("uid", type=int)
+@click.option("--feeds", is_flag=True, help="查看用户动态")
+@click.option("--page", default=1, type=int)
+@async_command
+async def user(uid, feeds, page):
+    """查看用户"""
+    async with CoolapkClient() as client:
+        if feeds:
+            raw = await client.get_user_feeds(uid, page)
+            _output(_parse_feeds(raw))
+        else:
+            raw = await client.get_user_space(uid)
+            if isinstance(raw, list) and raw:
+                raw = raw[0]
+            _output(UserModel.from_api(raw) if isinstance(raw, dict) else raw)
+
+
+# ---- 话题 ----
+
+
+@cli.command("topic")
+@click.argument("tag")
+@click.option("--feeds", is_flag=True, help="查看话题下的帖子")
+@click.option("--page", default=1, type=int)
+@async_command
+async def topic(tag, feeds, page):
+    """话题详情"""
+    async with CoolapkClient() as client:
+        if feeds:
+            raw = await client.get_topic_feeds(tag, page)
+            _output(_parse_feeds(raw))
+        else:
+            raw = await client.get_topic_detail(tag)
+            if isinstance(raw, list) and raw:
+                raw = raw[0]
+            _output(TopicModel.from_api(raw) if isinstance(raw, dict) else raw)
+
+
+# ---- 通知 ----
+
+
+@cli.command("notify")
+@click.argument("ntype", default="checkCount",
+                type=click.Choice(["checkCount", "atMeMeFeed", "atComment", "comment", "feedLike", "contactsFollow", "message"]))
+@click.option("--page", default=1, type=int)
+@async_command
+async def notify(ntype, page):
+    """查看通知"""
+    async with CoolapkClient() as client:
+        if ntype == "checkCount":
+            data = await client.get_notification_count()
+        else:
+            data = await client.get_notifications(ntype, page)
+    _output(data)
+
+
+# ---- 登录 ----
+
+
+WEB_LOGIN_URL = "https://account.coolapk.com/auth/login?type=coolapk&forward=https://www.coolapk.com/"
+WEB_LOGIN_TIMEOUT = 300  # 秒，超时未登录成功按失败处理
+
+
+def _validate_login_cookies(cookies: dict[str, str]) -> str | None:
+    """校验登录 Cookie 必备键；合法返回 None，否则返回错误信息"""
+    uid = str(cookies.get("uid", "") or "").strip()
+    if not uid or uid in ("0", "10000"):
+        return f"Cookie 缺少有效 uid（当前 uid={uid or '空'}，需非空且非 0/10000）"
+    if not str(cookies.get("token", "") or "").strip():
+        return "Cookie 缺少 token"
+    return None
+
+
+def _apply_cookie_login(config: AppConfig, cookie_str: str) -> dict:
+    """解析校验 Cookie 串并写入 config 持久化；失败返回含 error 的 dict"""
+    cookies = parse_cookie_str(cookie_str)
+    err = _validate_login_cookies(cookies)
+    if err:
+        return {"error": err}
+    config.uid = cookies["uid"].strip()
+    config.username = unquote(cookies.get("username", ""))
+    config.token = cookies["token"].strip()
+    config.desktop_cookie = cookie_str
+    config.save()
+    return {
+        "status": "ok",
+        "uid": config.uid,
+        "username": config.username,
+        "sessid_ok": has_valid_sessid(cookie_str),
+    }
+
+
+def _run_web_login() -> str | None:
+    """pywebview 打开酷安网页登录，轮询 Cookie，成功返回完整 Cookie 串
+
+    轮询中把各次读到的 Cookie 累积进 jar：登录成功瞬间服务域在
+    account.coolapk.com，随后重定向到 www.coolapk.com 可能只暴露部分键，
+    累积可跨导航时机抓全 SESSID/uid/username/token。
+    """
+    import time
+
+    import webview
+
+    result: dict = {"cookie_str": "", "closed": False}
+
+    def poll(window):
+        jar: dict[str, str] = {}
+        deadline = time.time() + WEB_LOGIN_TIMEOUT
+        while time.time() < deadline and not result["closed"]:
+            try:
+                for sc in window.get_cookies() or []:
+                    for key, morsel in sc.items():
+                        value = getattr(morsel, "value", None)
+                        if value:
+                            jar[key] = value
+            except Exception:
+                pass
+            sessid = jar.get("SESSID", "")
+            if (
+                sessid
+                and sessid.lower() not in ("deleted", "expired")
+                and jar.get("uid")
+                and jar.get("token")
+            ):
+                result["cookie_str"] = "; ".join(f"{k}={v}" for k, v in jar.items())
+                break
+            time.sleep(0.5)
+        try:
+            window.destroy()
+        except Exception:
+            pass
+
+    window = webview.create_window(
+        "酷安登录 — 登录成功后窗口会自动关闭",
+        WEB_LOGIN_URL,
+        width=480,
+        height=760,
+    )
+    window.events.closed += lambda _w=None: result.update(closed=True)
+    webview.start(poll, window)
+    return result["cookie_str"] or None
+
+
+@cli.command("login")
+@click.option("--web", is_flag=True, help="打开浏览器窗口网页登录（pywebview，Windows 走系统 WebView2）")
+@click.option("--cookie", help="导入完整 Cookie 串（uid=..;username=..;token=..[;SESSID=..]）")
+@click.option("--status", is_flag=True, help="查看登录状态")
+@click.option("--adb", is_flag=True, help="从已连接的手机 ADB 自动提取 Cookie 登录")
+@click.option("--sms", is_flag=True, help="短信验证码登录")
+@click.option("--phone", help="手机号（SMS 登录用）")
+@click.option("--captcha", help="图形验证码（SMS 发送验证码时需要）")
+@click.option("--code", help="短信验证码（SMS 登录第二步）")
+@click.option("--sessid", help="SESSID cookie（SMS 登录第二步，从第一步响应获取）")
+@click.option("--validate-url", help="验证 URL（SMS 登录第二步，从第一步响应的 message 获取）")
+@click.option("--captcha-file", default=None, help="图形验证码图片保存路径（默认系统临时目录）")
+@async_command
+async def login(web, cookie, status, adb, sms, phone, captcha, code, sessid, validate_url, captcha_file):
+    """登录管理
+
+    登录方式（四选一）：
+      coolapk login --web            浏览器窗口网页登录（推荐）
+      coolapk login --sms ...        短信验证码登录（两步流程见下）
+      coolapk login --cookie "<串>"  直接导入 Cookie 串
+      coolapk login --adb            从已连接手机提取 Cookie
+
+    SMS 登录两步流程：
+    第一步（发送验证码）：
+      coolapk login --sms --phone <手机号> --captcha <图形验证码>
+      → 不带 --captcha 时先把验证码图片存到临时目录，人工识别后带 --captcha 重跑
+      → 成功后返回 sessid 和 validate_url（message 字段）
+
+    第二步（提交短信验证码）：
+      coolapk login --sms --code <短信验证码> --sessid <第一步的sessid> --validate-url <第一步的message>
+      → 成功后自动写入登录态（完整 Cookie 串含 SESSID）
+    """
+    config = AppConfig.load()
+    captcha_file = captcha_file or str(Path(tempfile.gettempdir()) / "coolapk_captcha.jpg")
+
+    # --status: 查看登录状态
+    if status:
+        _output({
+            "logged_in": config.is_logged_in,
+            "uid": config.uid,
+            "username": config.username,
+            "source": config.source,
+            "login_mode": config.login_mode,
+            "sessid_ok": has_valid_sessid(config.desktop_cookie) if config.desktop_cookie else None,
+        })
+        return
+
+    # --web: 网页登录
+    if web:
+        try:
+            cookie_str = _run_web_login()
+        except Exception as e:
+            click.echo(json.dumps(
+                {"error": f"网页登录窗口启动失败: {e}", "hint": "无图形环境时请改用 --sms 或 --cookie"},
+                ensure_ascii=False,
+            ))
+            sys.exit(1)
+        if not cookie_str:
+            click.echo(json.dumps(
+                {"error": "网页登录未完成（窗口关闭或超时），未获取到登录 Cookie"},
+                ensure_ascii=False,
+            ))
+            sys.exit(1)
+        result = _apply_cookie_login(config, cookie_str)
+        if "error" in result:
+            click.echo(json.dumps(result, ensure_ascii=False))
+            sys.exit(1)
+        result["source"] = "web"
+        _output(result)
+        return
+
+    # --adb: 从手机提取 Cookie
+    if adb:
+        cookie_str = _extract_cookie_from_adb()
+        if not cookie_str:
+            _output({"error": "未能从手机提取 Cookie，请确认手机已连接且酷安已登录"})
+            sys.exit(1)
+        result = _apply_cookie_login(config, cookie_str)
+        if "error" in result:
+            click.echo(json.dumps(result, ensure_ascii=False))
+            sys.exit(1)
+        _output(result)
+        return
+
+    # --sms: SMS 登录
+    if sms:
+        # 第二步：提交短信验证码
+        if code and sessid and validate_url:
+            async with CoolapkClient() as client:
+                data = await client.login_sms(sessid, validate_url, code)
+            cookies = data.get("_cookies", {}) if isinstance(data, dict) else {}
+            if cookies.get("uid") and cookies.get("token"):
+                # 三键拼上 SESSID 存完整串，后续请求可整串直用
+                full_cookie = "; ".join(
+                    [sessid] + [f"{k}={v}" for k, v in cookies.items()]
+                )
+                result = _apply_cookie_login(config, full_cookie)
+                if "error" in result:
+                    click.echo(json.dumps(result, ensure_ascii=False))
+                    sys.exit(1)
+                result["message"] = data.get("message", "")
+                _output(result)
+            else:
+                _output(data)
+            return
+
+        # 第一步：发送验证码
+        if phone and captcha:
+            async with CoolapkClient() as client:
+                if sessid:
+                    # 复用之前的 session（验证码图片已在该 session 获取）
+                    request_hash_to_use = validate_url or ""
+                    data = await client.send_sms_code(sessid, request_hash_to_use, phone, captcha)
+                else:
+                    # 新 session：获取登录页 SESSID + requestHash
+                    sid, request_hash = await client.get_sms_login_page()
+                    data = await client.send_sms_code(sid, request_hash, phone, captcha)
+                    sessid = sid
+            if isinstance(data, dict):
+                data.setdefault("sessid", sessid)
+            _output(data)
+            return
+
+        # 只传 phone 没传 captcha：获取验证码图片
+        if phone and not captcha:
+            async with CoolapkClient() as client:
+                sid, request_hash = await client.get_sms_login_page()
+                captcha_bytes = await client.get_captcha_image(sid)
+            Path(captcha_file).write_bytes(captcha_bytes)
+            _output({
+                "step": "captcha_required",
+                "sessid": sid,
+                "request_hash": request_hash,
+                "captcha_file": captcha_file,
+                "next": f"请识别 {captcha_file} 中的验证码，然后运行："
+                        f" coolapk login --sms --phone {phone} --captcha <验证码> --sessid '{sid}' --validate-url '{request_hash}'",
+            })
+            return
+
+        _output({"error": "SMS 登录需要 --phone 参数。用法见 --help"})
+        sys.exit(1)
+
+    # --cookie: 手动 Cookie 登录
+    if cookie:
+        result = _apply_cookie_login(config, cookie)
+        if "error" in result:
+            click.echo(json.dumps(result, ensure_ascii=False))
+            sys.exit(1)
+        _output(result)
+        return
+
+    click.echo(json.dumps(
+        {"error": "请使用 --web / --cookie / --adb / --sms 登录，或 --status 查看状态"},
+        ensure_ascii=False,
+    ))
+    sys.exit(1)
+
+
+def _extract_cookie_from_adb() -> str | None:
+    """从已连接的手机 ADB 提取酷安 Cookie
+
+    前提：手机已 root，酷安已登录。
+    从 /data/data/com.coolapk.market/shared_prefs/coolapk_preferences_v7.xml 提取
+    uid/username/token。
+    """
+    import subprocess
+    import re
+
+    try:
+        result = subprocess.run(
+            ["adb", "shell", "su", "-c",
+             "cat /data/data/com.coolapk.market/shared_prefs/coolapk_preferences_v7.xml"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+    xml = result.stdout
+    if not xml:
+        return None
+
+    uid = re.search(r'<string name="uid">([^<]+)</string>', xml)
+    username = re.search(r'<string name="username">([^<]+)</string>', xml)
+    token = re.search(r'<string name="token">([^<]+)</string>', xml)
+
+    if not (uid and username and token):
+        return None
+
+    return f"uid={uid.group(1)};username={username.group(1)};token={token.group(1)}"
+
+
+if __name__ == "__main__":
+    cli()

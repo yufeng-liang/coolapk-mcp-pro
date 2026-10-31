@@ -1,0 +1,934 @@
+"""HTTP 客户端 + API 封装 — 合并网络层和业务端点"""
+
+import json
+import time
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+import httpx
+
+from coolapk_mcp import throttle
+from coolapk_mcp.auth.token_v3 import DEFAULT_APP_VERSION, DEFAULT_VERSION_CODE, generate_token_v3
+from coolapk_mcp.config import AppConfig, has_valid_sessid
+
+
+# 登录态失效统一提示（error_type=auth_expired，AI 客户端据此引导用户重登）
+AUTH_EXPIRED_MESSAGE = (
+    "登录态已失效：请在酷安桌面端重新登录后再试，"
+    "或运行 py -m coolapk_mcp login --web 重新导入登录 Cookie（也可用 login --sms 短信登录）"
+)
+
+
+class CoolapkError(Exception):
+    """API 业务错误
+
+    kind: api(服务端业务错误) captcha(风控验证码) network(超时/连接)
+          transient(5xx/429等可重试) http(其他HTTP错误) parse(响应解析失败)
+    """
+
+    def __init__(self, message: str, error_code: int = -1, kind: str = "api"):
+        self.message = message
+        self.error_code = error_code
+        self.kind = kind
+        super().__init__(message)
+
+
+class CoolapkClient:
+    """酷安 API 客户端"""
+
+    BASE_URL = "https://api.coolapk.com"
+
+    # 端点被验证码拦截后的冷却期（秒）：期间不再撞该端点，直接走回落
+    CAPTCHA_COOLDOWN = 600.0
+    # 详情回落时最多翻作者动态的页数
+    FALLBACK_SCAN_PAGES = 3
+    # feed_id → 作者uid 索引，持久化到 ~/.coolapk-mcp/uid_index.json
+    INDEX_FILE = Path.home() / ".coolapk-mcp" / "uid_index.json"
+    INDEX_MAX = 2000
+
+    def __init__(self, config: AppConfig | None = None):
+        self.config = config or AppConfig.load()
+        try:
+            self._client = httpx.AsyncClient(timeout=30.0)
+        except httpx.InvalidURL:
+            # NO_PROXY 等环境变量含非法值（如 [::1]）时 httpx 会解析失败，禁用环境代理兜底
+            self._client = httpx.AsyncClient(timeout=30.0, trust_env=False)
+        self._limiter = throttle.RateLimiter()
+        self._cache = throttle.TTLCache()
+        self._blocked: dict[str, float] = {}
+        self._uid_index: dict[int, int] = {}
+        self._load_uid_index()
+
+    # ---- feed_id → uid 索引（详情回落的关键） ----
+
+    def _load_uid_index(self) -> None:
+        try:
+            data = json.loads(self.INDEX_FILE.read_text(encoding="utf-8"))
+            self._uid_index = {int(k): int(v) for k, v in data.items()}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            self._uid_index = {}
+
+    def _save_uid_index(self) -> None:
+        try:
+            self.INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
+            trimmed = dict(list(self._uid_index.items())[-self.INDEX_MAX:])
+            self.INDEX_FILE.write_text(json.dumps(trimmed), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _index_feeds(self, data: Any) -> None:
+        """从列表响应记录 feed_id → 作者uid，供详情被风控时回落"""
+        if not isinstance(data, list):
+            return
+        changed = False
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            if item.get("entityType") not in ("feed", None):
+                continue
+            fid = item.get("id")
+            uid = item.get("uid") or (item.get("userInfo") or {}).get("uid")
+            if not fid or not uid:
+                continue
+            try:
+                self._uid_index[int(fid)] = int(uid)
+                changed = True
+            except (TypeError, ValueError):
+                continue
+        if changed:
+            self._save_uid_index()
+
+    def _build_headers(self) -> dict[str, str]:
+        """组装请求头，每次请求重新生成 X-App-Token（v3 算法）"""
+        token, _ = generate_token_v3(self.config.device_code)
+        return {
+            "X-Sdk-Int": "35",
+            "X-Sdk-Locale": "zh-CN",
+            "X-App-Mode": "universal",
+            "X-App-Channel": "coolapk",
+            "X-App-Id": "com.coolapk.market",
+            "X-App-Device": self.config.device_code,
+            "X-App-Version": DEFAULT_APP_VERSION,
+            "X-App-Code": str(DEFAULT_VERSION_CODE),
+            "X-Api-Version": "16",
+            "X-App-Supported": str(DEFAULT_VERSION_CODE),
+            "X-Dark-Mode": "0",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-App-Token": token,
+            "User-Agent": (
+                "Dalvik/2.1.0 (Linux; U; Android 16; 23113RKC6C Build/AQ3A.250226.002) "
+                "(#Build; Redmi; 23113RKC6C; AQ3A.250226.002; HyperOS_3.0; 3.0.1.0) "
+                f"+CoolMarket/{DEFAULT_APP_VERSION}-{DEFAULT_VERSION_CODE}-universal"
+            ),
+        }
+
+    def _get_cookie_header(self) -> str | None:
+        """返回 Cookie 字符串。直接拼字符串避免 httpx cookies 参数对中文 username 的编码问题。
+
+        桌面端导入的完整 Cookie 串（含 SESSID 等）直接整串使用；
+        否则按 APP 端三键（uid/username/token）拼接。
+        """
+        if not self.config.is_logged_in:
+            return None
+        if self.config.desktop_cookie and has_valid_sessid(self.config.desktop_cookie):
+            return self.config.desktop_cookie
+        return f"uid={self.config.uid}; username={quote(self.config.username, safe='')}; token={self.config.token}"
+
+    def _check_local_auth(self) -> None:
+        """登录前本地校验：未登录或完整 Cookie 串 SESSID 已失效直接抛 auth_expired，不发探测请求
+
+        仅当 Cookie 串里带 SESSID 键而值无效时判失效；SMS 登录只落三键串（无
+        SESSID），不算失效。检查用「;SESSID=」前缀匹配，避免误伤值里的子串。
+        """
+        if not self.config.is_logged_in:
+            raise CoolapkError(AUTH_EXPIRED_MESSAGE, kind="auth_expired")
+        cookie = self.config.desktop_cookie
+        if cookie and not has_valid_sessid(cookie) and ";SESSID=" in f";{cookie}":
+            raise CoolapkError(AUTH_EXPIRED_MESSAGE, kind="auth_expired")
+
+    async def _request(self, method: str, path: str, **kwargs) -> Any:
+        """统一请求方法：本地登录预检 → GET 缓存 → 全局限速 → 瞬态错误退避重试 → 错误分类"""
+        # 本地预检：未登录或 SESSID 已失效直接抛 auth_expired，不发探测请求；
+        # 请求类端点（登录流程自身）不受此限制
+        if not path.startswith("/v6/auth/"):
+            self._check_local_auth()
+
+        cache_key = None
+        if method == "GET" and throttle.CACHE_ENABLED:
+            params = kwargs.get("params") or {}
+            cache_key = f"{path}?{sorted((str(k), str(v)) for k, v in params.items())}"
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        url = f"{self.config.api_base}{path}"
+        resp = None
+        last_err: CoolapkError | None = None
+        for attempt in range(throttle.MAX_RETRIES + 1):
+            await self._limiter.acquire()
+            headers = self._build_headers()
+            cookie = self._get_cookie_header()
+            if cookie:
+                headers["Cookie"] = cookie
+            err: CoolapkError | None = None
+            try:
+                resp = await self._client.request(
+                    method, url, headers=headers, **kwargs
+                )
+                resp.raise_for_status()
+                break
+            except httpx.TimeoutException:
+                err = CoolapkError("请求超时", kind="network")
+            except httpx.ConnectError:
+                err = CoolapkError("无法连接服务器", kind="network")
+            except httpx.HTTPStatusError as e:
+                code = e.response.status_code
+                if code == 403:
+                    # 403 通常是登录态失效（captchaRequired / 会话无效）
+                    raise CoolapkError(AUTH_EXPIRED_MESSAGE, error_code=403, kind="auth_expired")
+                kind = "transient" if (code >= 500 or code == 429) else "http"
+                err = CoolapkError(f"HTTP {code}", kind=kind)
+            if err is not None and err.kind not in ("network", "transient"):
+                raise err
+            last_err = err
+            if attempt < throttle.MAX_RETRIES:
+                await throttle.backoff_sleep(attempt)
+
+        if resp is None:
+            raise last_err or CoolapkError("请求失败", kind="network")
+
+        try:
+            result = resp.json()
+        except json.JSONDecodeError:
+            # 风控页/网关错误页常返回 HTML
+            raise CoolapkError("响应解析失败", kind="parse")
+
+        # 检查业务错误
+        if "data" not in result and "message" in result:
+            error_code = result.get("error", -1)
+            message = result.get("message", "未知错误")
+            if isinstance(error_code, str):
+                error_code = int(error_code) if error_code.lstrip("-").isdigit() else -1
+            if "验证码" in message or "captcha" in message.lower():
+                # 负缓存：该端点短期内已被风控，冷却期内不再请求
+                base = path.split("?", 1)[0]
+                self._blocked[base] = time.monotonic() + self.CAPTCHA_COOLDOWN
+                raise CoolapkError(message, error_code, kind="captcha")
+            if error_code == 403 or "captchaRequired" in str(result):
+                raise CoolapkError(AUTH_EXPIRED_MESSAGE, error_code=403, kind="auth_expired")
+            raise CoolapkError(message, error_code)
+        data = result.get("data")
+        if isinstance(data, list):
+            self._index_feeds(data)
+        if cache_key is not None:
+            self._cache.put(cache_key, data, throttle.ttl_for(path))
+        return data
+
+    def _endpoint_blocked(self, base: str) -> bool:
+        until = self._blocked.get(base, 0.0)
+        if until and time.monotonic() < until:
+            return True
+        self._blocked.pop(base, None)
+        return False
+
+    async def get(self, path: str, params: dict | None = None) -> Any:
+        return await self._request("GET", path, params=params)
+
+    async def post(self, path: str, data: dict | None = None) -> Any:
+        return await self._request("POST", path, data=data or {})
+
+    async def post_multipart(
+        self, path: str, fields: dict[str, str] | None = None,
+        files: dict[str, tuple[str, bytes, str]] | None = None,
+    ) -> Any:
+        """multipart/form-data POST。files 格式: {name: (filename, content, content_type)}"""
+        return await self._request(
+            "POST", path, data=fields or {}, files=files or {}
+        )
+
+    # ---- 只读透传与图片下载（MCP 工具专用，不用于业务写入） ----
+
+    # get_url 允许的响应字段白名单（服务端可能返回的敏感/系统字段）
+    _GET_URL_BLOCKED_KEYS = frozenset(
+        {"cookie", "cookies", "token", "session", "sessid", "config"}
+    )
+
+    @classmethod
+    def _check_get_url_path(cls, path: str) -> str:
+        """校验 get_url 的路径参数：仅允许 api.coolapk.com 的 GET /v6/ 只读路径。
+
+        返回规范化后的路径；违规抛 CoolapkError(error_code=403)。
+        """
+        path = (path or "").strip()
+        # 允许整段 URL 输入，但必须是 api.coolapk.com
+        if path.startswith(("http://", "https://")):
+            from urllib.parse import urlsplit
+            host = urlsplit(path).netloc.lower()
+            if host not in ("api.coolapk.com", "api2.coolapk.com"):
+                raise CoolapkError(
+                    f"拒绝访问非酷安 API 域名: {host}（仅允许 api.coolapk.com）",
+                    error_code=403, kind="api",
+                )
+            path = urlsplit(path).path + (
+                f"?{urlsplit(path).query}" if urlsplit(path).query else ""
+            )
+        if not path.startswith("/"):
+            path = f"/{path}"
+        if not path.startswith("/v6/"):
+            raise CoolapkError(
+                f"仅允许 /v6/ 开头的接口路径，收到: {path}",
+                error_code=403, kind="api",
+            )
+        # 写端点黑名单：含写动作关键词的路径一律拒绝
+        # （酷安写接口全部走 GET 传参，必须拦在客户端）
+        lowered = path.lower()
+        blocked_segments = (
+            "/like", "/unlike", "/digg", "/reply", "/replyadd", "/replyaddpush",
+            "/follow", "/unfollow", "/followuser", "/createFeed", "/publish",
+            "/deletefeed", "/deletecomment", "/delete", "/edit", "/update",
+            "/message", "/chat", "/sendmessage", "/upload", "/report",
+            "/block", "/blacklist", "/favorite", "/collection", "/subscribe",
+            "/checkin", "/sign", "/vote", "/apply", "/modify", "/set",
+        )
+        for seg in blocked_segments:
+            if seg in lowered:
+                raise CoolapkError(
+                    f"拒绝写操作端点: {path}",
+                    error_code=403, kind="api",
+                )
+        return path
+
+    async def get_url(self, path: str) -> Any:
+        """只读透传：GET 任意 /v6/ 只读路径并返回原始 JSON。
+
+        仅允许 api.coolapk.com 域名；写端点黑名单一律 403 拒绝。
+        """
+        return await self.get(self._check_get_url_path(path))
+
+    async def download_image(self, url: str) -> tuple[bytes, str]:
+        """下载 CDN 图片，返回 (图片字节, 格式名)。
+
+        酷安图片 CDN 校验 Referer：必须带 https://www.coolapk.com/，
+        用浏览器 UA 即可放行（实测无需 App UA，见 src-tauri client.rs:3790）。
+        仅允许 image/avatar/static.coolapk.com 三个 CDN 域名。
+        """
+        from urllib.parse import urlsplit
+
+        url = (url or "").strip()
+        if url.startswith("//"):
+            url = f"https:{url}"
+        host = urlsplit(url).netloc.lower()
+        allowed_hosts = (
+            "image.coolapk.com", "avatar.coolapk.com", "static.coolapk.com",
+        )
+        if host not in allowed_hosts:
+            raise CoolapkError(
+                f"图片域名不在白名单: {host or url}"
+                f"（仅允许 {'/'.join(allowed_hosts)}）",
+                error_code=403, kind="api",
+            )
+        if url.startswith("http://"):
+            url = f"https://{url[len('http://'):]}"
+
+        import httpx
+        from httpx import HTTPError as _HTTPError
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.coolapk.com/",
+        }
+        try:
+            async with httpx.AsyncClient(
+                headers=headers, timeout=30, follow_redirects=True,
+            ) as client:
+                resp = await client.get(url)
+        except httpx.InvalidURL:
+            # NO_PROXY 等环境变量含非法值（如 [::1]）时解析失败，禁用环境代理兜底
+            async with httpx.AsyncClient(
+                headers=headers, timeout=30, follow_redirects=True,
+                trust_env=False,
+            ) as client:
+                resp = await client.get(url)
+        except _HTTPError as exc:
+            raise CoolapkError(f"图片下载失败: {exc}", kind="network") from exc
+
+        if resp.status_code != 200:
+            raise CoolapkError(
+                f"图片下载失败: HTTP {resp.status_code}（URL 可能已失效，"
+                f"agent 可改用 coolapk_get_url 获取接口数据，或直接向用户呈现 URL）",
+                error_code=resp.status_code, kind="http",
+            )
+        data = resp.content
+        if not data:
+            raise CoolapkError("图片下载失败: 响应体为空", kind="http")
+
+        # 从 Content-Type 或 URL 扩展名推断格式（FastMCP Image 需要）
+        ctype = (resp.headers.get("content-type") or "").lower()
+        for fmt in ("webp", "jpeg", "jpg", "png", "gif"):
+            if fmt in ctype:
+                return data, ("jpg" if fmt == "jpeg" else fmt)
+        lower_url = url.lower().split("?", 1)[0]
+        for ext in (".webp", ".jpg", ".jpeg", ".png", ".gif"):
+            if lower_url.endswith(ext):
+                return data, ("jpg" if ext in (".jpg", ".jpeg") else ext[1:])
+        # 未见扩展名时按魔数判断
+        if data.startswith(b"\x89PNG"):
+            return data, "png"
+        if data.startswith(b"\xff\xd8"):
+            return data, "jpg"
+        if data.startswith((b"GIF87a", b"GIF89a")):
+            return data, "gif"
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return data, "webp"
+        return data, "png"
+
+    # ---- 浏览 ----
+
+    async def get_home_feeds(self, page: int = 1) -> list[dict]:
+        """首页推荐动态"""
+        return await self.get(
+            "/v6/page/dataList",
+            {"url": "/page?url=V9_HOME_TAB_FOLLOW", "page": page},
+        )
+
+    async def get_hot_feeds(self, page: int = 1) -> list[dict]:
+        """热门动态"""
+        return await self.get(
+            "/v6/page/dataList",
+            {"url": "/feed/hotList", "page": page},
+        )
+
+    async def get_latest_feeds(self, page: int = 1) -> list[dict]:
+        """最新动态"""
+        return await self.get(
+            "/v6/page/dataList",
+            {"url": "/feed/newestList", "page": page},
+        )
+
+    async def get_main_feeds(self, page: int = 1) -> list[dict]:
+        """首页推荐（main/indexV8）"""
+        return await self.get("/v6/main/indexV8", {"page": page})
+
+    async def get_board_feeds(
+        self, board_id_or_url: str, page: int = 1
+    ) -> list[dict]:
+        """通用板块浏览
+
+        Args:
+            board_id_or_url: 板块 ID（如 digital）、page_name（如 V10_DIGITAL_HOME）、或完整 url
+            page: 页码
+        """
+        from coolapk_mcp.boards import BOARD_URLS, resolve_board_url
+
+        url = resolve_board_url(board_id_or_url, BOARD_URLS)
+        return await self.get("/v6/page/dataList", {"url": url, "page": page})
+
+    async def get_secondhand_feeds(
+        self, brand: int | None = None, page: int = 1
+    ) -> list[dict]:
+        """二手交易帖子
+
+        Args:
+            brand: 品牌ID（1005=苹果），None 则全部二手
+            page: 页码
+        """
+        if brand:
+            url = f"#/feed/ershouList?brand={brand}&dataListType=staggered"
+        else:
+            url = "#/feed/ershouList?dataListType=staggered"
+        return await self.get("/v6/page/dataList", {"url": url, "page": page})
+
+    # ---- 动态 ----
+
+    async def get_feed_detail(self, feed_id: int) -> dict | list:
+        """动态详情"""
+        return await self.get(f"/v6/feed/detail?id={feed_id}")
+
+    async def get_feed_replies(
+        self, feed_id: int, page: int = 1, list_type: str = "lastupdate_desc"
+    ) -> list[dict]:
+        """动态回复列表"""
+        return await self.get(
+            f"/v6/feed/replyList?id={feed_id}&listType={list_type}"
+            f"&page={page}&discussMode=1&feedType=feed"
+        )
+
+    async def get_hot_replies(self, feed_id: int, page: int = 1) -> list[dict]:
+        """热门回复"""
+        return await self.get(
+            f"/v6/feed/hotReplyList?id={feed_id}&page={page}&discussMode=1"
+        )
+
+    async def get_all_replies(
+        self, feed_id: int, max_pages: int = 30
+    ) -> list[dict]:
+        """拉取全部一级评论（自动翻页去重；楼中楼已内联在每条的 replyRows 里）。
+
+        max_pages 是安全上限，防止超大帖（数千评论）把请求预算耗尽；
+        超过上限时返回已取到的部分，调用方可对照 replynum 总数判断是否截断。
+        """
+        all_replies: list[dict] = []
+        seen: set[str] = set()
+        for page in range(1, max_pages + 1):
+            replies = await self.get_feed_replies(feed_id, page)
+            if not isinstance(replies, list) or not replies:
+                break
+            new = 0
+            for r in replies:
+                if not isinstance(r, dict):
+                    continue
+                rid = str(r.get("id", ""))
+                if rid and rid in seen:
+                    continue
+                if rid:
+                    seen.add(rid)
+                all_replies.append(r)
+                new += 1
+            if new == 0 or len(replies) < 10:
+                break
+        return all_replies
+
+    async def get_feed_detail_smart(
+        self,
+        feed_id: int,
+        author_uid: int | None = None,
+        with_replies: bool = True,
+        reply_page: int = 1,
+        all_replies: bool = False,
+    ) -> dict:
+        """动态详情（带风控回落）
+
+        /v6/feed/detail 被验证码拦截时，自动改从作者动态列表取帖子全文；
+        回复走独立的 replyList 接口（通常不受详情接口风控影响）。
+
+        Args:
+            feed_id: 帖子ID
+            author_uid: 作者UID（提供则回落更快；不提供则查本地 feed_id→uid 索引）
+            with_replies: 是否带回复
+            reply_page: 回复页码
+
+        Returns:
+            {"source": "api"|"author_feed_fallback", "data": dict, "replies": list|None}
+        """
+        detail_raw = None
+        source = "api"
+        if not self._endpoint_blocked("/v6/feed/detail"):
+            try:
+                raw = await self.get_feed_detail(feed_id)
+                if isinstance(raw, list) and raw:
+                    raw = raw[0]
+                if isinstance(raw, dict):
+                    detail_raw = raw
+            except CoolapkError as e:
+                if e.kind != "captcha":
+                    raise
+
+        if detail_raw is None:
+            uid = author_uid or self._uid_index.get(feed_id)
+            if not uid:
+                raise CoolapkError(
+                    "帖子详情被验证码拦截，且无作者UID可回落；请提供 author_uid 或先搜索该帖",
+                    kind="captcha",
+                )
+            for page in range(1, self.FALLBACK_SCAN_PAGES + 1):
+                feeds = await self.get_user_feeds(uid, page)
+                if not isinstance(feeds, list):
+                    break
+                for item in feeds:
+                    if isinstance(item, dict) and str(item.get("id")) == str(feed_id):
+                        detail_raw = item
+                        break
+                if detail_raw is not None or len(feeds) < 10:
+                    break
+            if detail_raw is None:
+                raise CoolapkError(
+                    f"帖子详情被验证码拦截，且在作者(uid={uid})前"
+                    f"{self.FALLBACK_SCAN_PAGES}页动态中未找到 id={feed_id}",
+                    kind="captcha",
+                )
+            source = "author_feed_fallback"
+
+        replies = None
+        if with_replies:
+            try:
+                if all_replies:
+                    replies = await self.get_all_replies(feed_id)
+                else:
+                    replies = await self.get_feed_replies(feed_id, reply_page)
+            except CoolapkError:
+                replies = None  # 回复接口也被拦时降级为只返回正文
+
+        return {"source": source, "data": detail_raw, "replies": replies}
+
+    # ---- 搜索 ----
+
+    async def search(
+        self, keyword: str, search_type: str = "feed", page: int = 1
+    ) -> list[dict]:
+        """通用搜索
+        search_type: feed / user / feedTopic / app
+        """
+        return await self.get(
+            "/v6/search",
+            {
+                "type": search_type,
+                "searchValue": keyword,
+                "page": page,
+                "showAnonymous": "-1",
+            },
+        )
+
+    async def search_feeds(
+        self,
+        keyword: str,
+        feed_type: str = "feed",
+        sort: str = "default",
+        page: int = 1,
+    ) -> list[dict]:
+        """搜索动态"""
+        return await self.get(
+            "/v6/search",
+            {
+                "type": "feed",
+                "feedType": feed_type,
+                "sort": sort,
+                "searchValue": keyword,
+                "page": page,
+                "showAnonymous": "-1",
+            },
+        )
+
+    # ---- 用户 ----
+
+    async def get_user_space(self, uid: int) -> dict | list:
+        """用户空间"""
+        return await self.get(f"/v6/user/space?uid={uid}")
+
+    async def get_user_profile(self, uid: int) -> dict | list:
+        """用户资料"""
+        return await self.get(f"/v6/user/profile?uid={uid}")
+
+    async def get_user_feeds(
+        self, uid: int, page: int = 1, feed_type: str = "feed"
+    ) -> list[dict]:
+        """用户动态列表"""
+        return await self.get(
+            f"/v6/user/{feed_type}List?uid={uid}&page={page}&isIncludeTop=1"
+        )
+
+    # ---- 话题 ----
+
+    async def get_topic_detail(self, tag: str) -> dict | list:
+        """话题详情"""
+        return await self.get(f"/v6/topic/newTagDetail?tag={tag}")
+
+    async def get_topic_feeds(self, tag: str, page: int = 1) -> list[dict]:
+        """话题下的帖子"""
+        return await self.get(
+            f"/v6/topic/tagFeedList?tag={tag}&page={page}"
+        )
+
+    # ---- 应用 ----
+
+    async def get_app_detail(self, package_name: str) -> dict | list:
+        """应用详情"""
+        return await self.get(f"/v6/apk/detail?id={package_name}")
+
+    # ---- 通知 ----
+
+    async def get_notification_count(self) -> dict | list:
+        """未读通知计数"""
+        return await self.get("/v6/notification/checkCount")
+
+    async def get_notifications(
+        self, ntype: str, page: int = 1
+    ) -> list[dict]:
+        """通知列表
+        ntype: atMeMeFeed / atComment / comment / feedLike / contactsFollow / message
+        """
+        return await self.get(f"/v6/notification/{ntype}?page={page}")
+
+    # ---- 登录态校验 ----
+
+    async def check_login(self) -> Any:
+        """校验当前登录态：本地检查不通过直接抛 auth_expired；通过则调 checkLoginInfo 确认
+
+        返回 {"logged_in": True, "uid": ..., "username": ..., "source": ...}。
+        """
+        self._check_local_auth()
+        await self.get("/v6/account/checkLoginInfo")
+        return {
+            "logged_in": True,
+            "uid": self.config.uid,
+            "username": self.config.username,
+            "source": self.config.source,
+        }
+
+    # ---- 验证码 ----
+
+    async def request_validate(self, captcha: str, **extra) -> Any:
+        """提交图形验证码校验（风控解锁）
+
+        Args:
+            captcha: 用户输入的验证码
+            **extra: 额外参数（视风控场景而定）
+        """
+        data = {"captcha": captcha, **extra}
+        return await self.post("/v6/account/requestValidate", data)
+
+    # ---- SMS 登录（走 account.coolapk.com 网页登录流程） ----
+
+    async def _auth_request(
+        self, method: str, path: str, sessid: str = "",
+        data: dict | None = None, referer: str = "https://account.coolapk.com/auth/login?type=mobile",
+    ) -> httpx.Response:
+        """account.coolapk.com 的请求（模拟酷安 APP WebView）
+
+        关键点：
+        - User-Agent 用真实 Android WebView UA（Chrome 149）
+        - X-Requested-With: com.coolapk.market 标识 APP
+        - Cookie 带 DID/oaid/AppSupported 等 APP 设备标识（服务端校验是否来自 APP）
+        - 不自动跟随重定向（follow_redirects=False），调用方需自行处理 302
+        """
+        url = f"https://account.coolapk.com{path}"
+        # 组装 Cookie：SESSID + APP 设备标识
+        cookie_parts = []
+        if sessid:
+            cookie_parts.append(sessid)
+        cookie_parts.append("forward=https://www.coolapk.com")
+        cookie_parts.append("AppSupported=2604201")
+        cookie_parts.append("darkMode=0")
+        cookie_parts.append("displayVersion=v14")
+        # DID 和 oaid 是 APP 设备标识，validateLogin 端点用这些判断是否来自 APP
+        # 这些值从手机 ADB 提取或用任意值（服务端不严格校验具体值，只检查字段存在）
+        cookie_parts.append("DID=coolapk_mcp_default_did")
+        cookie_parts.append("oaid=coolapk_mcp_default_oaid")
+        cookie_str = "; ".join(cookie_parts)
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 16; 23113RKC6C Build/BP2A.250605.031.A3; wv) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
+                "Chrome/149.0.7827.91 Mobile Safari/537.36"
+            ),
+            "X-Requested-With": "com.coolapk.market",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": referer,
+            "sec-ch-ua": '"Android WebView";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+            "sec-ch-ua-mobile": "?1",
+            "sec-ch-ua-platform": '"Android"',
+            "Cookie": cookie_str,
+        }
+        if method == "POST":
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            headers["Origin"] = "https://account.coolapk.com"
+            headers["X-Requested-With"] = "XMLHttpRequest"
+            headers["Accept"] = "*/*"
+            headers["Sec-Fetch-Site"] = "same-origin"
+            headers["Sec-Fetch-Mode"] = "cors"
+            headers["Sec-Fetch-Dest"] = "empty"
+        else:
+            headers["Upgrade-Insecure-Requests"] = "1"
+            headers["Sec-Fetch-Site"] = "none"
+            headers["Sec-Fetch-Mode"] = "navigate"
+            headers["Sec-Fetch-User"] = "?1"
+            headers["Sec-Fetch-Dest"] = "document"
+        # 不跟随重定向，让调用方处理 302
+        return await self._client.request(method, url, headers=headers, data=data, follow_redirects=False)
+
+    async def get_sms_login_page(self) -> tuple[str, str]:
+        """获取 SMS 登录页，返回 (sessid_cookie, request_hash)
+
+        流程：
+        1. GET /auth/login?type=mobile 获取 HTML 和 SESSID cookie
+        2. 从 HTML 解析 requestHash
+        """
+        import re
+
+        resp = await self._auth_request("GET", "/auth/login?type=mobile")
+        html = resp.text
+        # 提取 SESSID
+        sessid = ""
+        for cookie in resp.headers.get_list("set-cookie"):
+            if "SESSID=" in cookie:
+                sessid = cookie.split(";")[0]
+                break
+        # 提取 requestHash
+        m = re.search(r"requestHash[:\s]+['\"]([^'\"]+)['\"]", html)
+        request_hash = m.group(1) if m else ""
+        if not request_hash:
+            raise CoolapkError("无法从登录页解析 requestHash")
+        return sessid, request_hash
+
+    async def get_captcha_image(self, sessid: str) -> bytes:
+        """获取图形验证码图片 bytes
+
+        Args:
+            sessid: 从 get_sms_login_page 获取的 SESSID cookie
+        """
+        import time as _time
+
+        ts = int(_time.time() * 1000)
+        resp = await self._auth_request(
+            "GET", f"/auth/showCaptchaImage?{ts}", sessid=sessid,
+            referer="https://account.coolapk.com/auth/loginByCoolapk",
+        )
+        return resp.content
+
+    async def send_sms_code(
+        self, sessid: str, request_hash: str, phone: str, captcha: str, country: int = 86,
+    ) -> dict:
+        """发送短信验证码（POST /auth/login?type=mobile）
+
+        这是 SMS 登录的第一步。服务端验证图形验证码后发送短信到手机。
+
+        Args:
+            sessid: SESSID cookie
+            request_hash: 从登录页获取的 requestHash
+            phone: 手机号
+            captcha: 图形验证码（用户识别 get_captcha_image 返回的图片后输入）
+            country: 国家码，默认 86
+
+        Returns:
+            API 响应 dict。
+            - HTTP 302：验证码正确，短信已发送。Location 头是验证码输入页 URL。
+              返回 {"status": 1, "validate_url": "<Location>", "message": "短信验证码已发送"}
+            - HTTP 200 + JSON：验证码错误或频率限制。看 message 字段。
+            - status==-1 表示需要图形验证码。
+        """
+        import time as _time
+
+        data = {
+            "submit": 1,
+            "requestHash": request_hash,
+            "country": country,
+            "mobile": phone,
+            "captcha": captcha,
+            "randomNumber": f"{int(_time.time()*1000)}{int(_time.time()%1000)}",
+            # 网易易盾反机器人 token：nscode=200 是固定成功码，
+            # nstoken 用任意值即可通过服务端 APP 环境检测（实测验证）
+            "nscode": "200",
+            "nstoken": "coolapk_mcp_python_client",
+        }
+        resp = await self._auth_request("POST", "/auth/login?type=mobile", sessid=sessid, data=data)
+
+        # 302 重定向 = 验证码正确，短信已发送
+        if resp.status_code == 302:
+            location = resp.headers.get("location", "")
+            return {
+                "status": 1,
+                "message": "短信验证码已发送",
+                "validate_url": location,
+                "sessid": sessid,
+            }
+
+        # 200 JSON 响应
+        try:
+            result = resp.json()
+        except Exception:
+            text = resp.text[:500] if resp.text else ""
+            raise CoolapkError(f"发送验证码响应解析失败: HTTP {resp.status_code}, body={text}")
+        return result
+
+    async def login_sms(self, sessid: str, validate_url: str, code: str) -> dict:
+        """提交短信验证码完成登录
+
+        这是 SMS 登录的第二步。send_sms_code 成功后返回的 validate_url 是
+        `/auth/validateLogin?key=<token>` 格式。
+
+        流程：
+        1. GET validate_url 获取验证码输入页 HTML + 新的 requestHash
+        2. POST validate_url 提交 code + type=code + requestHash
+
+        Args:
+            sessid: SESSID cookie（必须与 send_sms_code 用同一个 session）
+            validate_url: send_sms_code 成功返回的 validate_url
+            code: 用户收到的短信验证码
+
+        Returns:
+            API 响应 dict。成功后 Set-Cookie 里会有 uid/username/token。
+        """
+        import re
+        import time as _time
+
+        # validate_url 是路径格式 /auth/validateLogin?key=xxx
+        path = validate_url
+        if validate_url.startswith("https://"):
+            path = validate_url
+            if validate_url.startswith("https://"):
+                # 去掉 host 部分
+                for host in ("account.coolapk.com", "www.coolapk.com"):
+                    if host in validate_url:
+                        path = validate_url.split(host, 1)[-1]
+                        break
+        elif not validate_url.startswith("/"):
+            path = f"/{validate_url}"
+
+        # 1. GET validate 页面获取新的 requestHash
+        resp = await self._auth_request("GET", path, sessid=sessid)
+        html = resp.text
+        m = re.search(r"requestHash[:\s]+['\"]([^'\"]+)['\"]", html)
+        request_hash = m.group(1) if m else ""
+
+        # 2. POST 提交验证码
+        data = {
+            "submit": 1,
+            "requestHash": request_hash,
+            "code": code,
+            "type": "code",
+            "randomNumber": f"{int(_time.time()*1000)}{int(_time.time()%1000)}",
+            # 网易易盾反机器人 token（同 send_sms_code）
+            "nscode": "200",
+            "nstoken": "coolapk_mcp_python_client",
+        }
+        resp = await self._auth_request(
+            "POST", path, sessid=sessid, data=data,
+            referer=f"https://account.coolapk.com{path}",
+        )
+
+        # 检查 302 重定向（登录成功）
+        if resp.status_code == 302:
+            location = resp.headers.get("location", "")
+            cookies = {}
+            for cookie in resp.headers.get_list("set-cookie"):
+                for name in ("uid", "username", "token"):
+                    if cookie.startswith(f"{name}="):
+                        val = cookie.split(";")[0].split("=", 1)[1]
+                        if val and val != "deleted":
+                            cookies[name] = val
+            return {
+                "status": 1,
+                "message": "登录成功",
+                "redirect": location,
+                "_cookies": cookies,
+            }
+
+        try:
+            result = resp.json()
+        except Exception:
+            text = resp.text[:500] if resp.text else ""
+            raise CoolapkError(f"短信验证码登录响应解析失败: HTTP {resp.status_code}, body={text}")
+
+        # 从 Set-Cookie 提取 uid/username/token
+        cookies = {}
+        for cookie in resp.headers.get_list("set-cookie"):
+            for name in ("uid", "username", "token"):
+                if cookie.startswith(f"{name}="):
+                    val = cookie.split(";")[0].split("=", 1)[1]
+                    if val and val != "deleted":
+                        cookies[name] = val
+        result["_cookies"] = cookies
+        return result
+
+    async def close(self):
+        await self._client.aclose()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        await self.close()
