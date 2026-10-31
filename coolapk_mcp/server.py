@@ -1,6 +1,7 @@
 """MCP Server — 酷安社区只读工具集（9 个工具）"""
 
 import functools
+import hmac
 import json
 import os
 from typing import Any
@@ -81,15 +82,21 @@ def _parse_feed_list(raw: Any) -> list[FeedModel]:
 
 
 def _catch_api_error(fn):
-    """把 CoolapkError 转成结构化 JSON（带 error_type），AI 客户端可据此避免盲目重试"""
+    """把 CoolapkError 转成结构化 JSON（带 error_type 与 code），AI 客户端可据此
+    程序化区分错误类别（如 403 登录失效 vs 1004 风控）。"""
 
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
+        global _client
         try:
             return await fn(*args, **kwargs)
         except CoolapkError as e:
+            if e.kind == "auth_expired":
+                # 登录态失效：丢弃旧 client（其构造时快照的登录态已过期），
+                # 下次调用重建并重新读 config——桌面端重登后直接重试即可生效
+                _client = None
             return json.dumps(
-                {"error": e.message, "error_type": e.kind},
+                {"error": e.message, "error_type": e.kind, "code": e.error_code},
                 ensure_ascii=False,
             )
 
@@ -334,15 +341,28 @@ def _build_http_app():
     from starlette.routing import Mount, Route
 
     host = os.environ.get("COOLAPK_HTTP_HOST", "127.0.0.1")
-    port = int(os.environ.get("COOLAPK_HTTP_PORT", "8000"))
+    port_raw = os.environ.get("COOLAPK_HTTP_PORT", "8000")
+    try:
+        port = int(port_raw)
+    except ValueError:
+        raise SystemExit(
+            f"[coolapk-mcp] COOLAPK_HTTP_PORT={port_raw!r} 不是有效端口号，"
+            "请设置为 1-65535 的整数。"
+        )
     token = os.environ.get("COOLAPK_HTTP_TOKEN", "")
 
-    # 非回环地址必须显式配 token，防止登录态裸奔公网
+    # 非回环地址必须显式配 token，防止登录态裸奔公网。
+    # 先按字面 IP 解析（直接支持 ::1 等 IPv6 回环，getaddrinfo 在部分平台会失败），
+    # 失败再走域名解析；都解析不出按公网对待，从严。
     try:
-        addr = ipaddress.ip_address(socket.gethostbyname(host))
+        addr = ipaddress.ip_address(host)
         is_loopback = addr.is_loopback
-    except (socket.gaierror, ValueError):
-        is_loopback = False  # 解析不出就按公网对待，从严
+    except ValueError:
+        try:
+            addr = ipaddress.ip_address(socket.gethostbyname(host))
+            is_loopback = addr.is_loopback
+        except (socket.gaierror, ValueError):
+            is_loopback = False
     if not is_loopback and not token:
         raise SystemExit(
             "[coolapk-mcp] 拒绝启动：COOLAPK_HTTP_HOST 绑定非回环地址（"
@@ -361,7 +381,12 @@ def _build_http_app():
             if state["token"]:
                 headers = dict(scope.get("headers") or [])
                 auth = headers.get(b"authorization", b"").decode("latin-1")
-                if auth != f"Bearer {state['token']}":
+                # RFC 9110：scheme 大小写不敏感；token 用恒定时间比较防时序侧信道
+                scheme, _, cred = auth.partition(" ")
+                expected = f"Bearer {state['token']}".encode()
+                if scheme.lower() != "bearer" or not hmac.compare_digest(
+                    cred.encode(), expected[len(b"Bearer "):]
+                ):
                     resp = JSONResponse(
                         {"error": "unauthorized", "detail": "缺少或错误的 Bearer Token"},
                         status_code=401,

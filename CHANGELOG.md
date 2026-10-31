@@ -2,6 +2,32 @@
 
 本文件记录本仓库相对基座的增强与修复。基座为 zjy2968466837/coolapk-mcp（2026-10-24 master 快照，承自 Lniosy/coolapk-mcp，MIT License），引入时的基座能力见 [NOTICE.md](NOTICE.md)。
 
+## 0.3.1（2026-10-31）
+
+第二轮全面审查（5 个独立维度：HTTP 传输与安全 / 部署物 / 核心代码回归 / 文档一致性 / 传输层动态测试）后的集中修复。
+
+### 修复
+
+- 登录失效被误报为验证码：403（message 为 `captchaRequired`）的风控响应永远先命中验证码分支，导致 `error_type=captcha` 误导并写入 600 秒负缓存；现 403 判定优先，验证码判定收窄为中文「验证码」字样
+- `get_url` 黑名单误伤 7 个只读端点（`/v6/vote/commentList`、`/v6/collection/*`、`/v6/favorite/list`、`/v6/notification/like`、`/v6/user/blackList`）：单段泛词（`/like` `/vote` 等）改为相邻两段形态匹配；反向补齐 8 个此前漏拦的写端点（blacklist 族、`followTag`/`unFollowTag`、`unFavorite`、`sendVcode`），`/v6/account/` 仅放行 `checkLoginInfo`/`requestValidate`
+- 纯图帖（无 `content`/`feed_type` 字段）落入用户白名单被裁掉 `id`/`images` 等字段：裁剪结果异常时回落原始条目
+- 重试耗尽后误解析末次响应体：429 + HTML 风控页被误报 `error_type=parse`，现按末次状态码构造 `transient`/`http` 错误
+- HTTP 错误 payload 新增 `code` 字段（酷安业务错误码），AI 客户端可程序化区分登录失效与风控
+- Bearer 鉴权改常量时间比较（`hmac.compare_digest`）且 scheme 大小写不敏感（RFC 9110）；`COOLAPK_HTTP_PORT` 非数字改为友好退出；回环判定支持 `::1` 字面量
+- 登录态过期后自动重建客户端：HTTP/stdio 服务进程收到 `auth_expired` 后下次调用重读登录态，桌面端重新登录后直接重试即可生效（无需重启服务进程）
+- `COOLAPK_MAX_RETRIES` 上限钳位 8（防指数退避溢出）、`status` 布尔值误判、图片魔数未知时 MIME 误报、空 `rid` 去重、索引/配置文件非 dict 顶层防护
+
+### 变更
+
+- `mcp` 依赖下限抬至 1.30（`TransportSecuritySettings` 顶层导入需要）；显式声明 `click` 依赖（此前靠传递依赖）；补充 `[build-system]`
+- Dockerfile 新增 `HEALTHCHECK`（urllib 探活 `/health`）、修正过时注释；`.dockerignore` 清理残留
+
+### 文档
+
+- README「快速启动」统一为 Linux 服务器写法；Docker 节补 fail-closed 说明；注明 uvicorn workers 必须为 1 与 DNS rebinding 校验关闭的取舍
+- `login --web` 的 pythonnet 表述校准（锁 3.2.1，Python 3.14 运行时初始化失败，推荐 3.12 或改用 `--sms`/`--cookie`）；故障排查 `auth_expired` 按 Python 版本分流
+- SKILL.md 修复断链与「重登后无需重启」的过时表述；NOTICE.md 补 `--adb` 通道与版本里程碑
+
 ## 0.3.0（2026-10-31）
 
 ### 新增

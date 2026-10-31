@@ -7,7 +7,7 @@ description: 用酷安 MCP 工具检索酷安社区资料的使用指南——�
 
 酷安（CoolAPK）是国内安卓玩机社区的主阵地：写机教程、root/解锁 BL 资源、Magisk 模块、ROM/刷机包、机型适配讨论都集中在这里。本 skill 指导 agent 通过酷安 MCP Server（`coolapk_*` 工具族）检索这些资料。
 
-前置条件：MCP 客户端（dsh / Claude Desktop / Cursor 或其他任意 harness）已按 [README.md](../README.md)「Agent 接入」一节配置酷安 MCP Server（任何 agent 都可照该节自助完成接入），并完成登录态准备（推荐安装第三方酷安桌面端登录一次，见 README「准备清单」）。
+前置条件：MCP 客户端（dsh / Claude Desktop / Cursor 或其他任意 harness）已按 [README.md](../../README.md)「Agent 接入」一节配置酷安 MCP Server（任何 agent 都可照该节自助完成接入），并完成登录态准备（推荐安装第三方酷安桌面端登录一次，见 README「准备清单」）。
 
 ## 何时用酷安搜资料
 
@@ -92,7 +92,7 @@ coolapk_topic         刷话题：with_feeds=true 拿话题下最新动态，跟
 - **不要高频连续调用**：一次任务里工具调用控制在个位数；同一关键词换不同词而不是连续翻很多页；列表页翻页 ≤3 页一般够用；
 - **优先命中缓存与已有信息**：同一话题/帖子在一次会话内不要重复拉详情；
 - **遇到 `error_type: captcha`**：不要立刻重试同一调用。换信息源（改用话题动态或搜索其它关键词），仍不行就告知用户稍后再试；
-- **遇到 `error_type: auth_expired`**：不要反复重试受登录态影响的调用，直接引导用户重新登录，按优先级：① 用户已装[酷安第三方桌面端](https://github.com/coolapk-desktop/coolapk-desktop)（酷安官方没有桌面端，这是社区维护的非官方客户端）→ 让用户在桌面端重新登录后直接重试即可，MCP auto 模式自动复用其登录态，无需重启 MCP；② 未装桌面端 → 让用户在仓库目录终端运行 `.venv\Scripts\coolapk login --sms`（短信登录；`--web` 在 Python 3.14 下已知不可用）或 `--cookie` 导入 Cookie；登录完成后再继续；
+- **遇到 `error_type: auth_expired`**：不要反复重试受登录态影响的调用，直接引导用户重新登录，按优先级：① 用户已装[酷安第三方桌面端](https://github.com/coolapk-desktop/coolapk-desktop)（酷安官方没有桌面端，这是社区维护的非官方客户端）→ 让用户在桌面端重新登录后直接重试即可（服务器会在下次调用时自动重建连接）；若仍失效，重启 / 重载 MCP 会话兜底；② 未装桌面端 → 让用户在仓库目录终端运行 `.venv\Scripts\coolapk login --sms`（短信登录；网页登录 `--web` 推荐 Python 3.12，3.14 下运行时初始化失败，3.14 用户改用 `--sms` / `--cookie` / `--adb`）或 `--cookie` 导入 Cookie；登录完成后再继续；
 - **不做写操作**：本 MCP 是纯只读的，任何点赞 / 回复 / 关注 / 发帖请求都应拒绝并说明。
 
 ## 输出建议

@@ -15,7 +15,6 @@ wpf_smoke.runtimeconfig.json
 
 # 本地临时目录
 .tmp*/
-dimc3_lpc3mt88/
 
 # 文档与 skill（不进入镜像）
 skills/

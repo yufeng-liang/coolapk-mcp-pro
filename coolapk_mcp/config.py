@@ -155,6 +155,9 @@ class AppConfig:
         if CONFIG_FILE.exists():
             try:
                 data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                # 配置被写坏时可能是 null/list/str，dict 预防防止 AttributeError 崩穿 load()
+                if not isinstance(data, dict):
+                    data = {}
                 config.device_code = str(data.get("device_code", "") or "")
                 config.uid = str(data.get("uid", "") or "")
                 config.username = str(data.get("username", "") or "")

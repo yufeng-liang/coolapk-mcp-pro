@@ -19,7 +19,7 @@ AUTH_EXPIRED_MESSAGE = (
     "登录态已失效：若已安装酷安第三方桌面端（github.com/coolapk-desktop/coolapk-desktop），"
     "在桌面端重新登录后直接重试即可（本服务 auto 模式会自动复用其登录态，无需重启）；"
     "或运行 coolapk login --web 重新导入登录 Cookie（也可用 login --sms 短信登录、"
-    "login --cookie 手动导入）"
+    "login --cookie 手动导入）；若按上述方式重新登录后仍提示失效，请重启 MCP 会话"
 )
 
 
@@ -68,8 +68,12 @@ class CoolapkClient:
     def _load_uid_index(self) -> None:
         try:
             data = json.loads(self.INDEX_FILE.read_text(encoding="utf-8"))
+            # 文件被写坏时可能是 null/list/str，dict 预检防止 AttributeError 崩穿构造
+            if not isinstance(data, dict):
+                self._uid_index = {}
+                return
             self._uid_index = {int(k): int(v) for k, v in data.items()}
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
             self._uid_index = {}
 
     def _save_uid_index(self) -> None:
@@ -173,6 +177,7 @@ class CoolapkClient:
         url = f"{self.config.api_base}{path}"
         resp = None
         last_err: CoolapkError | None = None
+        last_status: int | None = None
         for attempt in range(throttle.MAX_RETRIES + 1):
             await self._limiter.acquire()
             headers = self._build_headers()
@@ -185,13 +190,17 @@ class CoolapkClient:
                     method, url, headers=headers, **kwargs
                 )
                 resp.raise_for_status()
+                last_err = None  # 本轮成功：清掉早前失败轮标记，避免循环后被误判为重试耗尽
                 break
             except httpx.TimeoutException:
+                last_status = None
                 err = CoolapkError("请求超时", kind="network")
             except httpx.ConnectError:
+                last_status = None
                 err = CoolapkError("无法连接服务器", kind="network")
             except httpx.HTTPStatusError as e:
                 code = e.response.status_code
+                last_status = code
                 if code == 403:
                     # 403 通常是登录态失效（captchaRequired / 会话无效）
                     raise CoolapkError(AUTH_EXPIRED_MESSAGE, error_code=403, kind="auth_expired")
@@ -203,8 +212,18 @@ class CoolapkClient:
             if attempt < throttle.MAX_RETRIES:
                 await throttle.backoff_sleep(attempt)
 
+        if last_err is not None:
+            # 重试耗尽仍失败：瞬态错误（超时/连接/5xx/429）重试后依旧不成功。
+            # raise_for_status 抛错时 resp 已赋值，不能靠 resp is None 判定；
+            # 按末次状态码重抛，不再解析可能是 HTML 错误页的 body（否则会被
+            # resp.json() 误分类成 kind=parse，丢失可重试语义）
+            raise CoolapkError(
+                f"{last_err.message}（重试 {throttle.MAX_RETRIES} 次后仍失败）",
+                error_code=last_status if last_status is not None else -1,
+                kind=last_err.kind,
+            )
         if resp is None:
-            raise last_err or CoolapkError("请求失败", kind="network")
+            raise CoolapkError("请求失败", kind="network")
 
         try:
             result = resp.json()
@@ -218,6 +237,10 @@ class CoolapkClient:
         #    只看「无 data 键」会把 status=1004/-415 的风控响应当成功，data=None
         #    还会被写进缓存造成缓存投毒）
         status_code = result.get("status") if isinstance(result, dict) else None
+        if isinstance(status_code, bool):
+            # 布尔 status：False==0 会混进 (0,1) 合法集被当成功；归一成 int，
+            # False 视为失败信号（-1）、True 视为成功（1）
+            status_code = 1 if status_code else -1
         failed = (
             not isinstance(result, dict)
             or ("data" not in result and "message" in result)
@@ -234,13 +257,15 @@ class CoolapkClient:
                     status_code = int(status_code)
                 if isinstance(status_code, int):
                     error_code = error_code if error_code != -1 else status_code
-            if "验证码" in message or "captcha" in message.lower():
+            # 403/captchaRequired 是登录态失效，必须先于「验证码」判定——
+            # 否则 message 里的 captchaRequired 会被 "captcha" 子串抢判成图形验证码
+            if error_code == 403 or "captchaRequired" in str(result):
+                raise CoolapkError(AUTH_EXPIRED_MESSAGE, error_code=403, kind="auth_expired")
+            if "验证码" in message:
                 # 负缓存：该端点短期内已被风控，冷却期内不再请求
                 base = path.split("?", 1)[0]
                 self._blocked[base] = time.monotonic() + self.CAPTCHA_COOLDOWN
                 raise CoolapkError(message, error_code, kind="captcha")
-            if error_code == 403 or "captchaRequired" in str(result):
-                raise CoolapkError(AUTH_EXPIRED_MESSAGE, error_code=403, kind="auth_expired")
             if error_code == -415:
                 raise CoolapkError(
                     f"设备码被风控拉黑({message})，请更换登录态设备码", error_code, kind="api",
@@ -330,22 +355,53 @@ class CoolapkClient:
         lowered = decoded.lower()
         path_part = lowered.split("?", 1)[0]
         segs = [seg for seg in path_part.strip("/").split("/") if seg]
+        # account 模块整组敏感（登录/验证码/token 下发/风控），透传只放行
+        # 登录态检查与风控解锁两个端点；内部业务调用不走本校验，不受影响
+        if len(segs) >= 2 and segs[0] == "v6" and segs[1] == "account":
+            if segs[2:] not in (["checklogininfo"], ["requestvalidate"]):
+                raise CoolapkError(
+                    f"拒绝访问 account 模块端点: {path}（仅放行 checkLoginInfo/requestValidate）",
+                    error_code=403, kind="api",
+                )
         # 单段 + 相邻两段拼接两种形态：/v6/reply/add 这类写端点
         # 靠 "/reply/add" 两段项命中，且不会误伤单段只读端点（replyList/message-like）
-        path_segments = {f"/{s}" for s in segs}
-        path_segments |= {f"/{segs[i]}/{segs[i+1]}" for i in range(len(segs) - 1)}
+        single_segments = {f"/{s}" for s in segs}
+        pair_segments = {f"/{segs[i]}/{segs[i+1]}" for i in range(len(segs) - 1)}
+        # 单段黑名单：确切的写动作词。exact 匹配不伤子串（followtag≠follow、
+        # replyList 不含 /reply），但没有同名只读端点的泛词必须排除在单段之外——
+        # /vote /collection /favorite /blacklist 都是只读模块名
+        # （/v6/vote/commentList、/v6/collection/list、/v6/favorite/list、
+        # /v6/user/blackList），/like 撞只读的 /v6/notification/like
         blocked_segments = (
-            "/like", "/unlike", "/digg", "/replyadd", "/replyaddpush",
-            "/reply/add", "/reply/delete", "/reply/edit",
-            "/follow", "/unfollow", "/followuser", "/createfeed", "/publish",
-            "/deletefeed", "/deletecomment", "/delete", "/edit", "/update",
-            "/sendmessage", "/message/send", "/message/delete",
-            "/upload", "/report",
-            "/block", "/blacklist", "/favorite", "/collection", "/subscribe",
-            "/checkin", "/sign", "/vote", "/apply", "/modify", "/set",
+            "/digg", "/replyadd", "/replyaddpush",
+            "/follow", "/unfollow", "/followuser", "/unfollowuser",
+            "/followtag", "/unfollowtag",
+            "/createfeed", "/publish", "/deletefeed", "/deletecomment",
+            "/delete", "/edit", "/update", "/sendmessage", "/upload", "/report",
+            "/block", "/subscribe", "/checkin", "/sign", "/apply", "/modify", "/set",
+            "/unfavorite", "/sendvcode",
+            "/addtoblacklist", "/removefromblacklist",
+            "/addtoignorelist", "/removefromignorelist",
         )
         for seg in blocked_segments:
-            if seg in path_segments:
+            if seg in single_segments:
+                raise CoolapkError(
+                    f"拒绝写操作端点: {path}",
+                    error_code=403, kind="api",
+                )
+        # 泛词写端点按「资源/动作」相邻两段拦：like/unlike 的宿主资源不枚举全，
+        # 只拦已知的写端点形态；/notification/like 这类只读端点不在列，不受影响
+        blocked_pairs = (
+            "/reply/add", "/reply/delete", "/reply/edit",
+            "/message/send", "/message/delete",
+            "/feed/like", "/feed/unlike",
+            "/reply/like", "/reply/unlike",
+            "/collection/like", "/collection/unlike",
+            "/feed/vote", "/feed/favorite", "/apk/favorite",
+            "/collection/follow", "/collection/unfollow",
+        )
+        for pair in blocked_pairs:
+            if pair in pair_segments:
                 raise CoolapkError(
                     f"拒绝写操作端点: {path}",
                     error_code=403, kind="api",
@@ -439,7 +495,9 @@ class CoolapkClient:
             return data, "gif"
         if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
             return data, "webp"
-        return data, "png"
+        # 未知魔数默认 jpeg：HTTP 抓到的图绝大多数是 jpg，png 会生成
+        # 错误的 image/png MIME 导致客户端解码失败
+        return data, "jpeg"
 
     # ---- 浏览 ----
 
@@ -537,10 +595,12 @@ class CoolapkClient:
                 if not isinstance(r, dict):
                     continue
                 rid = str(r.get("id", ""))
-                if rid and rid in seen:
+                # 空 rid 无法去重也无法定位，跳过防止重复追加
+                if not rid:
                     continue
-                if rid:
-                    seen.add(rid)
+                if rid in seen:
+                    continue
+                seen.add(rid)
                 all_replies.append(r)
                 new += 1
             if new == 0 or len(replies) < 10:

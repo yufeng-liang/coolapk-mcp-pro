@@ -54,7 +54,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | 方式 | 命令 | 说明 |
 | - | - | - |
 | auto 模式（默认） | 无需操作 | 优先读酷安第三方桌面端 `%APPDATA%\com.coolapk.desktop\accounts.json` 中 `lastLoginUid` 对应账户的完整 Cookie（含 SESSID），无效时回落 `~/.coolapk-mcp/config.json` 的原生三键 token；设备码优先复用 accounts.json 的 `deviceCode` |
-| 网页登录 | `.venv\Scripts\coolapk login --web` | 拉起登录窗口，人工完成登录（含滑块 / 验证码）后自动提取 Cookie 写入本地配置。**Python 3.14 下已知不可用**（依赖 pythonnet≥3.3，当前 3.2.1 只支持到 3.12），3.10–3.12 可用；3.14 用户请改用 --sms / --cookie |
+| 网页登录 | `.venv\Scripts\coolapk login --web` | 拉起登录窗口，人工完成登录（含滑块 / 验证码）后自动提取 Cookie 写入本地配置。**Python 3.14 下已知不可用**：其依赖 pythonnet（当前锁定 3.2.1，官方标明 Requires-Python `>=3.11,<3.16`）在 3.14 下能安装但运行时初始化失败（`import clr` 报 `Failed to resolve Python.Runtime.Loader.Initialize`），网页登录推荐用 Python 3.12；3.14 用户请改用 `--sms` / `--cookie` |
 | 短信登录 | `.venv\Scripts\coolapk login --sms --phone <手机号>` | 按提示两步完成：识别图形验证码 → 提交短信验证码 |
 | Cookie 导入 | `.venv\Scripts\coolapk login --cookie "uid=…;username=…;token=…"` | 从浏览器或桌面端日志手动粘贴 Cookie |
 
@@ -95,7 +95,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 
 **给 agent 的话**：请按顺序完成以下六步，每步失败时参照「故障排查」一节；完成后向用户报告接入结果（工具数量、登录状态、一次冒烟检索的摘要）。执行过程中产生的配置文件修改属于常规接入操作，直接进行即可；只有涉及用户凭据（Cookie / 短信验证码）的步骤才需要用户配合。
 
-1. **确认前置**：本机 Windows / macOS / Linux 均可，Python ≥3.10（3.14 可用，但 `login --web` 在 3.14 下不可用）。检查用户是否已装[酷安第三方桌面端](https://github.com/coolapk-desktop/coolapk-desktop)（官方只有手机 App，桌面端是社区维护项目）：已装则登录态走 auto 模式自动复用；未装则准备一个酷安安卓 APK 改名 `coolapk.apk` 放到 `~/.coolapk-mcp/`（用于提取签名 blob）。
+1. **确认前置**：本机 Windows / macOS / Linux 均可，Python ≥3.10（3.14 可用，但 `login --web` 在 3.14 下运行时初始化失败，网页登录请用 Python 3.12，3.14 用户改走 `--sms` / `--cookie`）。检查用户是否已装[酷安第三方桌面端](https://github.com/coolapk-desktop/coolapk-desktop)（官方只有手机 App，桌面端是社区维护项目）：已装则登录态走 auto 模式自动复用；未装则准备一个酷安安卓 APK 改名 `coolapk.apk` 放到 `~/.coolapk-mcp/`（用于提取签名 blob）。
 2. **安装**：`git clone https://github.com/yufeng-liang/coolapk-mcp-pro.git && cd coolapk-mcp-pro && py -m venv .venv && .venv/Scripts/python -m pip install -e .`（Linux / macOS 为 `.venv/bin/`）。记住克隆目录的绝对路径，第 4 步要写进配置。
 3. **建立登录态**：优先让用户在已装桌面端里登录一次（零配置）；否则跑 `.venv/Scripts/coolapk login --sms --phone <手机号>`（需要用户提供手机号与短信验证码）或 `.venv/Scripts/coolapk login --cookie "uid=…;username=…;token=…"`。用 `coolapk login --status` 确认成功。
 4. **注册到你的 MCP 客户端**：按你的客户端类型选下方对应示例；都不匹配则参考「远程部署」一节的配置结构自行适配——stdio 形态核心三要素：`command` 指向 venv 的 python 可执行文件、`args` 为 `["-m", "coolapk_mcp.server"]`、工作目录或路径前缀指向克隆目录；远程形态核心三要素：`url` 指向服务端 `/mcp`、`headers.Authorization` 为 `Bearer <token>`、transport 为 `streamable-http`。
@@ -158,20 +158,22 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 
 ### 快速启动
 
+本节命令为 **Linux（bash）服务器** 写法（远程部署的目标环境即 Linux 服务器）；Windows 的本地安装与 stdio 接入见[安装](#安装)与「Agent 接入」两节。
+
 ```bash
-py -m venv .venv
-.venv/Scripts/python -m pip install .
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
 
 # 生成一个随机 token（服务端与客户端共用）
-python -c "import secrets; print(secrets.token_urlsafe(32))"
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 
-# 四个环境变量，然后启动（bash / Linux 服务器写法）
+# 四个环境变量，然后启动
 export COOLAPK_MCP_TRANSPORT=streamable-http   # 启用远程形态（http / streamable_http 别名等效）
 export COOLAPK_HTTP_HOST=127.0.0.1             # 一般绑回环，由反代对外；确要直连公网见下方安全一节
 export COOLAPK_HTTP_PORT=8000
 export COOLAPK_HTTP_TOKEN=<上一步生成的随机串>
 
-coolapk-mcp
+.venv/bin/coolapk-mcp
 ```
 
 启动后先自检：`curl http://127.0.0.1:8000/health` 返回 `{"status":"ok"}` 即说明服务已就绪（该端点免鉴权，仅供探活）；MCP 端点在 `/mcp`，一律要求 Bearer Token。
@@ -185,10 +187,13 @@ coolapk-mcp
 | `COOLAPK_HTTP_PORT` | `8000` | HTTP 监听端口 |
 | `COOLAPK_HTTP_TOKEN` | 空 | Bearer Token。客户端请求须带 `Authorization: Bearer <token>`；校验失败返回 401 |
 
+> **uvicorn workers 必须为 1**：服务内部以单进程方式启动 uvicorn（`uvicorn.Config(...)` 未设 `workers` 参数）。请勿自行用 `--workers N` 多进程拉起——全局限速（`COOLAPK_MIN_INTERVAL`）、GET 缓存与验证码负缓存都是**进程内状态**，多进程互不共享：限速被 worker 数稀释、缓存命中率下降、验证码冷却互不感知，风控风险成倍上升。需要扩容时按「一台服务器一个实例」拆分部署，不要在同一实例上开多进程。
+
 ### 安全
 
 - **强制 Bearer Token**：绑非回环地址而未设 `COOLAPK_HTTP_TOKEN` 时服务直接拒绝启动；token 用随机长串（生成命令见快速启动），不要用可猜的短串。
 - **必须走 TLS**：Bearer Token 是明文凭据，裸 HTTP 公网传输会被中间人截获。请勿把 `8000` 端口直接暴露公网，务必套一层 TLS 反向代理（Nginx 或 Caddy 示例如下），并在防火墙 / 云安全组里关闭直连端口。
+- **Host 校验（DNS rebinding 防护）已关闭**：FastMCP 自带的 DNS rebinding 防护按 Host 头白名单拦截请求，远程部署常态的「公网 IP 直连」会被其误判 421 拒绝，因此本服务显式关闭了该层（`enable_dns_rebinding_protection=False`）。此取舍以 Bearer Token 鉴权强制生效为前提——公网部署务必配置 `COOLAPK_HTTP_TOKEN` 并走 TLS 反代。
 - Nginx 反代示例（假设已有 `your-domain` 的证书配置）：
 
 ```nginx
@@ -255,6 +260,8 @@ docker run -d --name coolapk-mcp \
 ```
 
 `-e` 只需覆盖 `COOLAPK_HTTP_TOKEN`（传输形态与监听地址已内置默认值）；`-v` 挂载持久化目录后，设备码、登录态与 `auth_blob.bin` 重启容器不丢。同样建议只映射到 `127.0.0.1`，交给 TLS 反代对外。
+
+> **不传 token 容器会「启动即退出」——这是预期的 fail-closed 行为，不是故障**：镜像默认监听 `0.0.0.0`（非回环地址），服务端规定「绑非回环地址必须设置 `COOLAPK_HTTP_TOKEN`」，缺 token 时进程打印「拒绝启动」提示并以非零码退出（`docker logs coolapk-mcp` 可见原因）。这是防止登录态裸奔公网的保护逻辑，补上 `-e COOLAPK_HTTP_TOKEN=<随机长串>` 重新 `docker run` 即可。
 
 ### 客户端接入（远程形态）
 
@@ -330,7 +337,7 @@ docker run -d --name coolapk-mcp \
 ### 登录失效（`error_type: auth_expired`）
 
 1. 让 agent 调 `coolapk_login_status` 或运行 `coolapk login --status` 确认失效；
-2. 推荐运行 `coolapk login --web` 重新登录（也可 `--sms` / `--cookie` / `--adb`）；
+2. 重新登录，按 Python 版本选择通道：**Python 3.12** 推荐 `coolapk login --web`（图形化，最省事）；**Python 3.14** 下 `--web` 不可用（pythonnet 运行时初始化失败），改用 `--sms` / `--cookie` / `--adb`；
 3. stdio 模式下 MCP 服务进程随客户端会话重启，重登后新会话自动带上新登录态。
 
 ### 验证码（`error_type: captcha`）

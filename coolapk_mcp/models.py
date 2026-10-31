@@ -448,7 +448,7 @@ _TOOL_FIELDS: dict[str, tuple[str, ...]] = {
 _GET_URL_SENSITIVE_KEYS = frozenset(
     {"cookie", "cookies", "set-cookie", "token", "session", "sessid", "config"}
 )
-_GET_URL_SENSITIVE_SUBSTR = ("token", "session", "cookie", "sessid", "passwd", "secret")
+_GET_URL_SENSITIVE_SUBSTR = ("token", "session", "cookie", "sessid", "passwd", "password", "secret")
 
 
 def _apply_whitelist(obj: Any, fields: tuple[str, ...]) -> Any:
@@ -582,6 +582,10 @@ def _apply_search_whitelist(item: dict) -> dict:
     else:
         fields = None
     pruned = _apply_whitelist(item, fields) if fields else dict(item)
+    # 纯图帖等媒体动态 dump 后无 content/feed_type 键，会被上面的 elif 误套
+    # user 白名单、只剩 uid/username——裁剪后丢字段过多时回落原条目兜底
+    if fields and len(pruned) <= 2 and len(item) > 2:
+        pruned = dict(item)
     for flag in ("suspected_ad", "comment_match", "comment_search"):
         if flag in item:
             pruned[flag] = item[flag]

@@ -27,7 +27,8 @@ def _env_float(name: str, default: float) -> float:
 
 MIN_INTERVAL = _env_float("COOLAPK_MIN_INTERVAL", 1.2)
 try:
-    MAX_RETRIES = max(0, int(_env_float("COOLAPK_MAX_RETRIES", 2)))
+    # 上限钉 8：backoff 0.8*(2**attempt)，重试再多也无意义且会指数膨胀等待
+    MAX_RETRIES = min(8, max(0, int(_env_float("COOLAPK_MAX_RETRIES", 2))))
 except (OverflowError, ValueError):
     MAX_RETRIES = 2
 CACHE_ENABLED = os.environ.get("COOLAPK_NO_CACHE", "") not in ("1", "true", "True")
