@@ -9,3 +9,5 @@ wpf_smoke.runtimeconfig.json
 regression_probe.py
 tmp*_*/
 tmp*/
+tmp_*.py
+regression_probe.py
