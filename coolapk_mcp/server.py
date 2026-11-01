@@ -1,10 +1,15 @@
-"""MCP Server — 酷安社区只读工具集（12 个工具）"""
+"""MCP Server — 酷安社区只读工具集（13 个工具）"""
 
 import functools
+import hashlib
 import hmac
 import json
 import os
+import time
 from typing import Any
+from urllib.parse import quote, urlsplit
+
+import httpx
 
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.transport_security import TransportSecuritySettings
@@ -20,6 +25,14 @@ from coolapk_mcp.models import (
     apply_tool_whitelist,
 )
 from coolapk_mcp.config import AppConfig
+
+# 图片中转只允许这些酷安域名，避免被当成任意 URL 的开放代理
+IMAGE_HOSTS = frozenset({"image.coolapk.com", "avatar.coolapk.com", "static.coolapk.com"})
+IMAGE_UA = (
+    "Dalvik/2.1.0 (Linux; U; Android 16; 23113RKC6C Build/AQ3A.250226.002) "
+    "(#Build; Redmi; 23113RKC6C; AQ3A.250226.002; HyperOS_3.0; 3.0.1.0) "
+    "+CoolMarket/16.2.0-2604201-universal"
+)
 
 mcp = FastMCP(
     "coolapk",
@@ -478,6 +491,58 @@ async def coolapk_read_image(url: str) -> Image:
 
 
 @mcp.tool()
+async def coolapk_image_link(urls: str, ttl_minutes: int = 120) -> str:
+    """把酷安图片地址转成可直接在聊天窗口显示的 https 链接（需远程 HTTP 部署）。
+
+    为什么需要它：酷安 image.coolapk.com 对非酷安客户端返回 HTTP 567（防盗链），
+    很多聊天类客户端又没有解码 base64 的能力，只能显示文字链接。此工具把图片
+    转成托管在 MCP 服务上的签名链接（/img），链接自带过期时间与 HMAC 签名，
+    任何能打开网页的客户端都能直接显示图片。
+
+    仅在远程 HTTP 模式可用：MCP 进程需配置 COOLAPK_PUBLIC_BASE（对外访问前缀，
+    例如 https://mcp.example.com）与 COOLAPK_HTTP_TOKEN（用作签名密钥）。
+
+    Args:
+        urls: 一个或多个酷安图片 URL，用逗号、空格或换行分隔
+        ttl_minutes: 链接有效期（分钟），默认 120，最长 10080（7 天）
+    """
+    public_base = os.environ.get("COOLAPK_PUBLIC_BASE", "").rstrip("/")
+    if not public_base:
+        return json.dumps(
+            {
+                "error": "未启用的功能：本进程没有配置 COOLAPK_PUBLIC_BASE",
+                "hint": "stdio 本地模式没有对外地址，请直接用 coolapk_read_image 返回图片；"
+                "远程 HTTP 部署请设置 COOLAPK_PUBLIC_BASE=https://<域名>",
+            },
+            ensure_ascii=False,
+        )
+    secret = os.environ.get("COOLAPK_HTTP_TOKEN", "") or "coolapk-mcp-dev"
+    try:
+        ttl = max(1, min(int(ttl_minutes), 10080))
+    except (TypeError, ValueError):
+        ttl = 120
+    exp = int(time.time()) + ttl * 60
+
+    items: list[dict[str, Any]] = []
+    _sep = chr(10)
+    for raw in [part for part in urls.replace(_sep, " ").replace(",", " ").split() if part]:
+        parsed = urlsplit(raw)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme not in ("http", "https") or host not in IMAGE_HOSTS:
+            items.append({"url": raw, "error": "只支持酷安图片域名（image/avatar/static.coolapk.com）"})
+            continue
+        sig = hmac.new(secret.encode(), f"{raw}|{exp}".encode(), hashlib.sha256).hexdigest()[:32]
+        items.append(
+            {
+                "url": raw,
+                "link": f"{public_base}/img?u={quote(raw, safe='')}&exp={exp}&sig={sig}",
+                "expires_at": exp,
+            }
+        )
+    return json.dumps({"count": len(items), "ttl_minutes": ttl, "items": items}, ensure_ascii=False)
+
+
+@mcp.tool()
 @_catch_api_error
 async def coolapk_get_url(path: str) -> str:
     """只读透传：GET 任意酷安 /v6/ 只读接口路径并返回裁剪后的 JSON。
@@ -525,7 +590,7 @@ def _build_http_app():
     import socket
 
     from starlette.applications import Starlette
-    from starlette.responses import JSONResponse
+    from starlette.responses import JSONResponse, Response
     from starlette.routing import Mount, Route
 
     host = os.environ.get("COOLAPK_HTTP_HOST", "127.0.0.1")
@@ -560,7 +625,12 @@ def _build_http_app():
             "公网部署请务必用 Nginx/Caddy 反代加 TLS（见 README 远程部署章）。"
         )
 
-    state = {"token": token}
+    # ---- 图片中转：把酷安 CDN 的防盗链图片转成可公开访问的签名链接 ----
+    # 酷安 image.coolapk.com 对非客户端请求返回 HTTP 567，且多数聊天类客户端
+    # （如小爱）拿不到 base64 就显示不了图，因此提供 /img 中转 + HMAC 签名。
+    public_base = os.environ.get("COOLAPK_PUBLIC_BASE", "").rstrip("/")
+    img_secret = token or "coolapk-mcp-dev"
+    state = {"token": token, "public_base": public_base, "img_secret": img_secret}
 
     def _bearer_endpoint(inner_app):
         """Bearer Token 校验包裹 MCP 端点：/health 免鉴权，MCP 一律校验。"""
@@ -590,6 +660,60 @@ def _build_http_app():
         # 不暴露任何状态细节，只证明服务活着
         return JSONResponse({"status": "ok"})
 
+    def _img_sig(url: str, exp: int) -> str:
+        return hmac.new(
+            state["img_secret"].encode(), f"{url}|{exp}".encode(), hashlib.sha256
+        ).hexdigest()[:32]
+
+    async def _img(request):
+        """图片中转：校验签名与域名白名单后，带客户端特征去酷安 CDN 取图。"""
+        url = request.query_params.get("u") or ""
+        exp_raw = request.query_params.get("exp") or ""
+        sig = request.query_params.get("sig") or ""
+        if not url or not exp_raw or not sig:
+            return JSONResponse(
+                {"error": "bad_request", "detail": "缺少 u / exp / sig 参数"}, status_code=400
+            )
+        try:
+            exp = int(exp_raw)
+        except ValueError:
+            return JSONResponse(
+                {"error": "bad_request", "detail": "exp 必须是整数时间戳"}, status_code=400
+            )
+        if exp < int(time.time()):
+            return JSONResponse(
+                {"error": "expired", "detail": "链接已过期，请重新生成"}, status_code=403
+            )
+        parsed = urlsplit(url)
+        if parsed.scheme not in ("http", "https") or (parsed.hostname or "").lower() not in IMAGE_HOSTS:
+            return JSONResponse(
+                {"error": "forbidden_host", "detail": "只允许转发酷安图片域名"}, status_code=403
+            )
+        if not hmac.compare_digest(sig, _img_sig(url, exp)):
+            return JSONResponse(
+                {"error": "bad_signature", "detail": "签名校验失败"}, status_code=403
+            )
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True, trust_env=False) as client:
+                upstream = await client.get(
+                    url, headers={"User-Agent": IMAGE_UA, "Referer": "https://www.coolapk.com/"}
+                )
+        except Exception as exc:  # 网络异常统一 502，不泄漏细节
+            return JSONResponse(
+                {"error": "fetch_failed", "detail": type(exc).__name__}, status_code=502
+            )
+        if upstream.status_code != 200:
+            return JSONResponse(
+                {"error": "upstream_status", "detail": f"上游返回 {upstream.status_code}"},
+                status_code=502,
+            )
+        ctype = upstream.headers.get("content-type", "image/jpeg")
+        if not ctype.startswith("image/"):
+            ctype = "image/jpeg"
+        return Response(
+            upstream.content, media_type=ctype, headers={"Cache-Control": "public, max-age=86400"}
+        )
+
     http_app = mcp.streamable_http_app()
 
     import contextlib
@@ -602,6 +726,7 @@ def _build_http_app():
 
     routes = [
         Route("/health", _health, methods=["GET"]),
+        Route("/img", _img, methods=["GET", "HEAD"]),
         Mount(
             "/",
             app=_bearer_endpoint(http_app),

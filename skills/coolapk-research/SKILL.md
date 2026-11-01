@@ -42,6 +42,7 @@ coolapk_suggest       联想词改写：口语 → 酷安习惯用词
 coolapk_topic         刷话题：with_feeds=true 默认热度排序，前排即干货
 coolapk_feed_detail   读帖：拿正文与回复；需要完整舆情时用 all_replies 或 comment_keyword
 coolapk_read_image    看关键截图：教程帖的步骤截图、模块配置截图（image.coolapk.com 直连 567，必须走此工具）
+coolapk_image_link    客户端显示不了 base64 图片时（如手机语音助手），把图片转成签名 https 外链；仅远程 HTTP 模式可用
 ```
 
 要点：

@@ -10,7 +10,7 @@
 
 ## 特性
 
-- **12 个只读工具**：搜索、帖子详情、话题、用户资料、用户动态、首页动态、图片读取、登录状态、搜索联想词、URL 透传、作者画像、作者深挖聚合
+- **13 个只读工具**：搜索、帖子详情、话题、用户资料、用户动态、首页动态、图片读取、登录状态、搜索联想词、URL 透传、作者画像、作者深挖聚合、图片外链中转
 - **风控回落**：帖子详情接口被验证码拦截时自动改从作者动态列表取全文（`fetch_source` 字段标注来源），回复走独立接口
 - **请求节制**：全局限速（相邻请求 ≥1.2 s）、GET 按 TTL 缓存、瞬态错误指数退避重试、验证码端点负缓存冷却
 - **搜索净化**：严格关键词过滤 + 去重 + 疑似广告标记，滤掉酷安搜索混入的不相关结果
@@ -71,13 +71,14 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `coolapk_user_feeds` | 用户发布的帖子（支持多页聚合 + 关键词过滤 + 热度排序） | `uid`、`page`、`pages=1-5`、`keyword`、`sort=default\|hot\|latest` |
 | `coolapk_home` | 首页动态 | `tab=recommend\|hot\|latest`、`page` |
 | `coolapk_read_image` | 读取图片消息（带 Referer 下载，解决图片 CDN 直连 567） | 图片 URL |
+| `coolapk_image_link` | 把酷安图片转成可在任意聊天窗口显示的签名 https 链接（仅远程 HTTP 模式，需 `COOLAPK_PUBLIC_BASE`） | `urls`（逗号/空格/换行分隔）、`ttl_minutes`（默认 120） |
 | `coolapk_login_status` | 查询当前登录态与登录方式 | 无 |
 | `coolapk_suggest` | 搜索联想词（把口语化需求改写成酷安习惯用词） | `keyword` |
 | `coolapk_get_url` | 只读 GET 透传（访问上表未覆盖的酷安只读接口） | 接口路径与参数 |
 | `coolapk_author` | 作者画像与权威度评分（`author_tier` / `is_expert` / `fans_per_feed` / `expertise`），判断「这人是不是该领域大佬」 | `uid` |
 | `coolapk_author_digest` | 作者深挖聚合：一次抓多页他的帖子、按主题过滤并按热度排序，拿到完整攻略链 | `uid`、`keyword`、`pages=1-5`（默认 2）、`top`（默认 10） |
 
-前 6 个工具基座已实现；`coolapk_read_image` / `coolapk_login_status` / `coolapk_get_url` 为 0.2.0 新增；`coolapk_suggest` 为 0.4.0 新增；`coolapk_author` / `coolapk_author_digest` 为 0.5.0 新增。
+前 6 个工具基座已实现；`coolapk_read_image` / `coolapk_login_status` / `coolapk_get_url` 为 0.2.0 新增；`coolapk_suggest` 为 0.4.0 新增；`coolapk_author` / `coolapk_author_digest` 为 0.5.0 新增；`coolapk_image_link` 为 0.6.0 新增。
 
 帖子类结果统一带质量分：`post_score`（点赞 + 评论×3 + 转发×2）与 `discussion_ratio`（评论/点赞），可直接用于排序和判断「这条是干货还是凑数」。
 
@@ -91,6 +92,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `COOLAPK_MIN_INTERVAL` | `1.2` | 相邻 API 请求最小间隔（秒） |
 | `COOLAPK_MAX_RETRIES` | `2` | 瞬态错误（超时 / 5xx / 429）重试次数 |
 | `COOLAPK_NO_CACHE` | 未设 | 设为 `1` 禁用 GET 缓存（调试用） |
+| `COOLAPK_PUBLIC_BASE` | 未设 | 远程 HTTP 模式下的对外访问前缀（如 `https://mcp.example.com`）。设置后 `coolapk_image_link` 才能生成图片外链，`/img` 中转也随之生效 |
 
 数据文件（自动生成，勿提交仓库）：`~/.coolapk-mcp/config.json`（设备码与登录态）、`~/.coolapk-mcp/uid_index.json`（feed_id → 作者 uid 索引，供详情回落）。
 
@@ -325,6 +327,24 @@ docker run -d --name coolapk-mcp \
 
 远程字段的最新写法以 [Cursor 官方文档](https://docs.cursor.com/) 为准。
 
+### 图片外链（`/img` 中转）
+
+酷安图床 `image.coolapk.com` 对非酷安客户端返回 `HTTP 567`（防盗链），部分聊天类客户端（如手机语音助手）既打不开这个域名，也没有解码 base64 的能力，只能退化成一串链接。
+
+远程模式为此内置了图片中转：设置 `COOLAPK_PUBLIC_BASE` 后，`coolapk_image_link` 会把酷安图片地址转成 `https://你的域名/img?u=...&exp=...&sig=...` 形式的链接，任何能打开网页的客户端都能直接显示图片。
+
+```bash
+# systemd 里加上对外地址（与 COOLAPK_HTTP_TOKEN 一起生效）
+Environment=COOLAPK_PUBLIC_BASE=https://mcp.example.com
+```
+
+设计要点：
+
+- **签名防滥用**：链接带 `exp`（过期时间戳）与 `sig`（HMAC-SHA256，密钥取 `COOLAPK_HTTP_TOKEN`），任何拿到链接的人都能取图，但改不动参数、也访问不了别的域名——`/img` 只接受 `image.coolapk.com`、`avatar.coolapk.com`、`static.coolapk.com` 三个域名，不接受任意 URL。
+- **默认有效期 120 分钟**，单次最长 7 天；图片在服务端不做落盘，取到即转发。
+- 只影响图片显示，`/img` 免 Bearer 鉴权（否则 `<img>` 标签加载不了），安全边界完全靠签名与域名白名单。
+- 本地 stdio 模式没有对外地址，不生成外链，直接用 `coolapk_read_image` 返回图片即可。
+
 ### 服务端登录态
 
 远程形态的服务端登录态与本地完全同源，都在服务器的 `~/.coolapk-mcp/`：
@@ -351,7 +371,7 @@ docker run -d --name coolapk-mcp \
 
 ### 图片打不开（HTTP 567）
 
-酷安图片 CDN `image.coolapk.com` 对非官方直连请求返回 HTTP 567（2026-08 实测），把图片 URL 直接丢给浏览器或下载工具大概率拿不到图。请让 agent 使用 `coolapk_read_image` 工具（带 Referer 下载后以图片形式返回给多模态模型）读取关键截图。
+酷安图片 CDN `image.coolapk.com` 对非官方直连请求返回 HTTP 567（2026-08 实测），把图片 URL 直接丢给浏览器或下载工具大概率拿不到图。请让 agent 使用 `coolapk_read_image` 工具（带 Referer 下载后以图片形式返回给多模态模型）读取关键截图。如果客户端显示不了 base64 图片（例如手机语音助手），改用远程模式的 `coolapk_image_link` 生成签名外链，见上文「图片外链（`/img` 中转）」。
 
 ### 其它
 
