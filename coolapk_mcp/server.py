@@ -53,6 +53,9 @@ mcp = FastMCP(
         "帖子结果带 post_score（点赞+评论×3+转发×2）与 discussion_ratio，可直接用于排序筛选；"
         "判断教程可信度先看作者 author_tier（top/expert/active/normal），再决定是否用 "
         "coolapk_author_digest 深挖该作者的全部攻略。"
+        "图片：若客户端显示不了 base64 图片（如手机语音助手、IM 机器人），"
+        "用 coolapk_image_link 把图片 URL 转成签名 https 外链后再展示；"
+        "本地 stdio 模式请直接用 coolapk_read_image。"
     ),
 )
 
