@@ -2,11 +2,33 @@
 
 from __future__ import annotations
 
+import re
+
 from datetime import datetime, timezone
 from typing import Any
 
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+_LINK_PATTERN = re.compile(
+    r"https?://[^\s\"'<>]+|(?:(?:wwl\.|[a-z0-9-]+\.)?(?:pan\.quark|pan\.baidu|"
+    r"aliyundrive|alipan|123pan|mega\.nz|cloud\.189|caiyun\.139|drive\.uc|"
+    r"github\.com|gitee\.com|lanzou[a-z]*\.[a-z]+))[^\s\"'<>]*",
+    re.IGNORECASE,
+)
+
+
+def _extract_links(text: str) -> list[str]:
+    """从评论文本提取网盘/仓库链接（去重保序）。"""
+    if not text:
+        return []
+    out: list[str] = []
+    for m in _LINK_PATTERN.finditer(text):
+        u = m.group(0).rstrip(").,，。")
+        if u and u not in out:
+            out.append(u)
+    return out
 
 
 def _strip_html(html: str) -> str:
@@ -128,11 +150,17 @@ class FeedDetail(FeedModel):
     reply_count: int = 0
     # 详情获取路径：api（详情接口）或 author_feed_fallback（风控回落，从作者动态列表读取）
     fetch_source: str = ""
+    # 评论聚焦模式元信息（smart/author/hot）：楼主评论数、热评数、总评论数
+    comments_focus: dict | None = None
+    # 正文修改历史（作者每次编辑的快照，with_history=True 时填充）
+    edit_history: list[dict] = Field(default_factory=list)
+    # 深度展开楼中楼时补充的子回复条数（expand_sub_replies=True 时填充）
+    sub_replies_expanded: int = 0
 
     @classmethod
     def from_api(
         cls, data: dict, replies: list[dict] | None = None,
-        fetch_source: str = "",
+        fetch_source: str = "", comments_focus: dict | None = None,
     ) -> FeedDetail:
         user_info = data.get("userInfo") or {}
         pics = data.get("picArr") or data.get("pic") or []
@@ -160,6 +188,7 @@ class FeedDetail(FeedModel):
             replies=parsed_replies,
             reply_count=data.get("replyRowsCount", 0) or data.get("replynum", 0),
             fetch_source=fetch_source,
+            comments_focus=comments_focus,
         )
 
 
@@ -176,6 +205,8 @@ class ReplyModel(BaseModel):
     # 楼中楼：子回复总数 + 内联子回复（服务端默认只带最近几条）
     reply_count: int = Field(alias="replynum", default=0)
     reply_to: str = Field(alias="rusername", default="")
+    # 从评论文本提取的下载/仓库链接（server 层填充；工具帖资料多在评论链接里）
+    links: list[str] = Field(default_factory=list)
     sub_replies: list["ReplyModel"] = Field(default_factory=list)
 
     @field_validator("message", "username", "reply_to", mode="before")
@@ -187,6 +218,13 @@ class ReplyModel(BaseModel):
     def _generate_content(self) -> ReplyModel:
         if not self.content and self.message:
             self.content = _strip_html(self.message)
+        return self
+
+    @model_validator(mode="after")
+    def _collect_links(self) -> ReplyModel:
+        # 从原始 message（含超链接标签 href）提取网盘/仓库链接
+        if not self.links:
+            self.links = _extract_links(self.message or self.content)
         return self
 
     @field_validator("dateline", mode="before")
@@ -426,7 +464,7 @@ _FEED_FIELDS = (
 _REPLY_FIELDS = (
     "id", "content", "username", "uid", "like_num", "dateline",
     "is_author", "images", "reply_count", "reply_to", "sub_replies",
-    "comment_match",
+    "comment_match", "links",
 )
 
 # 各工具的输出白名单：coolapk_search 按 entityType 分发，
@@ -439,7 +477,8 @@ _TOOL_FIELDS: dict[str, tuple[str, ...]] = {
     "search_app": ("id", "title", "package_name", "description", "follow_num",
                    "download_num", "version"),
     "feed_detail": (*_FEED_FIELDS, "source_feed", "replies", "reply_count",
-                    "fetch_source", "comment_search"),
+                    "fetch_source", "comment_search", "comments_focus",
+                    "edit_history", "sub_replies_expanded"),
     "user_profile": ("uid", "username", "bio", "level", "fans_num", "follow_num",
                      "feed_num", "verify_title", "reg_date", "city", "gender"),
     "user_feeds": _FEED_FIELDS,

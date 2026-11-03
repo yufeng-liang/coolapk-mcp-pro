@@ -16,12 +16,16 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from coolapk_mcp import postfilter
 from coolapk_mcp import scoring
+
+
 from coolapk_mcp.client import CoolapkClient, CoolapkError
 from coolapk_mcp.models import (
     FeedDetail,
     FeedModel,
+    ReplyModel,
     TopicModel,
     UserModel,
+    _strip_html as _strip_html_keep_links,
     apply_tool_whitelist,
 )
 from coolapk_mcp.config import AppConfig
@@ -200,21 +204,41 @@ async def coolapk_feed_detail(
     reply_page: int = 1,
     all_replies: bool = False,
     comment_keyword: str | None = None,
+    comments_focus: str = "default",
+    with_history: bool = False,
+    expand_sub_replies: bool = False,
 ) -> str:
     """获取酷安帖子的完整详情和回复（详情接口被风控时自动回落）。
+
+    工具帖找资料建议用 comments_focus=smart：一次拿到「正文 + 楼主全部补充 +
+    高赞反馈」，获取方式与答疑多在楼主回复里。
 
     Args:
         feed_id: 帖子ID
         with_replies: 是否包含回复列表，默认是
-        reply_page: 回复页码（all_replies / comment_keyword 时忽略）
+        reply_page: 回复页码（all_replies / comment_keyword / comments_focus 非 default 时忽略）
         all_replies: 拉全部一级评论（自动翻页，含内联楼中楼），适合完整舆情/评论分析
         comment_keyword: 按关键词检索评论和楼中楼（自动拉全量；空格分隔多词=任一命中；
             命中条目带 comment_match 字段，楼中楼按上下文保留，统计见 comment_search）
+        comments_focus: 评论聚焦模式：default（默认时间序一页）/ smart（楼主全部回复
+            + 热门评论，找工具帖资料首选）/ author（只看楼主）/ hot（只看热门）/
+            all（全部一级评论，等同 all_replies）
+        with_history: 附带正文修改历史（作者每次编辑的快照，看版本演进）
+        expand_sub_replies: 深度展开楼中楼（对回复数多的父评论补全子回复，
+            楼主答疑常在楼中楼深处；会额外发请求，只在需要时开）
     """
     client = _get_client()
+    focus = (comments_focus or "default").strip().lower()
+    if focus not in ("default", "smart", "author", "hot", "all"):
+        focus = "default"
+
+    # all_replies 与 focus=all 等价
+    if focus == "all":
+        all_replies = True
+
     smart = await client.get_feed_detail_smart(
         feed_id,
-        with_replies=with_replies or bool(comment_keyword),
+        with_replies=with_replies or bool(comment_keyword) or focus in ("smart", "author", "hot"),
         reply_page=reply_page,
         all_replies=all_replies or bool(comment_keyword),
     )
@@ -223,6 +247,74 @@ async def coolapk_feed_detail(
         smart["replies"] if isinstance(smart["replies"], list) else None,
         fetch_source=smart["source"],
     )
+
+    # ---- 评论聚焦模式：单独拉楼主评论 / 热门评论替换默认列表 ----
+    focus_meta: dict | None = None
+    merged: list[dict] = []
+    if focus in ("smart", "author", "hot"):
+        try:
+            author_list: list[dict] = []
+            hot_list: list[dict] = []
+            if focus in ("smart", "author"):
+                author_list = await client.get_author_replies(feed_id)
+            if focus in ("smart", "hot"):
+                hot_list = await client.get_popular_replies(feed_id)
+            seen: set[str] = set()
+            for item in (author_list or []) + (hot_list or []):
+                if isinstance(item, dict) and str(item.get("id")) not in seen:
+                    seen.add(str(item.get("id")))
+                    merged.append(item)
+            focus_meta = {
+                "mode": focus,
+                "author_replies": len(author_list or []),
+                "hot_replies": len(hot_list or []),
+                "total_shown": len(merged),
+                "total_replynum": (smart["data"].get("replynum") or 0),
+            }
+        except CoolapkError:
+            focus_meta = {"mode": focus, "error": "评论聚焦拉取失败，已回落默认列表"}
+
+    if focus_meta is not None:
+        detail.comments_focus = focus_meta
+        if merged:
+            detail.replies = [ReplyModel.from_api(r) for r in merged]
+
+    # ---- 修改历史 ----
+    if with_history:
+        try:
+            hist = await client.get_feed_history(feed_id)
+            if isinstance(hist, list) and hist:
+                detail.edit_history = [
+                    {
+                        "id": h.get("id", 0),
+                        "content": _strip_html_keep_links(h.get("message", "")),
+                        "dateline": h.get("lastupdate", 0),
+                    }
+                    for h in hist
+                    if isinstance(h, dict)
+                ]
+        except CoolapkError:
+            detail.edit_history = []
+
+    # ---- 楼中楼深度展开（楼主在楼中楼的答疑 + 高赞父评论） ----
+    if expand_sub_replies and detail.replies:
+        expanded = 0
+        for i, r in enumerate(detail.replies[:12]):
+            need = (r.reply_count or 0) - len(r.sub_replies or [])
+            if need <= 0:
+                continue
+            try:
+                subs = await client.get_sub_replies_paged(r.id, 1, max_pages=3)
+            except CoolapkError:
+                continue
+            if subs:
+                detail.replies[i].sub_replies = (
+                    [ReplyModel.from_api(sr) for sr in subs]
+                )
+                expanded += len(subs)
+        if expanded:
+            detail.sub_replies_expanded = expanded
+
     if comment_keyword:
         dumped = detail.model_dump(mode="json", exclude_defaults=True)
         dumped = postfilter.filter_comments(dumped, comment_keyword)

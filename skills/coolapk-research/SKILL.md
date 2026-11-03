@@ -1,6 +1,6 @@
 ---
 name: coolapk-research
-description: 用酷安 MCP 工具检索酷安社区资料的使用指南——何时用酷安搜资料（玩机教程、root/解锁 BL、Magisk 模块、ROM/刷机等）、工具调用策略（search → feed_detail → read_image → topic）、语义搜索策略链、作者质量锚定、分类→话题映射表、风控礼仪。当需要从酷安社区找玩机资料、了解酷友讨论、查机型相关帖子时使用。
+description: 用酷安 MCP 工具检索酷安社区资料的使用指南——何时用酷安搜资料（玩机教程、root/解锁 BL、Magisk 模块、ROM/刷机等）、工具调用策略（search → feed_detail → read_image → topic）、语义搜索策略链、作者质量锚定、评论区金矿挖掘（楼主补充/热评反馈/楼中楼答疑/修改历史）、分类→话题映射表、风控礼仪。当需要从酷安社区找玩机资料、了解酷友讨论、查机型相关帖子时使用。
 ---
 
 # 酷安资料检索指南
@@ -34,7 +34,7 @@ description: 用酷安 MCP 工具检索酷安社区资料的使用指南——�
 3. **联想词改写**：`coolapk_suggest` 拿酷安建议的规范搜索词，修正生造词。
 4. **进话题抓干货**：`coolapk_topic`（with_feeds=true）已默认按热度排序（like+reply*3），前排是高价值帖。
 5. **全站搜帖**：`coolapk_search`（type=feed）默认 sort=hot，直接返回高赞干货帖而非低互动点评；结果带 like_num/reply_num，可再按热度筛选。
-6. **读帖收图**：`coolapk_feed_detail` 读正文与回复（需要完整舆情时用 all_replies 或 comment_keyword）；关键截图用 `coolapk_read_image` 看。
+6. **读帖挖评论区金矿**：工具/资源帖优先 `coolapk_feed_detail(comments_focus="smart")`——楼主评论区补充（下载链接/密码/更新说明常在这里）+ 热门评论（踩坑反馈）合并展示，每条回复自动带 `links` 网盘/仓库链接字段；需要版本演进时加 `with_history=True`（修改历史）；楼主答疑在楼中楼深处，加 `expand_sub_replies=True`（会增加请求量，确有需要再开）；需要完整舆情才用 `all_replies` 或 `comment_keyword`。关键截图用 `coolapk_read_image` 看。
 
 标准检索链路（按需截断）：
 
@@ -42,7 +42,7 @@ description: 用酷安 MCP 工具检索酷安社区资料的使用指南——�
 coolapk_search        先定位（默认 sort=hot 高赞优先；type=feedTopic 找话题）
 coolapk_suggest       联想词改写：口语 → 酷安习惯用词
 coolapk_topic         刷话题：with_feeds=true 默认热度排序，前排即干货
-coolapk_feed_detail   读帖：拿正文与回复；需要完整舆情时用 all_replies 或 comment_keyword
+coolapk_feed_detail   读帖：拿正文与回复；找工具/资源首选 comments_focus=smart（楼主补充+热评+links 链接字段）
 coolapk_read_image    看关键截图：教程帖的步骤截图、模块配置截图（image.coolapk.com 直连 567，必须走此工具）
 coolapk_image_link    客户端显示不了 base64 图片时（如手机语音助手），把图片转成签名 https 外链；仅远程 HTTP 模式可用
 ```

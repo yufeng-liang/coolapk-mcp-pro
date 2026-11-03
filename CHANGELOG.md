@@ -1,10 +1,21 @@
 # 更新日志
 
-## 未发布
+## 0.6.5（2026-11-03）
 
 ### 新增
 
+- **评论区金矿**（`coolapk_feed_detail` 三新参数）：
+  - `comments_focus`：`smart`（楼主补充 + 热门评论合并，找工具/资源首选）/ `author`（只看楼主）/ `hot`（热门评论）/ `all`（等价 all_replies），返回 `comments_focus` 元数据（各通道条数与总评论数）。
+  - `with_history`：附正文修改历史（作者每次编辑的快照，看版本演进）。
+  - `expand_sub_replies`：深度展开楼中楼（对回复数多的父评论翻页补全，楼主答疑常在深处；额外发请求，默认关）。
+- **评论链接提取**：每条回复自动带 `links` 字段——网盘（夸克/百度/阿里/123pan/MEGA/天翼/移动云盘/UC/蓝奏）与仓库（GitHub/Gitee）链接去重保序，工具帖的下载地址在评论区也能直接拿到。
+- 新环境变量 `COOLAPK_MAX_REPLY_PAGES`（默认 30，钳位 1-100）：大帖全量评论翻页上限可调。
 - `docs/PHONE-RIKKAHUB.md`：手机端接入指南（以 RikkaHub 为例，配图文截图），从拿到地址和 Token、导入 `mcpServers` JSON、逐项核对服务器配置、四问验收，到「图片为什么是破图」必须走 `coolapk_image_link`，附 7 条常见故障与 4 个手机客户端对照
+
+### 变更
+
+- 客户端新增四个只读方法：楼主评论（`fromFeedAuthor`）、热门评论（`listType=popular`）、楼中楼游标翻页（`firstItem/lastItem`）、修改历史（`changeHistoryList`）。
+- `README.md` 工具表 `coolapk_feed_detail` 行补三个新参数说明；环境变量表补 `COOLAPK_MAX_REPLY_PAGES`；`skills/coolapk-research/SKILL.md` 语义搜索策略链第 6 步改为「评论区金矿」指引（smart 首选 + links 字段 + with_history/expand_sub_replies 场景）。
 
 ### 文档
 

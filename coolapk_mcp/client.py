@@ -576,6 +576,73 @@ class CoolapkClient:
             f"/v6/feed/hotReplyList?id={feed_id}&page={page}&discussMode=1"
         )
 
+    async def get_author_replies(self, feed_id: int, page: int = 1) -> list[dict]:
+        """只看楼主：拉取楼主在评论区的回复（含楼中楼内联）。
+
+        酷安工具帖的关键补充信息（获取方式、答疑、密码说明）多在楼主回复里，
+        fromFeedAuthor=1 能一次精准命中，不用翻全部评论。
+        """
+        return await self.get(
+            f"/v6/feed/replyList?id={feed_id}&listType=&page={page}"
+            f"&discussMode=1&feedType=feed&blockStatus=0&fromFeedAuthor=1"
+        )
+
+    async def get_popular_replies(self, feed_id: int, page: int = 1) -> list[dict]:
+        """热门评论（listType=popular，按点赞排序）。
+
+        高赞评论多为亲测反馈 / 踩坑指南，信息密度远高于默认时间序。
+        """
+        return await self.get(
+            f"/v6/feed/replyList?id={feed_id}&listType=popular&page={page}"
+            f"&discussMode=1&feedType=feed&blockStatus=0&fromFeedAuthor=0"
+        )
+
+    async def get_sub_replies_paged(
+        self, reply_id: int, page: int = 1, max_pages: int = 5
+    ) -> list[dict]:
+        """楼中楼完整翻页（feedType=feed_reply + firstItem/lastItem 游标）。
+
+        服务端默认只在父评论里内联最近几条楼中楼；作者答疑常在楼中楼深处，
+        此方法按游标翻页补全。返回去重后的全部子回复。
+        """
+        collected: list[dict] = []
+        seen: set[str] = set()
+        first_item = ""
+        last_item = ""
+        for _ in range(max(1, max_pages)):
+            params = (
+                f"/v6/feed/replyList?id={reply_id}&listType=&page={page}"
+                f"&discussMode=1&feedType=feed_reply&blockStatus=0&fromFeedAuthor=0"
+            )
+            if first_item:
+                params += f"&firstItem={first_item}"
+            if last_item:
+                params += f"&lastItem={last_item}"
+            batch = await self.get(params)
+            if not isinstance(batch, list) or not batch:
+                break
+            for item in batch:
+                if not isinstance(item, dict):
+                    continue
+                rid = str(item.get("id", ""))
+                if not rid or rid in seen:
+                    continue
+                seen.add(rid)
+                collected.append(item)
+            first_item = str(batch[0].get("id", "")) if batch else ""
+            last_item = str(batch[-1].get("id", "")) if batch else ""
+            if len(batch) < 10:
+                break
+            page += 1
+        return collected
+
+    async def get_feed_history(self, feed_id: int, page: int = 1) -> list[dict]:
+        """动态修改历史：作者每次编辑正文留下的快照。
+
+        版本考古用——能看到教程帖 v1.0→v2.2 的正文演进（支持机型、获取方式变化）。
+        """
+        return await self.get(f"/v6/feed/changeHistoryList?id={feed_id}&page={page}")
+
     async def get_all_replies(
         self, feed_id: int, max_pages: int = 30
     ) -> list[dict]:
@@ -583,7 +650,14 @@ class CoolapkClient:
 
         max_pages 是安全上限，防止超大帖（数千评论）把请求预算耗尽；
         超过上限时返回已取到的部分，调用方可对照 replynum 总数判断是否截断。
+        默认上限可用环境变量 COOLAPK_MAX_REPLY_PAGES 调整（1-100）。
         """
+        if max_pages == 30:
+            try:
+                env_val = int(os.environ.get("COOLAPK_MAX_REPLY_PAGES", "") or 30)
+                max_pages = max(1, min(100, env_val))
+            except (TypeError, ValueError):
+                pass
         all_replies: list[dict] = []
         seen: set[str] = set()
         for page in range(1, max_pages + 1):

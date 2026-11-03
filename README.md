@@ -76,7 +76,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | 工具 | 作用 | 关键参数 |
 | - | - | - |
 | `coolapk_search` | 搜索帖子 / 用户 / 话题 / 应用，严格过滤 + 去重 + 广告标记；结果带热度字段 | `keyword`、`type=feed\|user\|feedTopic\|app`、`page`、`strict`、`sort=hot\|reply\|default`（默认 hot，结果质量显著更好） |
-| `coolapk_feed_detail` | 帖子详情 + 回复（风控自动回落） | `feed_id`、`all_replies`（拉全部一级评论）、`comment_keyword`（评论关键词检索） |
+| `coolapk_feed_detail` | 帖子详情 + 回复（风控自动回落）；评论聚焦与金矿挖掘 | `feed_id`、`all_replies`、`comment_keyword`、`comments_focus`（`smart`=楼主补充+热门评论，找工具/资源首选；`author`=只看楼主；`hot`=热门评论；`all`=全部）、`with_history`（正文修改历史）、`expand_sub_replies`（深度展开楼中楼，楼主答疑常在其中） |
 | `coolapk_topic` | 话题详情 / 话题下动态（默认按热度排序） | `tag`、`with_feeds`、`page`、`hot_first`（默认 true） |
 | `coolapk_user_profile` | 用户资料 | `uid` |
 | `coolapk_user_feeds` | 用户发布的帖子（支持多页聚合 + 关键词过滤 + 热度排序） | `uid`、`page`、`pages=1-5`、`keyword`、`sort=default\|hot\|latest` |
@@ -103,6 +103,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `COOLAPK_MIN_INTERVAL` | `1.2` | 相邻 API 请求最小间隔（秒） |
 | `COOLAPK_MAX_RETRIES` | `2` | 瞬态错误（超时 / 5xx / 429）重试次数 |
 | `COOLAPK_NO_CACHE` | 未设 | 设为 `1` 禁用 GET 缓存（调试用） |
+| `COOLAPK_MAX_REPLY_PAGES` | `30` | `all_replies` 全量评论翻页上限（1-100，大帖防刷屏防风控） |
 | `COOLAPK_BROWSER` | 未设 | 指定浏览器可执行文件路径（`coolapk login --web` 用）；不设则自动查找 Chrome / Edge |
 | `COOLAPK_CDP_PORT` | 未设 | 连接已在运行的浏览器调试端口（需该浏览器带 `--remote-debugging-port` 启动）；设置后 `--web` 不再自己拉起浏览器 |
 | `COOLAPK_PUBLIC_BASE` | 未设 | 远程 HTTP 模式下的对外访问前缀（如 `https://mcp.example.com`）。设置后 `coolapk_image_link` 才能生成图片外链，`/img` 中转也随之生效 |
