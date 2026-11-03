@@ -9,7 +9,7 @@
 ### 文档
 
 - `README.md`：开头新增「接入哪些客户端」一节，明确「凡是支持 MCP 的客户端都能接入」——电脑端编程工具看 `AGENT-SETUP.md`（可让 AI 带你跑通），手机端 AI 助手看 `docs/PHONE-RIKKAHUB.md`；首句客户端范围从「Claude Desktop / Cursor / dsh」扩为「任何支持 MCP 的 AI 助手」；目录结构补 `docs/` 与 `AGENT-SETUP.md`
-- `AGENT-SETUP.md`：手机 AI 助手硬规则增加指向 `docs/PHONE-RIKKAHUB.md` 的链接
+- `AGENT-SETUP.md`：新增「先判定场景再问问题」决策表（电脑本地 / 手机+有服务器 / 手机+无服务器 / 多台电脑 / Q1 与 Q3 矛盾五种情况各自怎么走）；「登录方式」一问改为按部署形态分支（服务器场景不再问桌面端）；「客户端」一问补辨析表（Claude Code vs Claude Desktop vs 网页版、Cursor/Windsurf、手机三款、未知客户端怎么问）；A5 验收补各客户端的配置核对命令（`dsh --dump-config` / `claude mcp list`）；手机 AI 助手硬规则增加指向 `docs/PHONE-RIKKAHUB.md` 的链接
 
 ## 0.6.1（2026-11-03）
 
