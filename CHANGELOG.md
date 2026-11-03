@@ -1,5 +1,15 @@
 # 更新日志
 
+## 未发布
+
+### 新增
+
+- `docs/PHONE-RIKKAHUB.md`：手机端接入指南（以 RikkaHub 为例，配图文截图），从拿到地址和 Token、导入 `mcpServers` JSON、逐项核对服务器配置、四问验收，到「图片为什么是破图」必须走 `coolapk_image_link`，附 7 条常见故障与 4 个手机客户端对照
+
+### 文档
+
+- `README.md`、`AGENT-SETUP.md`：手机 AI 助手段落增加指向 `docs/PHONE-RIKKAHUB.md` 的链接，README 目录结构补 `docs/` 与 `AGENT-SETUP.md`
+
 ## 0.6.1（2026-11-03）
 
 网页登录不再依赖 pythonnet，Python 3.14 也能用；同时补齐给 agent 的自助接入文档。

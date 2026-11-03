@@ -136,7 +136,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 }
 ```
 
-**凡是支持 MCP 的客户端都能接入**，包括手机上的 AI 助手（超级小爱、RikkaHub、Kelivo 等）——手机端通常只能连接远程形态，需要先按[远程部署](#远程部署)把服务跑起来；远程客户端写法见「远程部署 → 客户端接入」，其余桌面客户端按 stdio 三要素（`command` 指向 venv 的 python、`args` 为 `["-m", "coolapk_mcp.server"]`）自行适配，dsh 的 `cordis.patch.yml` 片段见 AGENT-SETUP.md。
+**凡是支持 MCP 的客户端都能接入**，包括手机上的 AI 助手（超级小爱、RikkaHub、Kelivo 等）——手机端通常只能连接远程形态，需要先按[远程部署](#远程部署)把服务跑起来，具体步骤（含导入 JSON、截图与逐项核对）见[手机端接入指南（以 RikkaHub 为例）](docs/PHONE-RIKKAHUB.md)；远程客户端写法见「远程部署 → 客户端接入」，其余桌面客户端按 stdio 三要素（`command` 指向 venv 的 python、`args` 为 `["-m", "coolapk_mcp.server"]`）自行适配，dsh 的 `cordis.patch.yml` 片段见 AGENT-SETUP.md。
 
 ## 远程部署
 
@@ -372,6 +372,9 @@ Environment=COOLAPK_PUBLIC_BASE=https://mcp.example.com
 │   ├── throttle.py     # 限速 / 缓存 / 退避重试
 │   ├── postfilter.py   # 搜索过滤、去重、评论关键词检索
 │   └── auth/           # token v3 签名与设备码
+├── docs/
+│   └── PHONE-RIKKAHUB.md  # 手机端（RikkaHub 为例）接入指南
+├── AGENT-SETUP.md      # 给 AI agent 的自助接入指南
 ├── NOTICE.md           # 基座来源声明与本仓改动说明
 ├── CHANGELOG.md        # 版本变更记录
 └── LICENSE             # MIT（承自上游）
