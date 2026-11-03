@@ -8,7 +8,8 @@
 
 ### 文档
 
-- `README.md`、`AGENT-SETUP.md`：手机 AI 助手段落增加指向 `docs/PHONE-RIKKAHUB.md` 的链接，README 目录结构补 `docs/` 与 `AGENT-SETUP.md`
+- `README.md`：开头新增「接入哪些客户端」一节，明确「凡是支持 MCP 的客户端都能接入」——电脑端编程工具看 `AGENT-SETUP.md`（可让 AI 带你跑通），手机端 AI 助手看 `docs/PHONE-RIKKAHUB.md`；首句客户端范围从「Claude Desktop / Cursor / dsh」扩为「任何支持 MCP 的 AI 助手」；目录结构补 `docs/` 与 `AGENT-SETUP.md`
+- `AGENT-SETUP.md`：手机 AI 助手硬规则增加指向 `docs/PHONE-RIKKAHUB.md` 的链接
 
 ## 0.6.1（2026-11-03）
 

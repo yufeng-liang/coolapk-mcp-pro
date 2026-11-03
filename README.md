@@ -1,8 +1,17 @@
 # 酷安 MCP Server（coolapk-mcp-pro）
 
-纯只读的酷安社区资料检索 MCP Server——让 Claude Desktop / Cursor / dsh 等 AI 助手直接检索酷安帖子、话题与用户资料。
+纯只读的酷安社区资料检索 MCP Server——让任何支持 MCP 的 AI 助手直接检索酷安帖子、话题与用户资料：电脑上的编程工具（dsh / Claude Code / Claude Desktop / Cursor / Cline）、手机上的 AI 助手（RikkaHub / Kelivo / 超级小爱）都可以。
 
-> 🤖 **如果你是 AI / agent**：请直接读 [AGENT-SETUP.md](AGENT-SETUP.md)——面向 agent 的自助接入指南，带你一步步完成安装、登录、客户端配置与验收。
+## 接入哪些客户端
+
+**凡是支持 MCP 的客户端都能接入**——客户端只负责发起请求，服务端不用为每个客户端改代码。
+
+| 你的客户端 | 接入指南 |
+| - | - |
+| 电脑上的编程工具：dsh / Claude Code / Claude Desktop / Cursor / Cline | 见 [AGENT-SETUP.md](AGENT-SETUP.md)，**也可以直接把这个文件丢给你的 AI，让它带你跑通**（该文档就是写给 agent 读的：AI 读完会主动问你是本地还是服务器、用哪种登录，然后一步步装好并验收） |
+| 手机上的 AI 助手：RikkaHub / Kelivo / 超级小爱 | 手机端跑不了本地进程，只能连远程形态；图文步骤（含导入 JSON、逐项核对、看图兜底、常见故障）见 [docs/PHONE-RIKKAHUB.md](docs/PHONE-RIKKAHUB.md) |
+
+> 🤖 **如果你是 AI / agent**：先读 [AGENT-SETUP.md](AGENT-SETUP.md)，按里面的三问确认用户场景，再动手安装。
 
 > **声明**：本项目基于 [Lniosy/coolapk-mcp](https://github.com/Lniosy/coolapk-mcp)（经 [zjy2968466837/coolapk-mcp](https://github.com/zjy2968466837/coolapk-mcp) 增强后平铺引入）二次增强，详见 [NOTICE.md](NOTICE.md)。感谢两位上游作者。登录态复用的「酷安桌面端」同样是第三方社区项目，声明见下节。
 
