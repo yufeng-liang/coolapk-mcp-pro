@@ -2,6 +2,8 @@
 
 纯只读的酷安社区资料检索 MCP Server——让 Claude Desktop / Cursor / dsh 等 AI 助手直接检索酷安帖子、话题与用户资料。
 
+> 🤖 **如果你是 AI / agent**：请直接读 [AGENT-SETUP.md](AGENT-SETUP.md)——面向 agent 的自助接入指南，带你一步步完成安装、登录、客户端配置与验收。
+
 > **声明**：本项目基于 [Lniosy/coolapk-mcp](https://github.com/Lniosy/coolapk-mcp)（经 [zjy2968466837/coolapk-mcp](https://github.com/zjy2968466837/coolapk-mcp) 增强后平铺引入）二次增强，详见 [NOTICE.md](NOTICE.md)。感谢两位上游作者。登录态复用的「酷安桌面端」同样是第三方社区项目，声明见下节。
 
 登录态复用酷安第三方桌面端（见下方准备清单）、失效检测与重登、风控回落、图片读取。Python 3.10+（实测 3.14）+ FastMCP。
@@ -54,7 +56,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | 方式 | 命令 | 说明 |
 | - | - | - |
 | auto 模式（默认） | 无需操作 | 优先读酷安第三方桌面端 `%APPDATA%\com.coolapk.desktop\accounts.json` 中 `lastLoginUid` 对应账户的完整 Cookie（含 SESSID），无效时回落 `~/.coolapk-mcp/config.json` 的原生三键 token；设备码优先复用 accounts.json 的 `deviceCode` |
-| 网页登录 | `.venv\Scripts\coolapk login --web` | 拉起登录窗口，人工完成登录（含滑块 / 验证码）后自动提取 Cookie 写入本地配置。**Python 3.14 下已知不可用**：其依赖 pythonnet（当前锁定 3.2.1，官方标明 Requires-Python `>=3.11,<3.16`）在 3.14 下能安装但运行时初始化失败（`import clr` 报 `Failed to resolve Python.Runtime.Loader.Initialize`），网页登录推荐用 Python 3.12；3.14 用户请改用 `--sms` / `--cookie` |
+| 网页登录 | `.venv\Scripts\coolapk login --web` | 拉起系统浏览器（Chrome / Edge）打开酷安授权页，人工完成登录（含滑块 / 验证码）后自动经 CDP 读取 Cookie 写入本地配置，300 秒超时。优先走 CDP 直连浏览器（不依赖 pythonnet，**Python 3.14 也可用**），本机找不到浏览器时回退 pywebview 窗口（仅 Windows）；浏览器路径可用 `COOLAPK_BROWSER` 指定，已开调试浏览器可设 `COOLAPK_CDP_PORT` 直连。无图形环境（纯服务器）不可用，此时改用 `--sms` / `--cookie` |
 | 短信登录 | `.venv\Scripts\coolapk login --sms --phone <手机号>` | 按提示两步完成：识别图形验证码 → 提交短信验证码 |
 | Cookie 导入 | `.venv\Scripts\coolapk login --cookie "uid=…;username=…;token=…"` | 从浏览器或桌面端日志手动粘贴 Cookie |
 
@@ -92,44 +94,19 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `COOLAPK_MIN_INTERVAL` | `1.2` | 相邻 API 请求最小间隔（秒） |
 | `COOLAPK_MAX_RETRIES` | `2` | 瞬态错误（超时 / 5xx / 429）重试次数 |
 | `COOLAPK_NO_CACHE` | 未设 | 设为 `1` 禁用 GET 缓存（调试用） |
+| `COOLAPK_BROWSER` | 未设 | 指定浏览器可执行文件路径（`coolapk login --web` 用）；不设则自动查找 Chrome / Edge |
+| `COOLAPK_CDP_PORT` | 未设 | 连接已在运行的浏览器调试端口（需该浏览器带 `--remote-debugging-port` 启动）；设置后 `--web` 不再自己拉起浏览器 |
 | `COOLAPK_PUBLIC_BASE` | 未设 | 远程 HTTP 模式下的对外访问前缀（如 `https://mcp.example.com`）。设置后 `coolapk_image_link` 才能生成图片外链，`/img` 中转也随之生效 |
 
 数据文件（自动生成，勿提交仓库）：`~/.coolapk-mcp/config.json`（设备码与登录态）、`~/.coolapk-mcp/uid_index.json`（feed_id → 作者 uid 索引，供详情回落）。
 
-## Agent 接入（给 harness 的自助指引）
+## Agent 接入
 
-如果你是 AI agent（运行在某个 harness / MCP 客户端里），本节就是写给你的：照着下面的指令自己完成接入，不需要用户动手。
+**如果你是 AI / agent，请直接读 [AGENT-SETUP.md](AGENT-SETUP.md)**——面向 agent 的完整自助指南：自检环境 → 问清部署形态 → 安装 → 建立登录态 → 写客户端配置 → 五项验收，照做即可完成接入，不需要用户手敲命令。
 
-**给 agent 的话**：请按顺序完成以下六步，每步失败时参照「故障排查」一节；完成后向用户报告接入结果（工具数量、登录状态、一次冒烟检索的摘要）。执行过程中产生的配置文件修改属于常规接入操作，直接进行即可；只有涉及用户凭据（Cookie / 短信验证码）的步骤才需要用户配合。
+人读速查（stdio 本地形态，路径换成实际克隆目录）：
 
-1. **确认前置**：本机 Windows / macOS / Linux 均可，Python ≥3.10（3.14 可用，但 `login --web` 在 3.14 下运行时初始化失败，网页登录请用 Python 3.12，3.14 用户改走 `--sms` / `--cookie`）。检查用户是否已装[酷安第三方桌面端](https://github.com/coolapk-desktop/coolapk-desktop)（官方只有手机 App，桌面端是社区维护项目）：已装则登录态走 auto 模式自动复用；未装则准备一个酷安安卓 APK 改名 `coolapk.apk` 放到 `~/.coolapk-mcp/`（用于提取签名 blob）。
-2. **安装**：`git clone https://github.com/yufeng-liang/coolapk-mcp-pro.git && cd coolapk-mcp-pro && py -m venv .venv && .venv/Scripts/python -m pip install -e .`（Linux / macOS 为 `.venv/bin/`）。记住克隆目录的绝对路径，第 4 步要写进配置。
-3. **建立登录态**：优先让用户在已装桌面端里登录一次（零配置）；否则跑 `.venv/Scripts/coolapk login --sms --phone <手机号>`（需要用户提供手机号与短信验证码）或 `.venv/Scripts/coolapk login --cookie "uid=…;username=…;token=…"`。用 `coolapk login --status` 确认成功。
-4. **注册到你的 MCP 客户端**：按你的客户端类型选下方对应示例；都不匹配则参考「远程部署」一节的配置结构自行适配——stdio 形态核心三要素：`command` 指向 venv 的 python 可执行文件、`args` 为 `["-m", "coolapk_mcp.server"]`、工作目录或路径前缀指向克隆目录；远程形态核心三要素：`url` 指向服务端 `/mcp`、`headers.Authorization` 为 `Bearer <token>`、transport 为 `streamable-http`。
-5. **验证**：重启 / 重载客户端后确认 `coolapk_*` 工具族（10 个）已挂载，调 `coolapk_login_status` 确认登录态，再跑一次 `coolapk_search`（keyword 任选，如 "Magisk 模块"）作为冒烟。
-6. **学会使用**：阅读 [skills/coolapk-research/SKILL.md](skills/coolapk-research/SKILL.md)——那是给 agent 的完整使用手册（何时用酷安搜资料、调用策略链路、话题映射表、风控礼仪）。遵守其中的限频约束；遇到 `error_type` 按「工具一览」末尾的说明处置，不要盲目重试。
-
-下面三个示例覆盖最常见的三种客户端，其余客户端按第 4 步的要素自行适配。
-
-### 示例一：DeepSeek Harness（dsh）
-
-编辑 dsh profile 配置目录下的 `cordis.patch.yml`，追加一个 MCP client 插件行（stdio 本地形态；远程形态写法见「远程部署 → 客户端接入」），重启 dsh 会话生效：
-
-```yaml
-- id: mcp-coolapk
-  name: '@deepseek-ai/dsh-mcp-client'
-  config:
-    serverName: coolapk
-    transport: stdio
-    command: D:/coolapk-mcp-pro/.venv/Scripts/python.exe
-    args:
-      - -m
-      - coolapk_mcp.server
-```
-
-写完后可用 `dsh --profile web --dump-config` 核对新行已合入。
-
-### 示例二：Claude Desktop
+**Claude Desktop**（`%APPDATA%\Claude\claude_desktop_config.json`，Windows 路径 JSON 内用 `\\` 转义）：
 
 编辑 `%APPDATA%\Claude\claude_desktop_config.json`（Windows 路径 JSON 内用 `\\` 转义）：
 
@@ -144,7 +121,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 }
 ```
 
-### 示例三：Cursor
+**Cursor**
 
 编辑项目或全局 `.cursor/mcp.json`（正斜杠路径即可）：
 
@@ -158,6 +135,8 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
   }
 }
 ```
+
+**凡是支持 MCP 的客户端都能接入**，包括手机上的 AI 助手（超级小爱、RikkaHub、Kelivo 等）——手机端通常只能连接远程形态，需要先按[远程部署](#远程部署)把服务跑起来；远程客户端写法见「远程部署 → 客户端接入」，其余桌面客户端按 stdio 三要素（`command` 指向 venv 的 python、`args` 为 `["-m", "coolapk_mcp.server"]`）自行适配，dsh 的 `cordis.patch.yml` 片段见 AGENT-SETUP.md。
 
 ## 远程部署
 
@@ -362,7 +341,7 @@ Environment=COOLAPK_PUBLIC_BASE=https://mcp.example.com
 ### 登录失效（`error_type: auth_expired`）
 
 1. 让 agent 调 `coolapk_login_status` 或运行 `coolapk login --status` 确认失效；
-2. 重新登录，按 Python 版本选择通道：**Python 3.12** 推荐 `coolapk login --web`（图形化，最省事）；**Python 3.14** 下 `--web` 不可用（pythonnet 运行时初始化失败），改用 `--sms` / `--cookie` / `--adb`；
+2. 重新登录：桌面端用户重新登录后**直接重试即可**（服务端会在下次调用时自动重建连接）；仍失效则按环境选通道重登——本地桌面推荐 `coolapk login --web`（全平台、含 Python 3.14 均可用，见[登录（四通道）](#登录四通道)）；纯服务器环境用 `--sms` / `--cookie` / `--adb`；
 3. stdio 模式下 MCP 服务进程随客户端会话重启，重登后新会话自动带上新登录态。
 
 ### 验证码（`error_type: captcha`）
@@ -385,9 +364,10 @@ Environment=COOLAPK_PUBLIC_BASE=https://mcp.example.com
 （仓库根）
 ├── pyproject.toml
 ├── coolapk_mcp/
-│   ├── server.py       # MCP 服务与 10 个工具
+│   ├── server.py       # MCP 服务与 13 个工具
 │   ├── cli.py          # coolapk 命令行（搜索 / 详情 / login 等）
 │   ├── client.py       # API 客户端（风控回落、全量评论检索）
+│   ├── browser_login.py  # --web 网页登录：系统浏览器 CDP 抓 Cookie（回退 pywebview）
 │   ├── config.py       # 登录态持久化（~/.coolapk-mcp）
 │   ├── throttle.py     # 限速 / 缓存 / 退避重试
 │   ├── postfilter.py   # 搜索过滤、去重、评论关键词检索

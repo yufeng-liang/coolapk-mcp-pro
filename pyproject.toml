@@ -1,6 +1,6 @@
 [project]
 name = "coolapk-mcp-pro"
-version = "0.6.0"
+version = "0.6.1"
 description = "酷安社区 MCP Server — AI 原生搜索工具"
 requires-python = ">=3.10"
 dependencies = [
@@ -15,6 +15,8 @@ dependencies = [
     "uvicorn>=0.23",
     # click：cli.py 直接 import，此前靠 uvicorn 传递依赖带入
     "click>=8.0",
+    # websocket-client：浏览器 CDP 登录（coolapk login --web）读取 Cookie 用，纯 Python 无需编译
+    "websocket-client>=1.6",
 ]
 
 [project.scripts]

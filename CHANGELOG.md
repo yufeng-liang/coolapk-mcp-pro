@@ -1,5 +1,23 @@
 # 更新日志
 
+## 0.6.1（2026-11-03）
+
+网页登录不再依赖 pythonnet，Python 3.14 也能用；同时补齐给 agent 的自助接入文档。
+
+### 新增
+
+- `AGENT-SETUP.md`：面向 agent 的自助接入指南（单文件），AI 读完可主动询问「本机还是服务器 / 用哪种登录 / 有没有装桌面端」，再一步步带用户装上并跑通；含 8 个客户端一句话清单与 dsh / Claude Desktop / RikkaHub 三个完整配置片段
+- `coolapk login --web` 改用系统浏览器 + Chrome DevTools Protocol 读 Cookie：启动 Chrome/Edge（独立临时 profile）→ 用户正常登录 → 通过 `Storage.getCookies` 取回 Cookie 并落盘；不依赖 pythonnet，**Python 3.14 也可用**
+- 环境变量 `COOLAPK_CDP_PORT`：连接已在运行的浏览器（需带 `--remote-debugging-port`），用于无法自动拉起浏览器的环境
+- 环境变量 `COOLAPK_BROWSER`：显式指定 Chrome/Edge 可执行文件路径
+- 新增依赖 `websocket-client`（纯 Python，无需编译）
+
+### 变更
+
+- `--web` 的原有 pywebview 实现保留为兜底：仅当本机找不到浏览器时才回退
+- 找不到或拉不起浏览器时，输出更明确的替代方案（指定 `COOLAPK_BROWSER` / 用 `COOLAPK_CDP_PORT` 连接 / 手动 `--cookie`）
+- README 「Agent 接入」章节压缩为指针，详细流程移入 `AGENT-SETUP.md`；`skills/coolapk-research/SKILL.md` 与 `AGENT-SETUP.md` 互链分工
+
 ## 0.6.0（2026-11-01）
 
 远程形态的图片显示：解决「聊天类客户端既打不开酷安图床、也解不了 base64」的最后一公里。

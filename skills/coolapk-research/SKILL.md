@@ -7,7 +7,9 @@ description: 用酷安 MCP 工具检索酷安社区资料的使用指南——�
 
 酷安（CoolAPK）是国内安卓玩机社区的主阵地：写机教程、root/解锁 BL 资源、Magisk 模块、ROM/刷机包、机型适配讨论都集中在这里。本 skill 指导 agent 通过酷安 MCP Server（`coolapk_*` 工具族）检索这些资料。
 
-前置条件：MCP 客户端（dsh / Claude Desktop / Cursor 或其他任意 harness）已按 [README.md](../../README.md)「Agent 接入」一节配置酷安 MCP Server（任何 agent 都可照该节自助完成接入），并完成登录态准备（推荐安装第三方酷安桌面端登录一次，见 README「准备清单」）。
+> 分工说明：**安装与接入**（怎么装、怎么登录、怎么写客户端配置）看仓库根 [AGENT-SETUP.md](../../AGENT-SETUP.md)；**本文件只讲装上之后怎么搜得准**（调用策略、话题映射、风控礼仪）。
+
+前置条件：MCP 客户端（dsh / Claude Desktop / Cursor 或其他任意 harness）已按 [AGENT-SETUP.md](../../AGENT-SETUP.md) 完成酷安 MCP Server 的接入与登录（任何 agent 都可照该指南自助完成）。
 
 ## 何时用酷安搜资料
 

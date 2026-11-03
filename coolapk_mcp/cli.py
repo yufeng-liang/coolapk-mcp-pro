@@ -317,7 +317,7 @@ def _apply_cookie_login(config: AppConfig, cookie_str: str) -> dict:
     }
 
 
-def _run_web_login() -> str | None:
+def _run_pywebview_login() -> str | None:
     """pywebview 打开酷安网页登录，轮询 Cookie，成功返回完整 Cookie 串
 
     轮询中把各次读到的 Cookie 累积进 jar：登录成功瞬间服务域在
@@ -380,8 +380,45 @@ def _run_web_login() -> str | None:
     return result["cookie_str"] or None
 
 
+def _run_web_login() -> tuple[str | None, dict | None]:
+    """网页登录：优先系统浏览器 + CDP，找不到浏览器再回退 pywebview
+
+    系统浏览器这条路不依赖 pythonnet，因此 Python 3.14 也能用；pywebview 在
+    Windows 上的后端依赖 pythonnet，而 pythonnet 尚未支持 3.14。
+    """
+    try:
+        from coolapk_mcp.browser_login import run_browser_login
+
+        cookie_str, status = run_browser_login(WEB_LOGIN_URL, WEB_LOGIN_TIMEOUT)
+    except Exception as exc:
+        click.echo(
+            json.dumps({"hint": f"系统浏览器登录不可用，尝试 pywebview: {exc}"}, ensure_ascii=False),
+            err=True,
+        )
+        cookie_str, status = None, "no_browser"
+
+    if status == "ok" and cookie_str:
+        return cookie_str, None
+    if status in ("timeout", "closed"):
+        # 浏览器已经打开过，登录没完成说明是用户侧没走完流程，换引擎也没用
+        return None, None
+    if status == "launch_failed":
+        return None, {
+            "error": "浏览器无法启动（可能受限环境或缺少图形界面）",
+            "hint": (
+                "三条替代方案：①把 COOLAPK_BROWSER 指向 chrome/edge 可执行文件后重试；"
+                "②自己用带 --remote-debugging-port=9222 的参数启动 Chrome，"
+                "再设 COOLAPK_CDP_PORT=9222 运行本命令，登录后会自动读取；"
+                "③手动抓 Cookie 后用 coolapk login --cookie"
+            ),
+        }
+
+    # status == "no_browser"：本机没有 Chrome/Edge，回退 pywebview
+    return _run_pywebview_login(), None
+
+
 @cli.command("login")
-@click.option("--web", is_flag=True, help="打开浏览器窗口网页登录（pywebview，Windows 走系统 WebView2）")
+@click.option("--web", is_flag=True, help="打开系统浏览器网页登录（Chrome/Edge + CDP 读 Cookie，Python 3.14 也可用）")
 @click.option("--cookie", help="导入完整 Cookie 串（uid=..;username=..;token=..[;SESSID=..]）")
 @click.option("--status", is_flag=True, help="查看登录状态")
 @click.option("--adb", is_flag=True, help="从已连接的手机 ADB 自动提取 Cookie 登录")
@@ -430,7 +467,7 @@ async def login(web, cookie, status, adb, sms, phone, captcha, code, sessid, val
     # --web: 网页登录
     if web:
         try:
-            cookie_str = _run_web_login()
+            cookie_str, web_error = _run_web_login()
         except Exception as e:
             click.echo(json.dumps(
                 {"error": f"网页登录窗口启动失败: {e}", "hint": "无图形环境时请改用 --sms 或 --cookie"},
@@ -439,7 +476,8 @@ async def login(web, cookie, status, adb, sms, phone, captcha, code, sessid, val
             sys.exit(1)
         if not cookie_str:
             click.echo(json.dumps(
-                {"error": "网页登录未完成（窗口关闭或超时），未获取到登录 Cookie"},
+                web_error
+                or {"error": "网页登录未完成（窗口关闭或超时），未获取到登录 Cookie"},
                 ensure_ascii=False,
             ))
             sys.exit(1)
