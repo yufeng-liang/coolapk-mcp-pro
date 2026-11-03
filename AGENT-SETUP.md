@@ -360,7 +360,7 @@ server {
 | # | 验收项 | 通过标准 |
 | - | - | - |
 | 1 | 拉取工具清单 | `tools/list` 恰好返回 **13 个** `coolapk_*` 工具（search / feed_detail / user_profile / user_feeds / author / author_digest / home / topic / suggest / login_status / read_image / image_link / get_url） |
-| 2 | 登录态 | 调 `coolapk_login_status`，返回 `logged_in: true` 且 `uid` 与用户预期一致 |
+| 2 | 登录态 | 调 `coolapk_login_status`，返回 `is_logged_in: true` 且 `uid` 与用户预期一致（注意与 CLI `coolapk login --status` 的 `logged_in` 字段名不同） |
 | 3 | 真实搜索 | 调 `coolapk_search`（keyword 任选，如 `Magisk 模块`），返回非空列表 |
 | 4 | 图片链路 | 本地：`coolapk_read_image` 传入上一步结果里任一帖子的图片 URL，能返回图片；远程：改用 `coolapk_image_link` 生成外链且链接能打开 |
 | 5 | 仅远程 | `curl https://<域名>/health` 返回 200 与 `{"status":"ok"}`；不带 Token 请求 `https://<域名>/mcp` 返回 **401** |
