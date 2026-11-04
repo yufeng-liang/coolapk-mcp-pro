@@ -81,7 +81,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `coolapk_user_profile` | 用户资料 | `uid` |
 | `coolapk_user_feeds` | 用户发布的帖子（支持多页聚合 + 关键词过滤 + 热度排序） | `uid`、`page`、`pages=1-5`、`keyword`、`sort=default\|hot\|latest` |
 | `coolapk_home` | 首页动态 | `tab=recommend\|hot\|latest`、`page` |
-| `coolapk_read_image` | 读取图片消息（带 Referer 下载，解决图片 CDN 直连 567） | 图片 URL |
+| `coolapk_read_image` | 读取图片消息（带 Referer 下载，解决图片 CDN 直连 567）；默认缩略优先（长边 1080px，省 70~80% 流量，`COOLAPK_IMG_THUMBNAIL=0` 关闭） | 图片 URL |
 | `coolapk_image_link` | 把酷安图片转成可在任意聊天窗口显示的签名 https 链接（仅远程 HTTP 模式，需 `COOLAPK_PUBLIC_BASE`） | `urls`（逗号/空格/换行分隔）、`ttl_minutes`（默认 120） |
 | `coolapk_login_status` | 查询当前登录态与登录方式 | 无 |
 | `coolapk_suggest` | 搜索联想词（把口语化需求改写成酷安习惯用词） | `keyword` |
@@ -106,7 +106,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `COOLAPK_MAX_REPLY_PAGES` | `30` | `all_replies` 全量评论翻页上限（1-100，大帖防刷屏防风控） |
 | `COOLAPK_BROWSER` | 未设 | 指定浏览器可执行文件路径（`coolapk login --web` 用）；不设则自动查找 Chrome / Edge |
 | `COOLAPK_CDP_PORT` | 未设 | 连接已在运行的浏览器调试端口（需该浏览器带 `--remote-debugging-port` 启动）；设置后 `--web` 不再自己拉起浏览器 |
-| `COOLAPK_IMG_THUMBNAIL` | `1` | `/img` 中转缩略优先开关（默认开）：带尺寸后缀的图先取酷安服务端缩略 `.m.jpg`（大图省约 40% 流量），上游非 200 自动回落原图；设 `0` 关闭 |
+| `COOLAPK_IMG_THUMBNAIL` | `1` | 图片缩略优先开关（默认开）：`coolapk_read_image` 与 `/img` 中转对带尺寸后缀的图先取酷安服务端缩略 `.m.jpg`（长边约 1080px，仍在多模态模型视觉窗口内，大图省约 70~80% 流量），上游非 200 自动回落原图；设 `0` 关闭 |
 | `COOLAPK_PUBLIC_BASE` | 未设 | 远程 HTTP 模式下的对外访问前缀（如 `https://mcp.example.com`）。设置后 `coolapk_image_link` 才能生成图片外链，`/img` 中转也随之生效 |
 
 数据文件（自动生成，勿提交仓库）：`~/.coolapk-mcp/config.json`（设备码与登录态）、`~/.coolapk-mcp/uid_index.json`（feed_id → 作者 uid 索引，供详情回落）。

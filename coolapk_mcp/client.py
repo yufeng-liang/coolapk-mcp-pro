@@ -5,7 +5,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -415,6 +415,20 @@ class CoolapkClient:
         """
         return await self.get(self._check_get_url_path(path))
 
+    @staticmethod
+    def _thumb_fetch_url(url: str) -> str | None:
+        """带 @WxH 尺寸后缀的 jpg 返回 .m.jpg 缩略地址，否则 None。
+
+        受 COOLAPK_IMG_THUMBNAIL 开关控制（默认开，"0"/"false" 关）。
+        缩略长边约 1080px，仍在主流多模态模型视觉窗口内，读图内容不受影响。
+        """
+        if os.environ.get("COOLAPK_IMG_THUMBNAIL", "1").lower() in ("0", "false"):
+            return None
+        path = urlsplit(url).path
+        if path.endswith(".jpg") and "@" in path:
+            return url + ".m.jpg"
+        return None
+
     async def download_image(self, url: str) -> tuple[bytes, str]:
         """下载 CDN 图片，返回 (图片字节, 格式名)。
 
@@ -439,6 +453,10 @@ class CoolapkClient:
             )
         if url.startswith("http://"):
             url = f"https://{url[len('http://'):]}"
+        # 缩略优先（与 /img 中转同一开关 COOLAPK_IMG_THUMBNAIL，默认开）：
+        # 上游非 200 自动回落原图。
+        fetch_url = self._thumb_fetch_url(url) or url
+        thumbnail_used = fetch_url != url
 
         import httpx
         from httpx import HTTPError as _HTTPError
@@ -454,14 +472,20 @@ class CoolapkClient:
             async with httpx.AsyncClient(
                 headers=headers, timeout=30, follow_redirects=True,
             ) as client:
-                resp = await client.get(url)
+                resp = await client.get(fetch_url)
+                if thumbnail_used and resp.status_code != 200:
+                    resp = await client.get(url)
+                    thumbnail_used = False
         except httpx.InvalidURL:
             # NO_PROXY 等环境变量含非法值（如 [::1]）时解析失败，禁用环境代理兜底
             async with httpx.AsyncClient(
                 headers=headers, timeout=30, follow_redirects=True,
                 trust_env=False,
             ) as client:
-                resp = await client.get(url)
+                resp = await client.get(fetch_url)
+                if thumbnail_used and resp.status_code != 200:
+                    resp = await client.get(url)
+                    thumbnail_used = False
         except _HTTPError as exc:
             raise CoolapkError(f"图片下载失败: {exc}", kind="network") from exc
 
