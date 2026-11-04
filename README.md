@@ -400,7 +400,8 @@ agent 侧使用指南（何时用酷安搜资料、话题映射表、风控礼�
 1. Fork 本仓并创建特性分支；
 2. 保持纯只读定位——任何写操作（点赞 / 回复 / 关注 / 发帖）的改动不会被接受；
 3. 提交前跑通冒烟：`.venv\Scripts\coolapk search "Magisk"` 与 `python -m coolapk_mcp.server` 可正常启动；
-4. 注释与 commit message 用中文，遵循现有代码风格。
+4. 注释与 commit message 用中文，遵循现有代码风格；
+5. 发版（打 tag / 发 release）遵循 [skills/coolapk-mcp-release/SKILL.md](skills/coolapk-mcp-release/SKILL.md)——含版本一致性检查、四步发布流程与 release 说明模板，tag 和 release 极易漏打，务必走完整流程。
 
 发现酷安接口或风控行为有变化也欢迎开 Issue 反馈实测记录。
 
