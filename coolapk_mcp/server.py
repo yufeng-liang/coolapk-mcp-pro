@@ -788,11 +788,24 @@ def _build_http_app():
             return JSONResponse(
                 {"error": "bad_signature", "detail": "签名校验失败"}, status_code=403
             )
+        # 缩略优先：带 @WxH 尺寸后缀的图先试酷安服务端缩略 .m.jpg（大图省约 40% 流量），
+        # 上游 404/非 200 自动回落原图；COOLAPK_IMG_THUMBNAIL=0 关闭。
+        fetch_url = url
+        thumbnail_used = False
+        want_thumb = os.environ.get("COOLAPK_IMG_THUMBNAIL", "1").lower() not in ("0", "false")
+        if want_thumb and urlsplit(url).path.endswith(".jpg") and "@" in urlsplit(url).path:
+            fetch_url = url + ".m.jpg"
+            thumbnail_used = True
         try:
             async with httpx.AsyncClient(timeout=20, follow_redirects=True, trust_env=False) as client:
                 upstream = await client.get(
-                    url, headers={"User-Agent": IMAGE_UA, "Referer": "https://www.coolapk.com/"}
+                    fetch_url, headers={"User-Agent": IMAGE_UA, "Referer": "https://www.coolapk.com/"}
                 )
+                if thumbnail_used and upstream.status_code != 200:
+                    upstream = await client.get(
+                        url, headers={"User-Agent": IMAGE_UA, "Referer": "https://www.coolapk.com/"}
+                    )
+                    thumbnail_used = False
         except Exception as exc:  # 网络异常统一 502，不泄漏细节
             return JSONResponse(
                 {"error": "fetch_failed", "detail": type(exc).__name__}, status_code=502

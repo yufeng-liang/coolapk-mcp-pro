@@ -156,6 +156,8 @@ class FeedDetail(FeedModel):
     edit_history: list[dict] = Field(default_factory=list)
     # 深度展开楼中楼时补充的子回复条数（expand_sub_replies=True 时填充）
     sub_replies_expanded: int = 0
+    # 分享链接（带 s= 分享码，浏览器打开可看全文与图片，免服务器图片流量）
+    share_url: str = ""
 
     @classmethod
     def from_api(
@@ -188,6 +190,7 @@ class FeedDetail(FeedModel):
             replies=parsed_replies,
             reply_count=data.get("replyRowsCount", 0) or data.get("replynum", 0),
             fetch_source=fetch_source,
+            share_url=data.get("shareUrl") or "",
             comments_focus=comments_focus,
         )
 
@@ -476,7 +479,7 @@ _TOOL_FIELDS: dict[str, tuple[str, ...]] = {
     "search_topic": ("id", "title", "tag", "follow_num", "comment_num", "description"),
     "search_app": ("id", "title", "package_name", "description", "follow_num",
                    "download_num", "version"),
-    "feed_detail": (*_FEED_FIELDS, "source_feed", "replies", "reply_count",
+    "feed_detail": (*_FEED_FIELDS, "share_url", "source_feed", "replies", "reply_count",
                     "fetch_source", "comment_search", "comments_focus",
                     "edit_history", "sub_replies_expanded"),
     "user_profile": ("uid", "username", "bio", "level", "fans_num", "follow_num",

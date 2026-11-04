@@ -76,7 +76,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | 工具 | 作用 | 关键参数 |
 | - | - | - |
 | `coolapk_search` | 搜索帖子 / 用户 / 话题 / 应用，严格过滤 + 去重 + 广告标记；结果带热度字段 | `keyword`、`type=feed\|user\|feedTopic\|app`、`page`、`strict`、`sort=hot\|reply\|default`（默认 hot，结果质量显著更好） |
-| `coolapk_feed_detail` | 帖子详情 + 回复（风控自动回落）；评论聚焦与金矿挖掘 | `feed_id`、`all_replies`、`comment_keyword`、`comments_focus`（`smart`=楼主补充+热门评论，找工具/资源首选；`author`=只看楼主；`hot`=热门评论；`all`=全部）、`with_history`（正文修改历史）、`expand_sub_replies`（深度展开楼中楼，楼主答疑常在其中） |
+| `coolapk_feed_detail` | 帖子详情 + 回复（风控自动回落）；评论聚焦与金矿挖掘 | `feed_id`、`all_replies`、`comment_keyword`、`comments_focus`（`smart`=楼主补充+热门评论，找工具/资源首选；`author`=只看楼主；`hot`=热门评论；`all`=全部）、`with_history`（正文修改历史）、`expand_sub_replies`（深度展开楼中楼，楼主答疑常在其中）；输出含 `share_url`（带分享码的网页链接，人在浏览器打开可看全文，不耗服务器图片流量） |
 | `coolapk_topic` | 话题详情 / 话题下动态（默认按热度排序） | `tag`、`with_feeds`、`page`、`hot_first`（默认 true） |
 | `coolapk_user_profile` | 用户资料 | `uid` |
 | `coolapk_user_feeds` | 用户发布的帖子（支持多页聚合 + 关键词过滤 + 热度排序） | `uid`、`page`、`pages=1-5`、`keyword`、`sort=default\|hot\|latest` |
@@ -106,6 +106,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `COOLAPK_MAX_REPLY_PAGES` | `30` | `all_replies` 全量评论翻页上限（1-100，大帖防刷屏防风控） |
 | `COOLAPK_BROWSER` | 未设 | 指定浏览器可执行文件路径（`coolapk login --web` 用）；不设则自动查找 Chrome / Edge |
 | `COOLAPK_CDP_PORT` | 未设 | 连接已在运行的浏览器调试端口（需该浏览器带 `--remote-debugging-port` 启动）；设置后 `--web` 不再自己拉起浏览器 |
+| `COOLAPK_IMG_THUMBNAIL` | `1` | `/img` 中转缩略优先开关（默认开）：带尺寸后缀的图先取酷安服务端缩略 `.m.jpg`（大图省约 40% 流量），上游非 200 自动回落原图；设 `0` 关闭 |
 | `COOLAPK_PUBLIC_BASE` | 未设 | 远程 HTTP 模式下的对外访问前缀（如 `https://mcp.example.com`）。设置后 `coolapk_image_link` 才能生成图片外链，`/img` 中转也随之生效 |
 
 数据文件（自动生成，勿提交仓库）：`~/.coolapk-mcp/config.json`（设备码与登录态）、`~/.coolapk-mcp/uid_index.json`（feed_id → 作者 uid 索引，供详情回落）。
@@ -320,7 +321,7 @@ docker run -d --name coolapk-mcp \
 
 酷安图床 `image.coolapk.com` 对非酷安客户端返回 `HTTP 567`（防盗链），部分聊天类客户端（如手机语音助手）既打不开这个域名，也没有解码 base64 的能力，只能退化成一串链接。
 
-远程模式为此内置了图片中转：设置 `COOLAPK_PUBLIC_BASE` 后，`coolapk_image_link` 会把酷安图片地址转成 `https://你的域名/img?u=...&exp=...&sig=...` 形式的链接，任何能打开网页的客户端都能直接显示图片。
+远程模式为此内置了图片中转：设置 `COOLAPK_PUBLIC_BASE` 后，`coolapk_image_link` 会把酷安图片地址转成 `https://你的域名/img?u=...&exp=...&sig=...` 形式的链接，任何能打开网页的客户端都能直接显示图片。`/img` 默认缩略优先：带尺寸后缀的图先取酷安服务端缩略 `.m.jpg`（大图省约 40% 流量），缩略不可用时自动回落原图；设 `COOLAPK_IMG_THUMBNAIL=0` 关闭。
 
 ```bash
 # systemd 里加上对外地址（与 COOLAPK_HTTP_TOKEN 一起生效）
