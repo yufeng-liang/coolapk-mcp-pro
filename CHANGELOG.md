@@ -1,6 +1,12 @@
 # 更新日志
 
-## 0.6.7（2026-11-04）
+## 0.6.8（2026-11-07）
+
+### 修复
+
+- `coolapk login --sms` 在酷安登录页改版后失效：页面把 requestHash 从 `requestHash: 'xxx'` 改成了 `createAuthCaptchaFlow('/auth/login?type=mobile', 'xxx')` 调用参数，老正则零命中导致「无法从登录页解析 requestHash」。现已兼容新老两种格式（实测真实登录页解析成功），解析失败时的报错文案同时引导到仓库 issues。
+
+# 更新日志（2026-11-04）
 
 ### 新增
 

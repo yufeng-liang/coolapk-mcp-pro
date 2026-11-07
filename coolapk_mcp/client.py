@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,26 @@ class CoolapkError(Exception):
         self.error_code = error_code
         self.kind = kind
         super().__init__(message)
+
+
+def _extract_request_hash(html: str) -> str:
+    """从登录页 HTML 提取 requestHash，兼容新老两种页面格式。
+
+    - 老格式：requestHash: 'xxxx'
+    - 新格式（2026-11 页面改版）：
+      var authFlow = createAuthCaptchaFlow('/auth/login?type=mobile', 'xxxx')
+      只匹配调用处（两个参数均为引号字符串），函数定义行
+      function createAuthCaptchaFlow(url, requestHash) 不会误命中。
+    """
+    m = re.search(r"requestHash[:\s]+['\"]([^'\"]+)['\"]", html)
+    if m:
+        return m.group(1)
+    m = re.search(
+        r"createAuthCaptchaFlow\s*\(\s*['\"][^'\"]+['\"]\s*,\s*['\"]([^'\"]+)['\"]", html
+    )
+    if m:
+        return m.group(1)
+    return ""
 
 
 class CoolapkClient:
@@ -1013,8 +1034,6 @@ class CoolapkClient:
         1. GET /auth/login?type=mobile 获取 HTML 和 SESSID cookie
         2. 从 HTML 解析 requestHash
         """
-        import re
-
         resp = await self._auth_request("GET", "/auth/login?type=mobile")
         html = resp.text
         # 提取 SESSID
@@ -1023,11 +1042,13 @@ class CoolapkClient:
             if "SESSID=" in cookie:
                 sessid = cookie.split(";")[0]
                 break
-        # 提取 requestHash
-        m = re.search(r"requestHash[:\s]+['\"]([^'\"]+)['\"]", html)
-        request_hash = m.group(1) if m else ""
+        # 提取 requestHash（兼容新老页面格式，见 _extract_request_hash）
+        request_hash = _extract_request_hash(html)
         if not request_hash:
-            raise CoolapkError("无法从登录页解析 requestHash")
+            raise CoolapkError(
+                "无法从登录页解析 requestHash（登录页可能又改版了，请到 "
+                "https://github.com/yufeng-liang/coolapk-mcp-pro/issues 反馈）"
+            )
         return sessid, request_hash
 
     async def get_captcha_image(self, sessid: str) -> bytes:
@@ -1118,7 +1139,6 @@ class CoolapkClient:
         Returns:
             API 响应 dict。成功后 Set-Cookie 里会有 uid/username/token。
         """
-        import re
         import time as _time
 
         # validate_url 是路径格式 /auth/validateLogin?key=xxx
@@ -1135,8 +1155,7 @@ class CoolapkClient:
         # 1. GET validate 页面获取新的 requestHash
         resp = await self._auth_request("GET", path, sessid=sessid)
         html = resp.text
-        m = re.search(r"requestHash[:\s]+['\"]([^'\"]+)['\"]", html)
-        request_hash = m.group(1) if m else ""
+        request_hash = _extract_request_hash(html)
 
         # 2. POST 提交验证码
         data = {
