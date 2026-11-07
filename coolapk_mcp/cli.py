@@ -588,16 +588,26 @@ def _extract_cookie_from_adb() -> str | None:
     import subprocess
     import re
 
-    try:
-        result = subprocess.run(
-            ["adb", "shell", "su", "-c",
-             "cat /data/data/com.coolapk.market/shared_prefs/coolapk_preferences_v7.xml"],
-            capture_output=True, text=True, timeout=10,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    # adb server 冷启动/手机唤醒可能超过 10s，超时过短会偶发提取失败；
+    # 给足 30s 并重试一次（第二次跑 adb server 已就绪，基本必成）
+    last_error: Exception | None = None
+    for _ in range(2):
+        try:
+            result = subprocess.run(
+                ["adb", "shell", "su", "-c",
+                 "cat /data/data/com.coolapk.market/shared_prefs/coolapk_preferences_v7.xml"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            last_error = exc
+            continue
+
+        xml = result.stdout
+        if xml:
+            break
+    else:
         return None
 
-    xml = result.stdout
     if not xml:
         return None
 
