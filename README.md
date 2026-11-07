@@ -1,6 +1,19 @@
+<div align="center">
+
 # 酷安 MCP Server（coolapk-mcp-pro）
 
+<img src="https://image.coolapk.com/feed/2026/1101/10/2781460_38649dd1_1091_9902_553@1600x719.png" alt="酷安 MCP——让你的 AI 帮你逛酷安" width="80%">
+
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![MCP](https://img.shields.io/badge/MCP-13%20tools-green)
+![酷安](https://img.shields.io/badge/酷安-13只读工具-16A34A)
+![License](https://img.shields.io/badge/license-MIT-yellow)
+![GitHub stars](https://img.shields.io/github/stars/yufeng-liang/coolapk-mcp-pro?style=flat&color=16A34A)
+[![MCP 协议](https://img.shields.io/badge/协议-MCP-8A2BE2)](https://modelcontextprotocol.io)
+
 纯只读的酷安社区资料检索 MCP Server——让任何支持 MCP 的 AI 助手直接检索酷安帖子、话题与用户资料：电脑上的编程工具（dsh / Claude Code / Claude Desktop / Cursor / Cline）、手机上的 AI 助手（RikkaHub / Kelivo / 超级小爱）都可以。
+
+</div>
 
 ## 接入哪些客户端
 
