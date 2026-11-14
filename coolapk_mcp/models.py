@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import re
-
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from html import unescape
 from typing import Any
 
 from bs4 import BeautifulSoup
@@ -20,12 +20,16 @@ _LINK_PATTERN = re.compile(
 
 
 def _extract_links(text: str) -> list[str]:
-    """从评论文本提取网盘/仓库链接（去重保序）。"""
+    """从评论文本提取网盘/仓库链接（去重保序）。
+
+    评论正文是 HTML，链接里的查询参数常被转义成 &amp;；先 html.unescape
+    还原实体再剥尾部标点，保证 https://x/a?pwd=1&amp;y=2 不被截断成 ?pwd=1。
+    """
     if not text:
         return []
     out: list[str] = []
     for m in _LINK_PATTERN.finditer(text):
-        u = m.group(0).rstrip(").,，。")
+        u = unescape(m.group(0)).rstrip(").,，。")
         if u and u not in out:
             out.append(u)
     return out
@@ -38,14 +42,22 @@ def _strip_html(html: str) -> str:
     return soup.get_text(separator=" ", strip=True)
 
 
-def _format_time(timestamp: int | float) -> str:
+# 酷安 dateline 是东八区 Unix 秒；固定 +08:00 偏移，不依赖运行环境本地时区
+_CST = timezone(timedelta(hours=8))
+
+
+def _format_time(timestamp: float | str) -> str:
+    """Unix 秒 → 东八区 ISO8601（如 2023-11-15T06:13+08:00）。
+
+    空值/非法值一律回退空串；数字字符串（接口偶尔返回）也按秒处理。
+    """
     if not timestamp:
         return ""
     try:
-        dt = datetime.fromtimestamp(int(timestamp), tz=timezone.utc)
-        return dt.strftime("%Y-%m-%d %H:%M")
-    except (ValueError, OSError):
+        dt = datetime.fromtimestamp(int(timestamp), tz=_CST)
+    except (ValueError, OSError, TypeError, OverflowError):
         return ""
+    return dt.isoformat(timespec="minutes")
 
 
 def _extract_pics(pic_arr: list[str] | str) -> list[str]:
@@ -156,6 +168,12 @@ class FeedDetail(FeedModel):
     edit_history: list[dict] = Field(default_factory=list)
     # 深度展开楼中楼时补充的子回复条数（expand_sub_replies=True 时填充）
     sub_replies_expanded: int = 0
+    # 楼中楼是否被截断：某父评论撞到页数上限/请求预算，还有子回复没取回
+    sub_replies_truncated: bool = False
+    # 全量评论翻页是否被截断（all_replies / comment_keyword 撞页数上限或预算）
+    replies_truncated: bool = False
+    # 全量评论续抓页码（未截断时为 None）
+    replies_next_page: int | None = None
     # 分享链接（带 s= 分享码，浏览器打开可看全文与图片，免服务器图片流量）
     share_url: str = ""
 
@@ -481,7 +499,9 @@ _TOOL_FIELDS: dict[str, tuple[str, ...]] = {
                    "download_num", "version"),
     "feed_detail": (*_FEED_FIELDS, "share_url", "source_feed", "replies", "reply_count",
                     "fetch_source", "comment_search", "comments_focus",
-                    "edit_history", "sub_replies_expanded"),
+                    "edit_history", "sub_replies_expanded",
+                    "sub_replies_truncated", "replies_truncated",
+                    "replies_next_page"),
     "user_profile": ("uid", "username", "bio", "level", "fans_num", "follow_num",
                      "feed_num", "verify_title", "reg_date", "city", "gender"),
     "user_feeds": _FEED_FIELDS,
@@ -492,7 +512,7 @@ _TOOL_FIELDS: dict[str, tuple[str, ...]] = {
                "fans_per_feed", "expertise"),
     # 作者领域聚合：作者画像 + 过滤后的高赞帖列表
     "author_digest": ("uid", "username", "author", "keyword", "pages",
-                      "fetched", "matched", "posts"),
+                      "fetched", "matched", "truncated", "next_page", "posts"),
 
     "home": _FEED_FIELDS,
     "topic": ("id", "title", "tag", "follow_num", "comment_num", "description"),
@@ -507,7 +527,9 @@ _GET_URL_SENSITIVE_KEYS = frozenset(
 _GET_URL_SENSITIVE_SUBSTR = ("token", "session", "cookie", "sessid", "passwd", "password", "secret")
 
 # user_feeds 新版包装结构的元数据字段（feeds 列表单独按动态白名单裁剪）
-_USER_FEEDS_META = ("uid", "pages", "fetched", "matched", "sort", "keyword")
+_USER_FEEDS_META = (
+    "uid", "pages", "fetched", "matched", "sort", "keyword", "truncated", "next_page",
+)
 
 
 def _apply_whitelist(obj: Any, fields: tuple[str, ...]) -> Any:

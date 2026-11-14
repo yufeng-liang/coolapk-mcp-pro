@@ -19,6 +19,14 @@ dependencies = [
     "websocket-client>=1.6",
 ]
 
+[project.optional-dependencies]
+# 开发/CI 依赖：pip install -e ".[dev]"
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+]
+
 [project.scripts]
 coolapk = "coolapk_mcp.cli:cli"
 coolapk-mcp = "coolapk_mcp.server:main"
@@ -29,3 +37,21 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["coolapk_mcp*"]
+
+[tool.pytest.ini_options]
+# pytest-asyncio 自动模式：async def 测试无需逐个加 @pytest.mark.asyncio
+asyncio_mode = "auto"
+# 异步 fixture 的事件循环作用域显式声明，避免 pytest-asyncio 新版的弃用告警
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# 临时目录（tmp*/ 已在 .gitignore 忽略）里是历史脚本，不参与检查
+exclude = [".venv", "tmp*"]
+
+[tool.ruff.lint]
+# 只开真实错误：语法/未定义名/未使用变量等，风格类规则等业务代码清理完再逐步加
+select = ["E9", "F63", "F7", "F82"]

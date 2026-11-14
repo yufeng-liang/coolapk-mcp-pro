@@ -1,17 +1,22 @@
 """HTTP 客户端 + API 封装 — 合并网络层和业务端点"""
 
+import asyncio
+import hashlib
 import json
 import os
 import re
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
 from coolapk_mcp import throttle
+from coolapk_mcp.auth.libauth import APK_CACHE_FILE
 from coolapk_mcp.auth.token_v3 import DEFAULT_APP_VERSION, DEFAULT_VERSION_CODE, generate_token_v3
+from coolapk_mcp.budget import Budget, BudgetExceeded, FetchResult
 from coolapk_mcp.config import AppConfig, has_valid_sessid
 
 
@@ -29,12 +34,22 @@ class CoolapkError(Exception):
 
     kind: api(服务端业务错误) captcha(风控验证码) network(超时/连接)
           transient(5xx/429等可重试) http(其他HTTP错误) parse(响应解析失败)
+          auth_expired(登录态失效) config(本地配置/资源缺失，如缺 libauth blob)
+
+    retry_after: 仅 captcha 类有实际意义——端点冷却剩余秒数，None 表示未知/不适用
     """
 
-    def __init__(self, message: str, error_code: int = -1, kind: str = "api"):
+    def __init__(
+        self,
+        message: str,
+        error_code: int = -1,
+        kind: str = "api",
+        retry_after: float | None = None,
+    ):
         self.message = message
         self.error_code = error_code
         self.kind = kind
+        self.retry_after = retry_after
         super().__init__(message)
 
 
@@ -58,6 +73,18 @@ def _extract_request_hash(html: str) -> str:
     return ""
 
 
+def _consume_future_exception(fut: asyncio.Future) -> None:
+    """主动消费 Future 的异常。
+
+    单飞 Future 的异常由等待者 await 时取回；但等待者可能全部提前取消，
+    没人检索异常时 asyncio 会打印 "Future exception was never retrieved" 告警，
+    这里在 done 回调里取一次把它吃掉（已取消的 Future 不取）。
+    """
+    if fut.cancelled():
+        return
+    fut.exception()
+
+
 class CoolapkClient:
     """酷安 API 客户端"""
 
@@ -65,6 +92,8 @@ class CoolapkClient:
 
     # 端点被验证码拦截后的冷却期（秒）：期间不再撞该端点，直接走回落
     CAPTCHA_COOLDOWN = 600.0
+    # 解验证码的入口端点必须豁免冷却机制，否则被风控后无法自助解锁（会死锁一个冷却期）
+    CAPTCHA_UNLOCK_PATHS = ("/v6/account/requestValidate",)
     # 详情回落时最多翻作者动态的页数
     FALLBACK_SCAN_PAGES = 3
     # feed_id → 作者uid 索引，持久化到 ~/.coolapk-mcp/uid_index.json
@@ -80,6 +109,8 @@ class CoolapkClient:
             self._client = httpx.AsyncClient(timeout=30.0, trust_env=False)
         self._limiter = throttle.RateLimiter()
         self._cache = throttle.TTLCache()
+        # 单飞表：cache_key -> 在途请求的 Future，同 key 的并发 GET 共用一次网络请求
+        self._inflight: dict[str, asyncio.Future] = {}
         self._blocked: dict[str, float] = {}
         self._uid_index: dict[int, int] = {}
         self._load_uid_index()
@@ -131,8 +162,21 @@ class CoolapkClient:
             self._save_uid_index()
 
     def _build_headers(self) -> dict[str, str]:
-        """组装请求头，每次请求重新生成 X-App-Token（v3 算法）"""
-        token, _ = generate_token_v3(self.config.device_code)
+        """组装请求头，每次请求重新生成 X-App-Token（v3 算法）
+
+        token 依赖 libauth blob（auth_blob.bin 或从酷安 APK 现场提取）：
+        get_blob 缺文件时抛 RuntimeError，读盘失败抛 OSError。这里统一包成
+        kind="config"，避免裸异常从 _request 逃出、上层无法按 error_type 分类。
+        """
+        try:
+            token, _ = generate_token_v3(self.config.device_code)
+        except (RuntimeError, OSError) as exc:
+            raise CoolapkError(
+                f"无法生成 X-App-Token（{type(exc).__name__}: {exc}）"
+                f"修复：运行 coolapk login 重新导入登录态，"
+                f"或把酷安 APK 放到 {APK_CACHE_FILE}（下次生成 token 时自动提取 blob）",
+                kind="config",
+            ) from exc
         return {
             "X-Sdk-Int": "35",
             "X-Sdk-Locale": "zh-CN",
@@ -180,27 +224,99 @@ class CoolapkClient:
         if cookie and not has_valid_sessid(cookie) and "sessid=" in cookie.lower():
             raise CoolapkError(AUTH_EXPIRED_MESSAGE, kind="auth_expired")
 
+    def _cache_key(self, path: str, params: dict | None = None) -> str:
+        """缓存/单飞键：身份（uid + token 短哈希）+ 路径 + 排序后的参数。
+
+        只带 path+params 时，同一进程内切换登录态（desktop 多账号 / auto 模式
+        回落本机 config）会把 A 账号的响应喂给 B 账号；token 为空（未登录）也
+        取空串哈希，保证键始终稳定。
+        """
+        token8 = hashlib.sha256((self.config.token or "").encode("utf-8")).hexdigest()[:8]
+        pairs = sorted((str(k), str(v)) for k, v in (params or {}).items())
+        return f"{self.config.uid}:{token8}:{path}?{pairs}"
+
     async def _request(self, method: str, path: str, **kwargs) -> Any:
-        """统一请求方法：本地登录预检 → GET 缓存 → 全局限速 → 瞬态错误退避重试 → 错误分类"""
+        """统一请求方法：本地登录预检 → GET 缓存 → 单飞合并 → 限速/重试 → 错误分类
+
+        单飞（single-flight）只覆盖 cache_key 非 None 的 GET：同 key 已有在途
+        请求时，后到的协程直接搭车共用结果，不再多消耗一次限速配额。
+        """
         # 本地预检：未登录或 SESSID 已失效直接抛 auth_expired，不发探测请求；
         # 请求类端点（登录流程自身）不受此限制
         if not path.startswith("/v6/auth/"):
             self._check_local_auth()
 
+        # 验证码负缓存前置闸门：该端点近期已被风控拦过，冷却期内直接跳过，
+        # 不再白白消耗一次限速配额、也不再往风控上撞。base 用 urlsplit 取纯路径，
+        # 与下方「验证码」分支写入时同一口径。
+        base = urlsplit(path).path
+        if base not in self.CAPTCHA_UNLOCK_PATHS and self._endpoint_blocked(base):
+            remaining = max(0.0, self._blocked.get(base, 0.0) - time.monotonic())
+            raise CoolapkError(
+                f"端点 {base} 处于验证码冷却期（约 {remaining:.0f}s 后解除），本次请求未发出",
+                kind="captcha",
+                retry_after=remaining,
+            )
+
         cache_key = None
         if method == "GET" and throttle.CACHE_ENABLED:
             params = kwargs.get("params") or {}
-            cache_key = f"{path}?{sorted((str(k), str(v)) for k, v in params.items())}"
+            cache_key = self._cache_key(path, params)
             cached = self._cache.get(cache_key)
             if cached is not None:
                 return cached
 
+        if cache_key is None:
+            # 非 GET 或缓存关闭：没有可共享的键，直接走请求体
+            return await self._request_uncached(method, path, None, **kwargs)
+
+        # ---- 单飞：同 key 已有在途请求时搭车，不再单独发一次 ----
+        inflight = self._inflight.get(cache_key)
+        if inflight is not None:
+            # shield：等待方被取消时不连带取消真正在发请求的那一路
+            return await asyncio.shield(inflight)
+
+        inflight = asyncio.get_running_loop().create_future()
+        self._inflight[cache_key] = inflight
+        # done 回调里主动取一次异常：等待者全部提前取消时没人检索，
+        # asyncio 会打印 "Future exception was never retrieved" 告警
+        inflight.add_done_callback(_consume_future_exception)
+        try:
+            result = await self._request_uncached(method, path, cache_key, **kwargs)
+        except asyncio.CancelledError:
+            # 生产方被取消：连带取消 Future，等待者收到 CancelledError 后可重试
+            inflight.cancel()
+            raise
+        except BaseException as exc:
+            # 其余异常（含 CoolapkError 的 kind 分类）原样转交给所有等待者
+            if not inflight.done():
+                inflight.set_exception(exc)
+            raise
+        else:
+            inflight.set_result(result)
+            return result
+        finally:
+            # 先让等待者拿到结果再出表：后到的调用即便撞上已完成 Future 也是直接返回
+            self._inflight.pop(cache_key, None)
+
+    async def _request_uncached(
+        self, method: str, path: str, cache_key: str | None, **kwargs
+    ) -> Any:
+        """真正的请求体：限速 → 瞬态错误退避重试 → 解析 → 写缓存（单飞由 _request 编排）"""
         url = f"{self.config.api_base}{path}"
+        # 验证码负缓存的键：与 _request 的前置闸门同一口径（urlsplit 取纯路径）
+        base = urlsplit(path).path
         resp = None
         last_err: CoolapkError | None = None
         last_status: int | None = None
         for attempt in range(throttle.MAX_RETRIES + 1):
             await self._limiter.acquire()
+            # 二次缓存检查：并发调用都过了首查，但先到的那个已经在限速窗口内
+            # 打完请求并写好了缓存；这里命中就直接返回，不重复打服务器
+            if cache_key is not None:
+                cached = self._cache.get(cache_key)
+                if cached is not None:
+                    return cached
             headers = self._build_headers()
             cookie = self._get_cookie_header()
             if cookie:
@@ -227,6 +343,13 @@ class CoolapkClient:
                     raise CoolapkError(AUTH_EXPIRED_MESSAGE, error_code=403, kind="auth_expired")
                 kind = "transient" if (code >= 500 or code == 429) else "http"
                 err = CoolapkError(f"HTTP {code}", kind=kind)
+            except (httpx.HTTPError, httpx.InvalidURL) as e:
+                # 兜底：ReadError/RemoteProtocolError/ProxyError 等散装 httpx 异常
+                # （以及不属于 HTTPError 家族的 InvalidURL）统一归入 network 走重试，
+                # 文案带异常类名，便于区分「连接被重置」还是「URL 非法」。
+                # asyncio.CancelledError 继承 BaseException，不会被这层接住。
+                last_status = None
+                err = CoolapkError(f"请求异常({type(e).__name__}): {e}", kind="network")
             if err is not None and err.kind not in ("network", "transient"):
                 raise err
             last_err = err
@@ -283,10 +406,11 @@ class CoolapkClient:
             if error_code == 403 or "captchaRequired" in str(result):
                 raise CoolapkError(AUTH_EXPIRED_MESSAGE, error_code=403, kind="auth_expired")
             if "验证码" in message:
-                # 负缓存：该端点短期内已被风控，冷却期内不再请求
-                base = path.split("?", 1)[0]
+                # 负缓存：该端点短期内已被风控，冷却期内不再请求（base 在函数开头算好）
                 self._blocked[base] = time.monotonic() + self.CAPTCHA_COOLDOWN
-                raise CoolapkError(message, error_code, kind="captcha")
+                raise CoolapkError(
+                    message, error_code, kind="captcha", retry_after=self.CAPTCHA_COOLDOWN,
+                )
             if error_code == -415:
                 raise CoolapkError(
                     f"设备码被风控拉黑({message})，请更换登录态设备码", error_code, kind="api",
@@ -376,6 +500,20 @@ class CoolapkClient:
         lowered = decoded.lower()
         path_part = lowered.split("?", 1)[0]
         segs = [seg for seg in path_part.strip("/").split("/") if seg]
+        # 拒绝点段、控制字符、反斜杠和分号矩阵参数：部分反代或上游会先
+        # 归一化路径，"/v6/feed/./like" 会被还原成写端点 "/v6/feed/like"；
+        # 分号可能被当成 matrix parameter 剥掉，控制字符可能被截断处理，
+        # 都会让下面的段匹配黑名单失效。
+        if (
+            "\\" in path_part
+            or ";" in path_part
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in path_part)
+            or any(seg in (".", "..") for seg in segs)
+        ):
+            raise CoolapkError(
+                f"拒绝含点段/控制字符/反斜杠/分号的路径: {path}",
+                error_code=403, kind="api",
+            )
         # account 模块整组敏感（登录/验证码/token 下发/风控），透传只放行
         # 登录态检查与风控解锁两个端点；内部业务调用不走本校验，不受影响
         if len(segs) >= 2 and segs[0] == "v6" and segs[1] == "account":
@@ -445,9 +583,11 @@ class CoolapkClient:
         """
         if os.environ.get("COOLAPK_IMG_THUMBNAIL", "1").lower() in ("0", "false"):
             return None
-        path = urlsplit(url).path
-        if path.endswith(".jpg") and "@" in path:
-            return url + ".m.jpg"
+        parts = urlsplit(url)
+        if parts.path.endswith(".jpg") and "@" in parts.path:
+            # 缩略后缀必须加在 path 尾部再重组：直接 url + ".m.jpg" 会让后缀落进
+            # query（...jpg?x=1.m.jpg），CDN 拿不到缩略图
+            return urlunsplit(parts._replace(path=parts.path + ".m.jpg"))
         return None
 
     async def download_image(self, url: str) -> tuple[bytes, str]:
@@ -621,6 +761,110 @@ class CoolapkClient:
             f"/v6/feed/hotReplyList?id={feed_id}&page={page}&discussMode=1"
         )
 
+    # ---- 分页收集：预算闸门 + 去重 + 截断标记 ----
+
+    @staticmethod
+    def _ensure_budget(budget: Budget | None, max_pages: int) -> Budget:
+        """预算缺省时按页数上限建默认预算：调用方不传也不会无限翻页。"""
+        if budget is not None:
+            return budget
+        return Budget(max_requests=max(1, int(max_pages)), deadline=30.0)
+
+    @staticmethod
+    def _dedupe_key(item: dict) -> tuple[str, str] | None:
+        """去重键：优先 id；缺 id 时退回标题；两者都没有则不去重（返回 None）。"""
+        rid = item.get("id")
+        if rid is not None and str(rid) != "":
+            return ("id", str(rid))
+        title = item.get("title")
+        if isinstance(title, str) and title:
+            return ("title", title)
+        return None
+
+    async def _collect_paged(
+        self,
+        fetch_page: Callable[[int], Awaitable[Any]],
+        *,
+        max_pages: int,
+        start_page: int = 1,
+        budget: Budget | None = None,
+    ) -> FetchResult:
+        """通用翻页：每页请求前过预算闸门，按 id/标题去重，收尾标记截断。
+
+        截断语义（server 端按此消费）：
+        - 预算耗尽：truncated=True，next_page=还没发出去的那一页；
+        - 跑满 max_pages 且末页仍满（>=10 条）：truncated=True，next_page=下一页；
+        - 空页 / 末页不足 10 条 / 整页重复：确实到底，truncated=False。
+
+        requests 用 budget.used 的起止差值统计，多个方法共享同一 budget 时
+        也能反映本次真实页请求数。
+        """
+        budget = self._ensure_budget(budget, max_pages)
+        pages = max(1, int(max_pages))
+        used_before = budget.used
+        items: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        truncated = False
+        next_page: int | None = None
+        page = max(1, int(start_page))
+        for _ in range(pages):
+            try:
+                budget.take()
+            except BudgetExceeded:
+                # 预算耗尽：已取部分照常返回，从当前页续抓
+                truncated, next_page = True, page
+                break
+            batch = await fetch_page(page)
+            if not isinstance(batch, list) or not batch:
+                break
+            fresh = 0
+            for item in batch:
+                if not isinstance(item, dict):
+                    continue
+                key = self._dedupe_key(item)
+                if key is not None:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                items.append(item)
+                fresh += 1
+            if fresh == 0:
+                # 整页都是重复（置顶帖重复页等），说明已经翻到底
+                break
+            if len(batch) < 10:
+                # 末页不足一屏：到底了
+                break
+            page += 1
+        else:
+            # 跑满 max_pages 且末页仍满：可能还有下一页
+            truncated, next_page = True, page
+        return FetchResult(
+            items,
+            truncated=truncated,
+            next_page=next_page,
+            requests=budget.used - used_before,
+        )
+
+    async def get_author_replies_paged(
+        self, feed_id: int, max_pages: int = 5, budget: Budget | None = None
+    ) -> FetchResult:
+        """只看楼主：多页聚合楼主回复（去重 + 预算控制）。"""
+        return await self._collect_paged(
+            lambda page: self.get_author_replies(feed_id, page),
+            max_pages=max_pages,
+            budget=budget,
+        )
+
+    async def get_popular_replies_paged(
+        self, feed_id: int, max_pages: int = 5, budget: Budget | None = None
+    ) -> FetchResult:
+        """热门评论：多页聚合高赞评论（去重 + 预算控制）。"""
+        return await self._collect_paged(
+            lambda page: self.get_popular_replies(feed_id, page),
+            max_pages=max_pages,
+            budget=budget,
+        )
+
     async def get_author_replies(self, feed_id: int, page: int = 1) -> list[dict]:
         """只看楼主：拉取楼主在评论区的回复（含楼中楼内联）。
 
@@ -643,20 +887,32 @@ class CoolapkClient:
         )
 
     async def get_sub_replies_paged(
-        self, reply_id: int, page: int = 1, max_pages: int = 5
-    ) -> list[dict]:
+        self, reply_id: int, page: int = 1, max_pages: int = 5,
+        budget: Budget | None = None,
+    ) -> FetchResult:
         """楼中楼完整翻页（feedType=feed_reply + firstItem/lastItem 游标）。
 
         服务端默认只在父评论里内联最近几条楼中楼；作者答疑常在楼中楼深处，
-        此方法按游标翻页补全。返回去重后的全部子回复。
+        此方法按游标翻页补全。返回去重后的子回复 + truncated/next_page/requests。
         """
+        pages = max(1, int(max_pages))
+        budget = self._ensure_budget(budget, pages)
+        used_before = budget.used
         collected: list[dict] = []
-        seen: set[str] = set()
+        seen: set[tuple[str, str]] = set()
         first_item = ""
         last_item = ""
-        for _ in range(max(1, max_pages)):
+        truncated = False
+        next_page: int | None = None
+        current = max(1, int(page))
+        for _ in range(pages):
+            try:
+                budget.take()
+            except BudgetExceeded:
+                truncated, next_page = True, current
+                break
             params = (
-                f"/v6/feed/replyList?id={reply_id}&listType=&page={page}"
+                f"/v6/feed/replyList?id={reply_id}&listType=&page={current}"
                 f"&discussMode=1&feedType=feed_reply&blockStatus=0&fromFeedAuthor=0"
             )
             if first_item:
@@ -666,20 +922,31 @@ class CoolapkClient:
             batch = await self.get(params)
             if not isinstance(batch, list) or not batch:
                 break
+            fresh = 0
             for item in batch:
                 if not isinstance(item, dict):
                     continue
-                rid = str(item.get("id", ""))
-                if not rid or rid in seen:
-                    continue
-                seen.add(rid)
+                key = self._dedupe_key(item)
+                if key is not None:
+                    if key in seen:
+                        continue
+                    seen.add(key)
                 collected.append(item)
-            first_item = str(batch[0].get("id", "")) if batch else ""
-            last_item = str(batch[-1].get("id", "")) if batch else ""
-            if len(batch) < 10:
+                fresh += 1
+            first_item = str(batch[0].get("id", "")) if isinstance(batch[0], dict) else ""
+            last_item = str(batch[-1].get("id", "")) if isinstance(batch[-1], dict) else ""
+            if fresh == 0 or len(batch) < 10:
                 break
-            page += 1
-        return collected
+            current += 1
+        else:
+            # 跑满 max_pages 且末页仍满：可能还有下一页
+            truncated, next_page = True, current
+        return FetchResult(
+            collected,
+            truncated=truncated,
+            next_page=next_page,
+            requests=budget.used - used_before,
+        )
 
     async def get_feed_history(self, feed_id: int, page: int = 1) -> list[dict]:
         """动态修改历史：作者每次编辑正文留下的快照。
@@ -689,12 +956,12 @@ class CoolapkClient:
         return await self.get(f"/v6/feed/changeHistoryList?id={feed_id}&page={page}")
 
     async def get_all_replies(
-        self, feed_id: int, max_pages: int = 30
-    ) -> list[dict]:
+        self, feed_id: int, max_pages: int = 30, budget: Budget | None = None
+    ) -> FetchResult:
         """拉取全部一级评论（自动翻页去重；楼中楼已内联在每条的 replyRows 里）。
 
         max_pages 是安全上限，防止超大帖（数千评论）把请求预算耗尽；
-        超过上限时返回已取到的部分，调用方可对照 replynum 总数判断是否截断。
+        预算耗尽或超过上限时返回已取到的部分，truncated/next_page 指明截断位置。
         默认上限可用环境变量 COOLAPK_MAX_REPLY_PAGES 调整（1-100）。
         """
         if max_pages == 30:
@@ -703,28 +970,11 @@ class CoolapkClient:
                 max_pages = max(1, min(100, env_val))
             except (TypeError, ValueError):
                 pass
-        all_replies: list[dict] = []
-        seen: set[str] = set()
-        for page in range(1, max_pages + 1):
-            replies = await self.get_feed_replies(feed_id, page)
-            if not isinstance(replies, list) or not replies:
-                break
-            new = 0
-            for r in replies:
-                if not isinstance(r, dict):
-                    continue
-                rid = str(r.get("id", ""))
-                # 空 rid 无法去重也无法定位，跳过防止重复追加
-                if not rid:
-                    continue
-                if rid in seen:
-                    continue
-                seen.add(rid)
-                all_replies.append(r)
-                new += 1
-            if new == 0 or len(replies) < 10:
-                break
-        return all_replies
+        return await self._collect_paged(
+            lambda page: self.get_feed_replies(feed_id, page),
+            max_pages=max_pages,
+            budget=budget,
+        )
 
     async def get_feed_detail_smart(
         self,
@@ -733,6 +983,7 @@ class CoolapkClient:
         with_replies: bool = True,
         reply_page: int = 1,
         all_replies: bool = False,
+        budget: Budget | None = None,
     ) -> dict:
         """动态详情（带风控回落）
 
@@ -744,6 +995,9 @@ class CoolapkClient:
             author_uid: 作者UID（提供则回落更快；不提供则查本地 feed_id→uid 索引）
             with_replies: 是否带回复
             reply_page: 回复页码
+            budget: 请求预算。传入时与作者动态回落扫描、all_replies 翻页共享同一
+                份配额；None 时回落扫描自建小预算，all_replies 由 get_all_replies
+                按 max_pages 自建默认预算
 
         Returns:
             {"source": "api"|"author_feed_fallback", "data": dict, "replies": list|None}
@@ -768,7 +1022,17 @@ class CoolapkClient:
                     "帖子详情被验证码拦截，且无作者UID可回落；请提供 author_uid 或先搜索该帖",
                     kind="captcha",
                 )
+            # 回落扫描同样受预算约束：调用方传入时与回复翻页共享配额；
+            # 未传时只建一个刚好够扫 FALLBACK_SCAN_PAGES 页的小预算，不无限请求
+            scan_budget = budget if budget is not None else Budget(
+                max_requests=self.FALLBACK_SCAN_PAGES, deadline=30.0
+            )
             for page in range(1, self.FALLBACK_SCAN_PAGES + 1):
+                try:
+                    scan_budget.take()
+                except BudgetExceeded:
+                    # 预算耗尽：不再扫，按「未找到」走下面的 captcha 错误
+                    break
                 feeds = await self.get_user_feeds(uid, page)
                 if not isinstance(feeds, list):
                     break
@@ -790,7 +1054,7 @@ class CoolapkClient:
         if with_replies:
             try:
                 if all_replies:
-                    replies = await self.get_all_replies(feed_id)
+                    replies = await self.get_all_replies(feed_id, budget=budget)
                 else:
                     replies = await self.get_feed_replies(feed_id, reply_page)
             except CoolapkError:
@@ -861,20 +1125,32 @@ class CoolapkClient:
         )
 
     async def get_user_feeds_pages(
-        self, uid: int, pages: int = 2, start_page: int = 1, feed_type: str = "feed"
-    ) -> list[dict]:
-        """用户动态多页聚合，按 id 去重。
+        self, uid: int, pages: int = 2, start_page: int = 1, feed_type: str = "feed",
+        budget: Budget | None = None,
+    ) -> FetchResult:
+        """用户动态多页聚合，按 id 去重（预算 + 截断标记）。
 
         置顶帖带 isIncludeTop=1 时每页都会带一次（实测 3 页 60 条里只有 1 条重复），
         所以去重是必需的。首页失败照常抛错；后续页失败只保留已抓到的部分，
-        避免因为翻到底或被限流把整次聚合废掉。
+        避免因为翻到底或被限流把整次聚合废掉。预算耗尽或跑满页数上限时
+        truncated=True 并给出 next_page（动态页无稳定游标，用页码续抓）。
         """
         pages = max(1, min(int(pages or 1), 5))
         start = max(1, int(start_page or 1))
-        seen: set[object] = set()
+        budget = self._ensure_budget(budget, pages)
+        used_before = budget.used
+        seen: set[tuple[str, str]] = set()
         out: list[dict] = []
+        truncated = False
+        next_page: int | None = None
+        page = start
         for offset in range(pages):
             page = start + offset
+            try:
+                budget.take()
+            except BudgetExceeded:
+                truncated, next_page = True, page
+                break
             try:
                 items = await self.get_user_feeds(uid, page, feed_type)
             except CoolapkError:
@@ -887,17 +1163,27 @@ class CoolapkClient:
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                fid = item.get("id")
-                if fid is not None:
-                    if fid in seen:
+                key = self._dedupe_key(item)
+                if key is not None:
+                    if key in seen:
                         continue
-                    seen.add(fid)
+                    seen.add(key)
                 out.append(item)
                 fresh += 1
             if fresh == 0:
                 # 整页都是重复，说明已经翻到底（置顶帖重复页）
                 break
-        return out
+            if len(items) < 10:
+                break
+        else:
+            # 跑满页数上限且末页仍满：还有更早的动态可翻
+            truncated, next_page = True, page + 1
+        return FetchResult(
+            out,
+            truncated=truncated,
+            next_page=next_page,
+            requests=budget.used - used_before,
+        )
 
     # ---- 话题 ----
 

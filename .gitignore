@@ -3,12 +3,18 @@ __pycache__/
 .venv/
 *.egg-info/
 
+# 测试 / 覆盖率产物
+.pytest_cache/
+# 本机 shell 未设 TEMP 时 pytest 的 tmp_path 基目录会落到仓库根
+pytest-of-*/
+.ruff_cache/
+htmlcov/
+coverage.xml
+
 # 本地验收脚本
 accept_task4.py
 wpf_smoke.runtimeconfig.json
 regression_probe.py
-tmp*_*/
 tmp*/
 tmp_*.py
-regression_probe.py
 coolapk-login-*/

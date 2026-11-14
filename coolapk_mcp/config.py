@@ -215,3 +215,10 @@ class AppConfig:
         tmp = CONFIG_FILE.with_suffix(".json.tmp")
         tmp.write_text(payload, encoding="utf-8")
         os.replace(tmp, CONFIG_FILE)
+        # POSIX：配置里有 uid/token/完整 Cookie，收紧成仅本人可读写；
+        # Windows 没有该权限位（os.chmod 只能改只读位），失败一律忽略
+        if os.name == "posix":
+            try:
+                os.chmod(CONFIG_FILE, 0o600)
+            except OSError:
+                pass
