@@ -22,6 +22,7 @@ class _FakeClient:
     def __init__(self):
         self.calls: list[tuple[str, tuple, dict]] = []
         self.search_result: object = {}
+        self.fallback_replies: list = []
         self.detail_result: dict = {
             "data": {"id": 1, "replynum": 0},"replies": None,"source": "api",
         }
@@ -46,6 +47,10 @@ class _FakeClient:
     async def get_feed_history(self, feed_id):
         self._record("get_feed_history", (feed_id,), {})
         return []
+
+    async def get_feed_replies(self, feed_id, page=1):
+        self._record("get_feed_replies", (feed_id, page), {})
+        return self.fallback_replies
 
 
 @pytest.fixture()
@@ -82,13 +87,65 @@ def test_search_forwards_sort(fake_client):
 
 
 def test_feed_forwards_focus_and_flags(fake_client):
-    """--focus smart 必须触发焦点收敛，并把 with_replies 一起打开"""
+    """--focus smart 触发焦点收敛；focus 活跃时不预拉默认回复（与服务端同源）"""
     result = _invoke(["feed", "1", "--focus", "smart", "--history", "--expand-sub-replies"])
     assert result.exit_code == 0, result.output
     kwargs = next(kw for n, _a, kw in fake_client.calls if n == "get_feed_detail_smart")
-    assert kwargs["with_replies"] is True
+    assert kwargs["with_replies"] is False, "focus 会整份替换 replies，预拉的那页没人看"
     # --history 由 cli 自己抓历史（get_feed_history），不该塞进 smart 的入参
     assert "with_history" not in kwargs
+
+
+def test_feed_focus_falls_back_to_default_replies(fake_client):
+    """聚焦两路都空时回拉默认回复：有评论的帖子不该显示成空评论区"""
+    fake_client.fallback_replies = [{"id": 7, "message": "普通评论"}]
+
+    result = _invoke(["feed", "1", "--focus", "smart"])
+
+    assert result.exit_code == 0, result.output
+    assert any(name == "get_feed_replies" for name, _a, _kw in fake_client.calls)
+    payload = json.loads(result.output)
+    assert [r["id"] for r in payload["replies"]] == [7]
+    assert payload["comments_focus"]["fallback"] == "default_replies"
+
+
+def test_feed_focus_page_is_forwarded(fake_client, monkeypatch):
+    """--focus-page 对应服务端的 focus_page：续抓时从上次的 next_page 开始"""
+    seen: dict = {}
+
+    async def _focus(client, feed_id, mode, start_page=1):
+        seen["start_page"] = start_page
+        return [], None
+
+    monkeypatch.setattr(focus_mod, "collect_focus", _focus)
+
+    result = _invoke(["feed", "1", "--focus", "hot", "--focus-page", "3"])
+
+    assert result.exit_code == 0, result.output
+    assert seen["start_page"] == 3
+
+
+def test_feed_grep_searches_before_reply_cap(fake_client):
+    """--grep 命中落在第 70 条也必须找到：检索先于条数截断（服务端同源）"""
+    fake_client.detail_result = {
+        "data": {"id": 1, "replynum": 100},
+        "replies": [
+            {
+                "id": index,
+                "message": "这里有解锁工具" if index == 70 else f"第{index}条",
+                "userInfo": {"username": "网友"},
+            }
+            for index in range(100)
+        ],
+        "source": "api",
+    }
+
+    result = _invoke(["feed", "1", "--grep", "解锁工具"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["comment_search"]["scanned_comments"] == 100
+    assert [r["id"] for r in payload["replies"]] == [70]
 
 
 def test_output_error_carries_retry_hints(capsys):

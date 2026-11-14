@@ -46,6 +46,7 @@ from coolapk_mcp.models import (
     _strip_html as _strip_html_keep_links,
     apply_tool_whitelist,
     cap_replies,
+    REPLY_MAX_ITEMS,
 )
 from coolapk_mcp.config import CONFIG_DIR, AppConfig, restrict_to_owner
 # 图片中转的域名白名单与签名拼装只有一份实现（CLI image-link 也用这份）
@@ -449,22 +450,43 @@ async def _read_image_body(resp: "httpx.Response") -> tuple[int, bytes, str, dic
 
 
 def _parse_feed_list(raw: Any) -> list[FeedModel]:
+    """解析动态列表：只收真实动态，运营卡片不再变成 id=null 的幽灵条目。
+
+    酷安列表接口会混入 entityType='card' 的运营卡片（「优质图文」等），此前一律
+    过 FeedModel.from_api，输出里就出现只有 images/title、id=null 的条目，还把
+    fetched 撑大、把 has_more 顶成 true；卡片内嵌的 feed 子项照样保留，与 CLI 的
+    _parse_feeds 同口径。
+    """
     if not isinstance(raw, list):
         return []
-    return [FeedModel.from_api(f) for f in raw if isinstance(f, dict)]
+    items: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("entityType") == "card":
+            items.extend(
+                sub
+                for sub in (entry.get("entities") or [])
+                if isinstance(sub, dict) and sub.get("entityType") == "feed"
+            )
+            continue
+        items.append(entry)
+    return [FeedModel.from_api(item) for item in items]
 
 
-# 一次最多返回的图片张数：九宫格是酷安常见形态，再多就是批量搬运了
-class ImageBatch(list[Image]):
-    """多图返回值的注解占位（不是真的容器类型）。
+def _page_fill(raw: Any) -> int:
+    """本页原始条目数：has_more 按「接口这一页是否填满」判断，卡片也算占位。
 
-    FastMCP 见到 `list[Image]` 会尝试用 pydantic 建结构化返回 schema，而 mcp 的
-    Image 不是可建模类型，导入期直接抛 PydanticSchemaGenerationError。这个类自带
-    零类型注解，FastMCP 判定「无法建模」，于是走非结构化分支，运行时再由
-    _convert_to_content 把每个 Image 转成一块 ImageContent —— 正好是多张图片结果。
+    不能用解析后的条数：卡片被滤掉、卡片内嵌套动态被展开，两个方向都会让「本页
+    几条」偏离接口页大小，末页判定随之失真。
     """
+    return len(raw) if isinstance(raw, list) else 0
 
 
+# 图片工具必须显式声明 structured_output=False：FastMCP 见到 list[Image] 会尝试用
+# pydantic 建结构化返回 schema，而 mcp 的 Image 不是可建模类型，导入期直接抛
+# PydanticSchemaGenerationError；显式关闭后运行时由 _convert_to_content 把每个
+# Image 转成一块 ImageContent —— 正好是多张图片结果。
 _MAX_IMAGES = 9
 
 
@@ -476,10 +498,14 @@ def _paging_meta(page: int, filled: int, size: int | None = None) -> dict[str, A
     truncated/next_page，两套口径让 agent 无法用同一套逻辑决定要不要继续翻。
 
     判定口径是「本页是否填满」：酷安末页通常不满一页，填满即认为可能还有下一页
-    （多翻一页最多拿到空列表，不会漏数据）。filled 用原始条数而不是过滤后的
-    条数，否则「过滤后剩 3 条、后面还有」会被误判成末页。
+    （多翻一页最多拿到空列表，不会漏数据）。filled 传解析后的条数，绝不能传
+    关键词过滤后的条数，否则「过滤后剩 3 条、后面还有」会被误判成末页。
     """
-    size = max(1, int(CoolapkClient.PAGE_SIZE if size is None else size))
+    size = int(CoolapkClient.PAGE_SIZE if size is None else size)
+    if size <= 0:
+        # 显式关掉分页提示（COOLAPK_PAGE_SIZE=0 之类）：别再 max(1) 把它变成 1，
+        # 那会让 has_more 恒 true，调用方永远翻不到底
+        return {"has_more": False, "next_page": None}
     has_more = filled >= size
     return {"has_more": has_more, "next_page": page + 1 if has_more else None}
 
@@ -497,7 +523,7 @@ def _search_empty_hint(meta: dict, keyword: str) -> str:
     if raw_count:
         return (
             f"酷安返回 {raw_count} 条但没有可用帖子（多为卡片/广告位）；"
-            f"可设 strict=false 重试，或换个更通用的关键词"
+            f"这与 strict 无关（改 strict=false 结果相同），请换页码或换个更通用的关键词"
         )
     return f"酷安没有搜到「{keyword}」：可用 coolapk_suggest 查联想词，或换更通用的说法"
 
@@ -525,20 +551,28 @@ def _prepare_feeds(
     keyword_mode = _normalize_keyword_mode(keyword_mode)
     if not isinstance(raw, list):
         return [], 0
-    items = [
-        _dump(FeedModel.from_api(f)) for f in raw if isinstance(f, dict)
-    ]
+    items: list[dict] = []
+    haystacks: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        items.append(_dump(FeedModel.from_api(entry)))
+        # 关键词在原始文本上匹配：FeedModel 会把正文截到 FEED_CONTENT_MAX_CHARS，
+        # 按截断后的 content 匹配时，长文末尾出现的关键词会被漏掉（实测 2100 字
+        # 正文末尾命中 0 条，关键词挪到开头就命中 1 条）
+        haystacks.append(
+            postfilter.normalize_text(
+                f"{entry.get('title') or ''} {entry.get('message') or ''}"
+            )
+        )
     total = len(items)
     words = [w for w in (postfilter.normalize_text(x) for x in (keyword or "").split()) if w]
     if words:
-        def _hit(it: dict) -> bool:
-            haystack = postfilter.normalize_text(
-                f"{it.get('title') or ''} {it.get('content') or ''}"
-            )
+        def _hit(haystack: str) -> bool:
             hits = [w in haystack for w in words]
             return all(hits) if keyword_mode == "all" else any(hits)
 
-        items = [it for it in items if _hit(it)]
+        items = [it for it, text in zip(items, haystacks, strict=True) if _hit(text)]
     for it in items:
         scoring.annotate_post(it)
     if sort == "hot":
@@ -651,7 +685,11 @@ async def coolapk_search(
         "page": page,
         # 用原始条数判断下一页：结果被 strict 过滤后变少，按结果数判断会把
         # 「过滤后只剩 3 条、后面还有 30 条」误判成末页
-        **_paging_meta(page, int(meta.get("raw_count") or 0)),
+        # 搜索接口每页约 20 条（不是 PAGE_SIZE=10）：按 PAGE_SIZE 判会把真实末页
+        # 也标成 has_more=true，用户白翻一页空页
+        **_paging_meta(
+            page, int(meta.get("raw_count") or 0), size=CoolapkClient.SEARCH_PAGE_SIZE
+        ),
         "counts": meta,
         "results": results,
     }
@@ -816,22 +854,32 @@ async def coolapk_feed_detail(
             # 有父评论的楼中楼撞到页数上限没取全，上层据此决定是否继续深挖
             detail.sub_replies_truncated = True
 
-    # 回复条数上限：all_replies 一条帖子能翻 300 条，整份塞进上下文会把后续
-    # 对话挤掉。保留前 N 条并标出省略条数（replies_omitted），比静默少给要诚实
-    detail = cap_replies(detail)
-
     if comment_keyword:
+        # 关键词检索必须发生在条数截断之前：一条 300 回复的帖子若先截到前 60 条
+        # 再检索，命中落在第 70 条的评论会被报成「没有」，而用户问的正是
+        # 「有没有人提到 X」——这是会误导判断的假阴性。
         dumped = detail.model_dump(mode="json", exclude_defaults=True)
         dumped = postfilter.filter_comments(dumped, comment_keyword)
-        if detail.replies_truncated:
-            # 评论检索本身没有翻页逻辑，截断状态来自上游 all_replies；
-            # 不标出来会让 agent 误以为"关键词只命中这些"，实际是没扫完。
+        matched = dumped.get("replies") or []
+        if REPLY_MAX_ITEMS > 0 and len(matched) > REPLY_MAX_ITEMS:
+            # 命中数超过输出上限时按上限裁剪（replies_omitted = 命中但没列出的条数）
+            dumped["replies"] = matched[:REPLY_MAX_ITEMS]
+            dumped["replies_omitted"] = len(matched) - REPLY_MAX_ITEMS
+            dumped["replies_truncated"] = True
+        if dumped.get("replies_truncated"):
+            # 评论检索本身没有翻页逻辑：截断可能来自上游 all_replies 没扫完，
+            # 也可能来自命中数超过输出上限。不标出来会让 agent 误以为
+            # "关键词只命中这些"，实际是没扫完/没列全。
             stats = dumped.setdefault("comment_search", {})
             stats["truncated"] = True
             if detail.replies_next_page is not None:
                 stats["next_page"] = detail.replies_next_page
         # 与默认分支同源：_json 内部做 dump + 白名单裁剪
         return _json(dumped, whitelist="feed_detail")
+
+    # 回复条数上限：all_replies 一条帖子能翻 300 条，整份塞进上下文会把后续
+    # 对话挤掉。保留前 N 条并标出省略条数（replies_omitted），比静默少给要诚实
+    detail = cap_replies(detail)
     return _json(detail, whitelist="feed_detail")
 
 
@@ -1027,6 +1075,8 @@ async def coolapk_home(tab: str = "recommend", page: int = 1) -> str:
     # 语义修正：此前 recommend 走 V9_HOME_TAB_FOLLOW（关注流），关注少的人会
     # 拿到几条甚至空列表，看起来像工具坏了；真推荐是 main/indexV8。关注流保留
     # 为独立的 follow 分栏，两个语义不再混用一个名字。
+    # 未知取值静默回落会让调用方以为参数生效了：回显时用 tab_fallback 标出来
+    tab_fallback = tab not in ("recommend", "follow", "dynamic", "关注", "hot", "latest")
     if tab in ("follow", "dynamic", "关注"):
         tab = "follow"
         data = await client.get_home_feeds(page)
@@ -1045,7 +1095,8 @@ async def coolapk_home(tab: str = "recommend", page: int = 1) -> str:
                 "page": page,
                 "fetched": len(feeds),
                 "feeds": feeds,
-                **_paging_meta(page, len(feeds)),
+                **({"tab_fallback": True} if tab_fallback else {}),
+                **_paging_meta(page, _page_fill(data)),
             },
             whitelist="home",
         )
@@ -1115,7 +1166,7 @@ async def coolapk_board(board: str, page: int = 1) -> str:
                 "page": page,
                 "fetched": len(feeds),
                 "feeds": feeds,
-                **_paging_meta(page, len(feeds)),
+                **_paging_meta(page, _page_fill(raw)),
             },
             whitelist="board",
         )
@@ -1144,7 +1195,7 @@ async def coolapk_secondhand(brand: int = 0, page: int = 1) -> str:
                 "page": page,
                 "fetched": len(feeds),
                 "feeds": feeds,
-                **_paging_meta(page, len(feeds)),
+                **_paging_meta(page, _page_fill(raw)),
             },
             whitelist="secondhand",
         )
@@ -1322,9 +1373,9 @@ async def coolapk_login_status() -> str:
     )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 @_catch_api_error
-async def coolapk_read_image(url: str) -> ImageBatch:
+async def coolapk_read_image(url: str) -> list[Image]:
     """下载酷安 CDN 图片并作为图片返回（支持一次多张，九宫格帖一次看全）。
 
     仅允许酷安图片域名：image.coolapk.com / avatar.coolapk.com /
@@ -1335,7 +1386,8 @@ async def coolapk_read_image(url: str) -> ImageBatch:
         url: 一个或多个图片 URL，用逗号、空格或换行分隔，最多 9 张
             （http 自动升级 https）
     """
-    urls = split_urls(url)
+    # 去重保序：同一张图粘两遍时没必要下载两次（限速窗口很贵）
+    urls = list(dict.fromkeys(split_urls(url)))
     if not urls:
         raise CoolapkError("url 不能为空", kind="api")
     if len(urls) > _MAX_IMAGES:
@@ -1368,7 +1420,7 @@ async def coolapk_read_image(url: str) -> ImageBatch:
                 kind=exc.kind,
             ) from exc
         images.append(Image(data=data, format=fmt))
-    return ImageBatch(images)
+    return images
 
 
 @mcp.tool()

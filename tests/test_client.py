@@ -251,9 +251,12 @@ def _reply_pages(sizes: dict[int, int], requested: list[int]):
 def test_budget_limits_pages_and_marks_truncated(monkeypatch):
     """预算只有 2 次时只翻 2 页，返回 FetchResult 且标 truncated/next_page"""
     client = _make_client(_recording_handler([]))
+    size = client.PAGE_SIZE
     requested: list[int] = []
-    # 每页都满 10 条：说明后面还有，必须靠预算刹住
-    monkeypatch.setattr(client, "get_feed_replies", _reply_pages({1: 10, 2: 10, 3: 10}, requested))
+    # 每页都填满（PAGE_SIZE 条）：说明后面还有，必须靠预算刹住
+    monkeypatch.setattr(
+        client, "get_feed_replies", _reply_pages({1: size, 2: size, 3: size}, requested)
+    )
 
     result = asyncio.run(
         client.get_all_replies(123, max_pages=5, budget=Budget(max_requests=2))
@@ -261,7 +264,7 @@ def test_budget_limits_pages_and_marks_truncated(monkeypatch):
 
     assert isinstance(result, FetchResult)
     assert requested == [1, 2]  # 第 3 页的 take() 就被预算拦下
-    assert len(result) == 20
+    assert len(result) == size * 2
     assert result.truncated is True
     assert result.next_page == 3
     assert result.requests == 2
@@ -269,15 +272,17 @@ def test_budget_limits_pages_and_marks_truncated(monkeypatch):
 
 
 def test_short_last_page_is_not_truncated(monkeypatch):
-    """第 2 页只有 3 条 = 到底了，不该标截断"""
+    """第 2 页不满一页 = 到底了，不该标截断"""
     client = _make_client(_recording_handler([]))
+    size = client.PAGE_SIZE
+    short = max(0, min(3, size - 1))
     requested: list[int] = []
-    monkeypatch.setattr(client, "get_feed_replies", _reply_pages({1: 10, 2: 3}, requested))
+    monkeypatch.setattr(client, "get_feed_replies", _reply_pages({1: size, 2: short}, requested))
 
     result = asyncio.run(client.get_all_replies(123, max_pages=5))
 
     assert requested == [1, 2]
-    assert len(result) == 13
+    assert len(result) == size + short
     assert result.truncated is False
     assert result.next_page is None
     assert result.requests == 2

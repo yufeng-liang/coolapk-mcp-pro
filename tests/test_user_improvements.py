@@ -14,7 +14,7 @@ from click.testing import CliRunner
 from coolapk_mcp import cli as cli_mod
 from coolapk_mcp import models as models_mod
 from coolapk_mcp import server as server
-from coolapk_mcp.client import CoolapkError
+from coolapk_mcp.client import CoolapkClient, CoolapkError
 from coolapk_mcp.linkparse import parse_feed_id
 from coolapk_mcp.models import FeedDetail, FeedModel, ReplyModel, cap_replies
 
@@ -90,13 +90,14 @@ def test_home_tab_routes_and_echoes(monkeypatch, tab, source, shown) -> None:
 
 def test_home_reports_paging_signals(monkeypatch) -> None:
     """分页信号：本页填满 → has_more=True 且给出 next_page；不满 → 到底了。"""
-    full = _HomeClient(count=10)
+    size = CoolapkClient.PAGE_SIZE
+    full = _HomeClient(count=size)
     _patch_client(monkeypatch, full)
     payload = json.loads(asyncio.run(server.coolapk_home("recommend", 2)))
     assert payload["has_more"] is True
     assert payload["next_page"] == 3
 
-    partial = _HomeClient(count=3)
+    partial = _HomeClient(count=max(0, size - 1))
     _patch_client(monkeypatch, partial)
     payload = json.loads(asyncio.run(server.coolapk_home("recommend", 2)))
     assert payload["has_more"] is False
@@ -117,7 +118,7 @@ class _ListClient(_HomeClient):
 
 
 def test_board_carries_paging_meta(monkeypatch) -> None:
-    fake = _ListClient(count=10)
+    fake = _ListClient(count=CoolapkClient.PAGE_SIZE)
     _patch_client(monkeypatch, fake)
 
     payload = json.loads(asyncio.run(server.coolapk_board("digital", 1)))
@@ -127,7 +128,7 @@ def test_board_carries_paging_meta(monkeypatch) -> None:
 
 
 def test_secondhand_carries_paging_meta(monkeypatch) -> None:
-    fake = _ListClient(count=2)
+    fake = _ListClient(count=max(0, CoolapkClient.PAGE_SIZE - 1))
     _patch_client(monkeypatch, fake)
 
     payload = json.loads(asyncio.run(server.coolapk_secondhand(1005, 4)))
@@ -145,7 +146,7 @@ class _NotifyClient:
 
 
 def test_notify_carries_paging_meta(monkeypatch) -> None:
-    _patch_client(monkeypatch, _NotifyClient(count=10))
+    _patch_client(monkeypatch, _NotifyClient(count=CoolapkClient.PAGE_SIZE))
 
     payload = json.loads(asyncio.run(server.coolapk_notify("message", 1)))
 
@@ -284,6 +285,19 @@ def test_read_image_returns_every_image(monkeypatch) -> None:
     ]
 
 
+def test_read_image_tool_schema_stays_unstructured() -> None:
+    """多图返回依赖非结构化分支：一旦 FastMCP 改走结构化包装，输出 schema 会变。
+
+    mcp 的 Image 不可建模，结构化分支会在导入期直接抛 PydanticSchemaGenerationError
+    （测试全灭）；这条断言把「当前走在哪条分支」钉住，升级 mcp/pydantic 后失败信息
+    指向这里，而不是一堆看不懂的 schema 报错。
+    """
+    tool = server.mcp._tool_manager.get_tool("coolapk_read_image")
+
+    assert tool is not None
+    assert getattr(tool, "output_schema", "missing") is None
+
+
 def test_read_image_rejects_foreign_host_before_downloading(monkeypatch) -> None:
     fake = _ImageClient()
     _patch_client(monkeypatch, fake)
@@ -331,6 +345,13 @@ def test_read_image_limits_and_empty_input(monkeypatch) -> None:
         (True, None),
         ("没有数字", None),
         ("看这两条 1234567 和 7654321", None),
+        # 长数字不是帖子 ID：手机号一旦被当成 ID，会去请求一条不存在的帖子
+        ("手机号 13800000000 打给我", None),
+        # 两条不同链接同样属于歧义：静默取第一条会把别人的帖子当成用户要的
+        ("https://www.coolapk.com/feed/1111111 和 https://www.coolapk.com/feed/2222222", None),
+        # 有链接时只信链接，文案里的手机号不参与判定
+        ("https://www.coolapk.com/feed/1111111 联系 13800000000", 1111111),
+        ("fid=8888888", 8888888),
     ],
 )
 def test_parse_feed_id(value, expected) -> None:
@@ -368,6 +389,65 @@ def test_feed_detail_rejects_unparsable_input(monkeypatch) -> None:
     payload = json.loads(asyncio.run(server.coolapk_feed_detail("这条消息里没有链接")))
 
     assert "无法从 feed_id 解析" in payload["error"]
+
+
+class _CommentClient:
+    """关键词命中落在第 70 条评论：默认只输出前 60 条，检索顺序决定成败。"""
+
+    def __init__(self, hits: list[int]) -> None:
+        self.hits = hits
+
+    async def get_feed_detail_smart(self, feed_id, **kwargs):
+        rows = [
+            {
+                "id": index,
+                "message": f"第{index}条评论",
+                "likenum": 0,
+                "userInfo": {"username": "网友", "uid": index},
+            }
+            for index in range(100)
+        ]
+        for index in self.hits:
+            rows[index]["message"] = "这里有解锁工具下载地址"
+        return {
+            "data": {"id": feed_id, "message": "正文", "replynum": len(rows)},
+            "replies": rows,
+            "source": "api",
+        }
+
+
+def test_comment_keyword_searches_before_reply_cap(monkeypatch) -> None:
+    """命中在第 70 条时也必须找到：先截前 60 条再检索会报「没有」的假阴性。"""
+    _patch_client(monkeypatch, _CommentClient([70]))
+
+    payload = json.loads(
+        asyncio.run(
+            server.coolapk_feed_detail(1001, all_replies=True, comment_keyword="解锁工具")
+        )
+    )
+
+    assert payload["comment_search"]["scanned_comments"] == 100
+    assert payload["comment_search"]["matched_comments"] == 1
+    assert [r["id"] for r in payload["replies"]] == [70]
+    assert "replies_omitted" not in payload, "命中数没超上限时不该谎称省略"
+
+
+def test_comment_keyword_caps_matches_and_flags_omitted(monkeypatch) -> None:
+    """命中数超过输出上限：按上限裁剪并标出省略条数与截断状态。"""
+    monkeypatch.setattr(server, "REPLY_MAX_ITEMS", 2)
+    _patch_client(monkeypatch, _CommentClient([10, 20, 30]))
+
+    payload = json.loads(
+        asyncio.run(
+            server.coolapk_feed_detail(1001, all_replies=True, comment_keyword="解锁工具")
+        )
+    )
+
+    assert payload["comment_search"]["matched_comments"] == 3
+    assert [r["id"] for r in payload["replies"]] == [10, 20]
+    assert payload["replies_omitted"] == 1
+    assert payload["replies_truncated"] is True
+    assert payload["comment_search"]["truncated"] is True
 
 
 class _CliClient:

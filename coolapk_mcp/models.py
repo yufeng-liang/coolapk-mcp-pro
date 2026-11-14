@@ -91,7 +91,9 @@ def _env_int(name: str, default: int) -> int:
         return default
     try:
         return int(float(raw))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError：inf / 1e400 这类值能过 float() 却过不了 int()，此前会
+        # 让 import 期直接崩，整个服务起不来
         return default
 
 
@@ -523,7 +525,7 @@ _USER_FEEDS_META = (
     "truncated", "next_page",
 )
 # home 包装结构的元字段（feeds 单独按动态白名单裁剪）
-_HOME_META = ("tab", "page", "fetched", "has_more", "next_page")
+_HOME_META = ("tab", "tab_fallback", "page", "fetched", "has_more", "next_page")
 # 板块 / 二手包装的元字段
 _BOARD_META = ("board", "page", "fetched", "has_more", "next_page")
 _SECONDHAND_META = ("brand", "page", "fetched", "has_more", "next_page")

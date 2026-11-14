@@ -91,7 +91,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | 命令 | 作用 |
 | - | - |
 | `coolapk home --tab recommend\|follow\|hot\|latest / main / hot / boards / board / secondhand` | 首页（`recommend` 算法推荐、`follow` 关注流）、热门、板块与二手市场浏览 |
-| `coolapk feed <id或分享链接>` | 帖子详情（`FEED_ID` 可粘整段分享文案），支持 `--focus smart\|author\|hot\|all`、`--grep`、`--all-replies`、`--history`、`--expand-sub-replies` |
+| `coolapk feed <id或分享链接>` | 帖子详情（`FEED_ID` 可粘整段分享文案），支持 `--focus smart\|author\|hot\|all`、`--focus-page`（续抓焦点评论）、`--grep`、`--all-replies`、`--history`、`--expand-sub-replies` |
 | `coolapk search <keyword>` | 搜索，`--type` / `--sort hot\|reply\|default` / `--strict` |
 | `coolapk user <uid>` | 用户资料或 `--feeds` 动态列表 |
 | `coolapk author <uid>` | 作者画像：等级、粉丝、专长推断与高分动态（`--top N`） |
@@ -107,16 +107,16 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | 工具 | 作用 | 关键参数 |
 | - | - | - |
 | `coolapk_search` | 搜索帖子 / 用户 / 话题 / 应用，严格过滤 + 去重 + 广告标记；结果带热度字段、`has_more`/`next_page` 续抓信号；结果为空时附 `hint` 说明原因（被严格过滤 / 只剩卡片广告 / 真没有） | `keyword`、`type=feed\|user\|feedTopic\|app`、`page`、`strict`、`sort=hot\|reply\|default`（默认 hot，结果质量显著更好） |
-| `coolapk_feed_detail` | 帖子详情 + 回复（风控自动回落）；评论聚焦与金矿挖掘；正文超长自动截断并标 `content_truncated`，回复超 `COOLAPK_REPLY_MAX_ITEMS` 条标 `replies_omitted` | `feed_id`（数字，或直接粘贴 `https://www.coolapk.com/feed/…` 分享链接/整段分享文案）、`all_replies`、`comment_keyword`、`comments_focus`（`smart`=楼主补充+热门评论，找工具/资源首选；`author`=只看楼主；`hot`=热门评论；`all`=全部）、`with_history`（正文修改历史）、`expand_sub_replies`（深度展开楼中楼，楼主答疑常在其中）；输出含 `share_url`（带分享码的网页链接，人在浏览器打开可看全文，不耗服务器图片流量） |
+| `coolapk_feed_detail` | 帖子详情 + 回复（风控自动回落）；评论聚焦与金矿挖掘；正文超长自动截断并标 `content_truncated`，`comment_keyword` 按全部已取回复检索后再套条数上限（命中不会被条数截断吃掉），回复超 `COOLAPK_REPLY_MAX_ITEMS` 条标 `replies_omitted`（这是本地裁剪，不给 `next_page`，继续往后看请传 `reply_page`） | `feed_id`（数字，或直接粘贴 `https://www.coolapk.com/feed/…` 分享链接/整段分享文案）、`all_replies`、`comment_keyword`、`comments_focus`（`smart`=楼主补充+热门评论，找工具/资源首选；`author`=只看楼主；`hot`=热门评论；`all`=全部）、`with_history`（正文修改历史）、`expand_sub_replies`（深度展开楼中楼，楼主答疑常在其中）、`focus_page`（焦点评论起始页，消费上次的 `comments_focus.next_page` 续抓）；输出含 `share_url`（带分享码的网页链接，人在浏览器打开可看全文，不耗服务器图片流量） |
 | `coolapk_topic` | 话题详情 / 话题下动态（默认按热度排序）；详情或动态任一路被风控时降级返回，并在 `topic_error` / `feeds_error` 标注原因 | `tag`、`with_feeds`、`page`、`hot_first`（默认 true） |
 | `coolapk_user_profile` | 用户资料 | `uid` |
 | `coolapk_user_feeds` | 用户发布的帖子（支持多页聚合 + 关键词过滤 + 热度排序；撞页数/预算上限时 `truncated=true` 并用 `next_page` 续抓） | `uid`、`page`、`pages=1-5`、`keyword`、`sort=default\|hot\|latest`、`keyword_mode=any\|all`（生效值回显在同名字段） |
-| `coolapk_home` | 首页动态，返回 `{tab, page, fetched, has_more, next_page, feeds}`（未知 tab 归 recommend） | `tab=recommend`（算法推荐，`/v6/main/indexV8`）、`follow`（只看已关注的人）、`hot`、`latest`；`page` |
+| `coolapk_home` | 首页动态，返回 `{tab, page, fetched, has_more, next_page, feeds}`（未知 tab 归 recommend 并回显 `tab_fallback=true`） | `tab=recommend`（算法推荐，`/v6/main/indexV8`）、`follow`（只看已关注的人）、`hot`、`latest`；`page` |
 | `coolapk_board` | 板块动态（21 个板块：数码/二手交易/摄影/问答/酷安头条…），支持板块 id 或中文名，未知板块直接报错并列出可用清单；带 `has_more`/`next_page` | `board`（如 `digital` / `手机` / `二手交易`）、`page` |
 | `coolapk_secondhand` | 二手市场动态，可按品牌过滤；带 `has_more`/`next_page` | `brand`（品牌 id，0=全部）、`page` |
 | `coolapk_app_detail` | 应用详情（简介、关注数、下载量、版本） | `package_name`（如 `com.coolapk.market`） |
 | `coolapk_notify` | 消息通知：@我的、评论我的、赞我的、关注、私信；可选带未读数；带 `has_more`/`next_page` | `ntype=atMeMeFeed\|atComment\|comment\|feedLike\|contactsFollow\|message`、`page`、`with_count` |
-| `coolapk_read_image` | 读取图片消息（带 Referer 下载，解决图片 CDN 直连 567）；默认缩略优先（长边 1080px，省 70~80% 流量，`COOLAPK_IMG_THUMBNAIL=0` 关闭）；支持一次多张（九宫格帖一次看全） | 图片 URL（逗号/空格/换行分隔，最多 9 张） |
+| `coolapk_read_image` | 读取图片消息（带 Referer 下载，解决图片 CDN 直连 567）；默认缩略优先（长边 1080px，省 70~80% 流量，`COOLAPK_IMG_THUMBNAIL=0` 关闭）；支持一次多张（九宫格帖一次看全，重复 URL 自动去重） | 图片 URL（逗号/空格/换行分隔，最多 9 张） |
 | `coolapk_image_link` | 把酷安图片转成可在任意聊天窗口显示的签名 https 链接（仅远程 HTTP 模式，需 `COOLAPK_PUBLIC_BASE`） | `urls`（逗号/空格/换行分隔）、`ttl_minutes`（默认 120） |
 | `coolapk_login_status` | 查询当前登录态与登录方式 | 无 |
 | `coolapk_suggest` | 搜索联想词（把口语化需求改写成酷安习惯用词） | `keyword` |
@@ -436,7 +436,7 @@ pytest -q --cov=coolapk_mcp --cov-fail-under=60   # 带覆盖率门槛（当前�
 ```
 
 - 测试覆盖模型解析、白名单裁剪、限速/分桶/退避、缓存键与单飞、预算截断、HTTP 图片中转、配置与板块映射等；`pytest -q` 应全绿。
-- `tests/manual/regression_probe.py` 是零真实网络的离线回归探针（99 项断言），不进 CI，改协议/解析逻辑后可手动跑一遍做冒烟。
+- `tests/manual/regression_probe.py` 是零真实网络的离线回归探针（115 项断言），不进 CI，改协议/解析逻辑后可手动跑一遍做冒烟。
 - 覆盖率当前基线约 70%：`server.py` 82%、`client.py` 59%，`cli.py`（57%）与 `browser_login.py`（47%）仍在低位，属于优先补测区。
 - 测试不依赖本机登录态：`conftest.py` 默认把 `generate_token_v3` 打桩成假 token，并把 `~/.coolapk-mcp` 下所有导入期路径常量重定向到临时目录，跑测试不会碰真实 `config.json` / `img_secret` / `auth_blob`。
 - CI（`.github/workflows/ci.yml`）三条腿：Linux 上 Python 3.10 / 3.12 / 3.14 跑 ruff + mypy + pytest（覆盖率门槛 60%）+ `coolapk --help` + compileall；Windows 上 Python 3.12 跑同一套（覆盖权限与路径分支）；另有 Docker 腿做镜像构建与容器内 CLI 冒烟。

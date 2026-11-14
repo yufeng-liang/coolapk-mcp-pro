@@ -29,6 +29,7 @@ from coolapk_mcp.models import (
     UserModel,
     apply_tool_whitelist,
     cap_replies,
+    REPLY_MAX_ITEMS,
 )
 
 
@@ -99,26 +100,57 @@ def cli():
     setup_logging()
 
 
+# 页大小在 import 期取一次：CLI 的测试会把 CoolapkClient 换掉，运行时再取类属性
+# 会炸在测试桩上；与 models 的 import 期常量同口径
+_PAGE_SIZE = CoolapkClient.PAGE_SIZE
+
+
+def _paging_meta(page: int, filled: int) -> dict:
+    """列表命令的分页提示：与服务端 coolapk_home 同口径（本页填满即可能还有下一页）。
+
+    filled 必须传接口返回的原始条目数，不能传解析后的动态数（卡片会被滤掉、
+    卡片内嵌套动态会被展开，两个方向都会让末页判定失真）。
+    """
+    size = max(1, int(_PAGE_SIZE))
+    has_more = filled >= size
+    return {"has_more": has_more, "next_page": page + 1 if has_more else None}
+
+
 # ---- 浏览 ----
 
 
 @cli.command("home")
-@click.option("--tab", type=click.Choice(["recommend", "follow", "hot", "latest"]),
-              default="recommend")
+@click.option("--tab", type=click.Choice(
+    ["recommend", "follow", "dynamic", "关注", "hot", "latest"]), default="recommend")
 @click.option("--page", default=1, type=int)
 @async_command
 async def home(tab, page):
     """首页动态（recommend 走算法推荐，follow 只看已关注的人）"""
+    page = max(1, int(page or 1))
     async with CoolapkClient() as client:
-        if tab == "follow":
+        if tab in ("follow", "dynamic", "关注"):
+            tab = "follow"
             raw = await client.get_home_feeds(page)
         elif tab == "hot":
             raw = await client.get_hot_feeds(page)
         elif tab == "latest":
             raw = await client.get_latest_feeds(page)
         else:
+            tab = "recommend"
             raw = await client.get_main_feeds(page)
-    _output(_parse_feeds(raw))
+    feeds = _parse_feeds(raw)
+    # 与服务端 coolapk_home 同口径包装：只输出 feeds 列表时，调用方不知道该不该
+    # 翻下一页（列表被卡片滤短后尤其判断不出来）
+    _output(
+        {
+            "tab": tab,
+            "page": page,
+            "fetched": len(feeds),
+            # _output 只对「顶层是 list」递归转 dict，嵌在包装里的模型要自己转
+            "feeds": [_dump(item) for item in feeds],
+            **_paging_meta(page, len(raw) if isinstance(raw, list) else 0),
+        }
+    )
 
 
 @cli.command("main")
@@ -188,12 +220,15 @@ async def secondhand(brand, page):
 @click.option("--focus", "comments_focus", default="default",
               type=click.Choice(["default", "smart", "author", "hot", "all"]),
               help="评论聚焦：smart(楼主回复+热门)/author(仅楼主)/hot(仅热门)")
+@click.option("--focus-page", default=1, type=int,
+              help="焦点评论起始页（续抓上一次的 focus_meta.next_page）")
 @click.option("--history", "with_history", is_flag=True, help="附带正文修改历史")
 @click.option("--expand-sub-replies", is_flag=True,
               help="深度展开楼中楼（每条父评论最多补 3 页，有预算上限）")
 @async_command
 async def feed(feed_id, replies, reply_page, feed_type, author_uid, all_replies,
-               comment_keyword, comments_focus, with_history, expand_sub_replies):
+               comment_keyword, comments_focus, focus_page, with_history,
+               expand_sub_replies):
     """动态详情（详情接口被验证码拦截时自动从作者动态列表回落）
 
     FEED_ID 可以是纯数字，也可以直接粘酷安分享链接/整段分享文案。
@@ -212,10 +247,14 @@ async def feed(feed_id, replies, reply_page, feed_type, author_uid, all_replies,
     focus = comments_focus
     if focus == "all":
         all_replies = True
+    focus_active = focus in ("smart", "author", "hot")
+    want_replies = replies or bool(comment_keyword)
     async with CoolapkClient() as client:
         smart = await client.get_feed_detail_smart(
             feed_id, author_uid=author_uid,
-            with_replies=replies or bool(comment_keyword) or focus in ("smart", "author", "hot"),
+            # 与服务端同源：focus 活跃时不预拉默认回复（collect_focus 会整份替换
+            # replies），真取不到时在下面回拉一页兜底，常规路径少一次限速窗口
+            with_replies=want_replies and not focus_active,
             reply_page=reply_page,
             all_replies=all_replies or bool(comment_keyword),
         )
@@ -228,13 +267,27 @@ async def feed(feed_id, replies, reply_page, feed_type, author_uid, all_replies,
         if raw_replies is not None:
             detail.replies_truncated = bool(getattr(raw_replies, "truncated", False))
             detail.replies_next_page = getattr(raw_replies, "next_page", None)
-        if focus in ("smart", "author", "hot"):
-            merged, meta = await collect_focus(client, feed_id, focus)
+        if focus_active:
+            merged, meta = await collect_focus(
+                client, feed_id, focus, start_page=max(1, int(focus_page or 1))
+            )
             if meta is not None:
                 meta["total_replynum"] = smart["data"].get("replynum") or 0
                 detail.comments_focus = meta
             if merged:
                 detail.replies = [ReplyModel.from_api(r) for r in merged]
+            elif want_replies:
+                # 聚焦两路都失败或为空：回拉一页默认回复，别让调用方拿到空评论区
+                try:
+                    fallback = await client.get_feed_replies(feed_id, reply_page)
+                except CoolapkError:
+                    fallback = None
+                if fallback:
+                    detail.replies = [ReplyModel.from_api(r) for r in fallback]
+                    detail.comments_focus = {
+                        **(detail.comments_focus or {}),
+                        "fallback": "default_replies",
+                    }
         if with_history:
             try:
                 hist = await client.get_feed_history(feed_id)
@@ -265,17 +318,27 @@ async def feed(feed_id, replies, reply_page, feed_type, author_uid, all_replies,
                 if subs:
                     detail.replies[i].sub_replies = [ReplyModel.from_api(sr) for sr in subs]
                     detail.sub_replies_expanded = (detail.sub_replies_expanded or 0) + len(subs)
-    # 与服务端同口径：回复条数上限，超出的部分用 replies_omitted 标出来
-    data = _dump(cap_replies(detail))
     if comment_keyword:
         from coolapk_mcp import postfilter
+
+        # 与服务端同源：检索在条数截断之前做，否则命中落在第 61 条之后会被
+        # 报成「没有」（用户问的正是「有没有人提到 X」，这是假阴性）
+        data = _dump(detail)
         data = postfilter.filter_comments(data, comment_keyword)
-        if detail.replies_truncated:
+        matched = data.get("replies") or []
+        if REPLY_MAX_ITEMS > 0 and len(matched) > REPLY_MAX_ITEMS:
+            data["replies"] = matched[:REPLY_MAX_ITEMS]
+            data["replies_omitted"] = len(matched) - REPLY_MAX_ITEMS
+            data["replies_truncated"] = True
+        if data.get("replies_truncated"):
             # 与服务端同源：不标出来会被误读成「关键词只命中这些」
             stats = data.setdefault("comment_search", {})
             stats["truncated"] = True
             if detail.replies_next_page is not None:
                 stats["next_page"] = detail.replies_next_page
+    else:
+        # 与服务端同口径：回复条数上限，超出的部分用 replies_omitted 标出来
+        data = _dump(cap_replies(detail))
     _output(data)
 
 

@@ -1078,6 +1078,14 @@ def probe_ui4():
         (True, None),
         ("没有数字", None),
         ("看这两条 1234567 和 7654321", None),
+        ("手机号 13800000000 打给我", None),
+        ("https://www.coolapk.com/feed/1111111 和 https://www.coolapk.com/feed/2222222", None),
+        ("https://www.coolapk.com/feed/1111111 联系 13800000000", 1111111),
+        ("fid=8888888", 8888888),
+        # 外部站点链接不做数字兜底：GitHub issue 里的数字曾被当成帖子 ID
+        ("https://github.com/foo/bar/issues/123456", None),
+        ("https://example.com/a/123456/whatever", None),
+        ("/m/feed/detail?id=8899", None),
     ]
     bad = [(value, parse_feed_id(value), want) for value, want in cases if parse_feed_id(value) != want]
 
@@ -1187,6 +1195,8 @@ def probe_ui6():
         f"feed={len(long_feed.content)} reply={len(long_reply.content)} omitted={capped.replies_omitted}",
     )
 
+    keys = ("COOLAPK_FEED_CONTENT_MAX", "COOLAPK_REPLY_CONTENT_MAX", "COOLAPK_REPLY_MAX_ITEMS")
+    saved = {key: os.environ.get(key) for key in keys}
     before = (_models.FEED_CONTENT_MAX_CHARS, _models.REPLY_CONTENT_MAX_CHARS, _models.REPLY_MAX_ITEMS)
     os.environ["COOLAPK_FEED_CONTENT_MAX"] = "7"
     os.environ["COOLAPK_REPLY_CONTENT_MAX"] = "bad"
@@ -1195,15 +1205,25 @@ def probe_ui6():
         importlib.reload(_models)
         reloaded = (_models.FEED_CONTENT_MAX_CHARS, _models.REPLY_CONTENT_MAX_CHARS, _models.REPLY_MAX_ITEMS)
     finally:
-        for key in ("COOLAPK_FEED_CONTENT_MAX", "COOLAPK_REPLY_CONTENT_MAX", "COOLAPK_REPLY_MAX_ITEMS"):
-            os.environ.pop(key, None)
+        # 还原现场：直接 pop 会把调用方原有的环境变量也删掉，别人机器上就假红
+        for key in keys:
+            if saved[key] is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = saved[key]
         importlib.reload(_models)
+        # reload 会新建类对象，server 里缓存的还是旧类（isinstance 判断会分裂），
+        # 这里同步重载一次，探针后续行为与真实进程一致
+        importlib.reload(_srvmod)
+    after = (_models.FEED_CONTENT_MAX_CHARS, _models.REPLY_CONTENT_MAX_CHARS, _models.REPLY_MAX_ITEMS)
     check(
         "ui6b 三项上限可由环境变量配置（非法值回落默认、0 表示不限制）",
         reloaded == (7, 800, 0) and _models._truncate("abc", 0) == ("abc", False)
         and _models._truncate("abcdef", 3) == ("abc…", True)
-        and (_models.FEED_CONTENT_MAX_CHARS, _models.REPLY_CONTENT_MAX_CHARS, _models.REPLY_MAX_ITEMS) == before,
-        f"reloaded={reloaded} restored={before}",
+        and after == (_models.FEED_CONTENT_MAX_CHARS, _models.REPLY_CONTENT_MAX_CHARS, _models.REPLY_MAX_ITEMS)
+        and after == before
+        and _srvmod.FeedModel is _models.FeedModel,
+        f"reloaded={reloaded} restored={after} before={before}",
     )
 
 

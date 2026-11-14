@@ -325,7 +325,8 @@ def _env_int(name: str, default: int) -> int:
     """读整数环境变量；空值或非法值静默回退默认值。"""
     try:
         return int(float(os.environ.get(name, "") or default))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError：inf / 1e400 能过 float() 但过不了 int()，此前会让 import 期崩
         return default
 
 
@@ -343,6 +344,9 @@ class CoolapkClient:
     # 一页的基准条数：末页判定与可翻页上限都由它推导。酷安接口哪天换页大小，
     # 只改 COOLAPK_PAGE_SIZE 即可，不用满仓库找魔数 10
     PAGE_SIZE = _env_int("COOLAPK_PAGE_SIZE", 10)
+    # 搜索接口的页大小与 PAGE_SIZE 不同（实测每页约 20 条）：用它单独判搜索末页，
+    # 否则真实末页（18 条）也会被判成 has_more，让调用方多翻一页空页
+    SEARCH_PAGE_SIZE = _env_int("COOLAPK_SEARCH_PAGE_SIZE", 20)
     # feed_id → 作者uid 索引，持久化到 ~/.coolapk-mcp/uid_index.json
     INDEX_FILE = Path.home() / ".coolapk-mcp" / "uid_index.json"
     INDEX_MAX = 2000

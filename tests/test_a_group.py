@@ -101,7 +101,8 @@ def test_get_url_strict_allows_known_read_shapes() -> None:
 
 
 def test_page_size_default_and_env_parse(monkeypatch) -> None:
-    assert client_mod.CoolapkClient.PAGE_SIZE == 10
+    # 本机设了 COOLAPK_PAGE_SIZE 时按本机值：硬编码 10 会让已配置环境假红
+    assert client_mod.CoolapkClient.PAGE_SIZE == client_mod._env_int("COOLAPK_PAGE_SIZE", 10)
     monkeypatch.setenv("COOLAPK_PAGE_SIZE", "20")
     assert client_mod._env_int("COOLAPK_PAGE_SIZE", 10) == 20
     monkeypatch.setenv("COOLAPK_PAGE_SIZE", "not-a-number")

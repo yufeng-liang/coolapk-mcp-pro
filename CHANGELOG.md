@@ -15,13 +15,13 @@
 - 新增 `COOLAPK_LOG_JSON` / `COOLAPK_LOG_LEVEL`：开启后日志输出 JSON Lines 到 stderr（`ts`/`level`/`logger`/`msg`，异常时多一个 `exc` 只留最后一行），容器与采集器可直接按行解析，stdio 模式不污染协议帧。
 - 新增 `.github/workflows/release.yml`：推送 `vX.Y.Z` tag 时校验 tag 与 `pyproject` / `__version__` 一致，构建 sdist/wheel 并附加到 GitHub Release（不推 PyPI）。
 - `coolapk_read_image` 支持一次多张图片（逗号/空格/换行分隔，最多 9 张）：九宫格帖此前要调 9 次，现在一次看全；任一张下载失败会指明是第几张，不再静默返回「这帖只有这么多图」。
-- `coolapk_feed_detail` 的 `feed_id` 与 CLI `coolapk feed` 现在接受酷安分享链接或整段分享文案（含 `?id=` / `feedId=` 形态），自动解析出帖子 ID；解析不出时明确报错，不再把整段文本当 ID 发给接口。
+- `coolapk_feed_detail` 的 `feed_id` 与 CLI `coolapk feed` 现在接受酷安分享链接或整段分享文案（含 `?id=` / `feedId=` 形态），自动解析出帖子 ID；只有酷安域名下的链接参与解析，其他站点链接（如 GitHub issue 页里的数字）与整段文案中的手机号不会被当成 ID，多个不同酷安 ID 并存时明确报错而不是随便挑一个。
 - 列表类工具（`coolapk_search` / `coolapk_home` / `coolapk_board` / `coolapk_secondhand` / `coolapk_notify`）统一返回 `has_more` 与 `next_page`，续抓口径与 `coolapk_feed_detail` / `coolapk_user_feeds` 对齐：此前只能盲猜 `page+1`，翻过头拿到空列表也判断不出「到底了」。
 - `coolapk_search` 结果为空时新增 `hint`，区分「被关键词严格过滤」（给出被滤条数并建议 `strict=false` 或换词）、「只剩卡片/广告位」与「酷安确实没有」。
 
 ### 变更
 
-- `coolapk_home` 返回结构由裸列表改为 `{tab, page, fetched, feeds}` 包装：此前 agent 无从判断拿到的是哪一栏、也没有分页信息；未知 `tab` 取值统一按 `recommend` 处理并回显真实分栏。
+- `coolapk_home` 返回结构由裸列表改为 `{tab, page, fetched, has_more, next_page, feeds}` 包装：此前 agent 无从判断拿到的是哪一栏、也没有分页信息；未知 `tab` 取值统一按 `recommend` 处理，回显真实分栏并附 `tab_fallback=true` 说明取值被改写。CLI `coolapk home` 同步输出这一包装（此前只打印裸列表，也没有分页信号，且 `--tab 关注` 会被参数校验直接拒绝）。
 - 所有时间字段统一为 ISO8601 + 东八区偏移（如 `2023-11-15T06:13+08:00`）：此前用 UTC 且不带时区标记，东八区用户看到的时间比实际早 8 小时，跨日帖还会认错日期。
 - `coolapk_feed_detail` / `coolapk_user_feeds` / `coolapk_author_digest` 新增 `truncated` / `next_page`（及 `sub_replies_truncated`）：撞到页数或请求预算上限时明确告知「还有没取的」，此前只能靠条数猜。
 - `coolapk_topic` 详情与动态拆分降级：话题详情接口被风控时仍返回动态列表，并在 `topic_error` / `feeds_error` 标注原因；此前任一路失败即整次失败。
@@ -36,8 +36,10 @@
 - CI 增 Windows 腿（Python 3.12，覆盖 icacls/路径分支）与 Docker 腿（镜像构建 + 非 root 容器内 CLI 冒烟），Linux 覆盖率改为 `--cov-fail-under=60` 门槛，挡住「新增整块代码零测试」。
 - /status 的 `requests` 增加 `calls` 与 `latency_ms`：延迟按逻辑调用统计（含缓存命中与单飞搭车），排障时能直接看出是慢在限速还是上游。
 - /status 取 client 或指标失败时降级为 `{"status":"degraded",…}`（HTTP 仍 200）：此前配置损坏会让探针拿到 500，与「进程挂了」无法区分。
+- `coolapk_read_image` 的多图返回改用 `@mcp.tool(structured_output=False)` 显式声明非结构化输出：此前靠「`list[Image]` 这种参数化注解会让 FastMCP 降级」这一内部行为隐式成立，MCP 版本一动就可能在 import 期抛 `PydanticSchemaGenerationError` 让整个服务起不来。
 - 指标覆盖面补齐：非 `CoolapkError` 的意外异常记为 `internal:<异常类名>`（此前一律零记录），SMS/验证码登录链路的请求也计入 `requests`（此前恒为 0，与真实上游流量不符）；单飞搭车者不再被算成「缓存未命中」，命中率回归真实。
-- 长文本不再无上限地塞进上下文：正文超 `COOLAPK_FEED_CONTENT_MAX`（默认 2000 字）、单条评论超 `COOLAPK_REPLY_CONTENT_MAX`（默认 800 字）截断并标 `content_truncated`；单次回复条数超 `COOLAPK_REPLY_MAX_ITEMS`（默认 60）时保留前 N 条并标 `replies_omitted`（`all_replies` 一条帖能翻 300 条）；三项设 `0` 均可关闭限制。
+- 长文本不再无上限地塞进上下文：正文超 `COOLAPK_FEED_CONTENT_MAX`（默认 2000 字）、单条评论超 `COOLAPK_REPLY_CONTENT_MAX`（默认 800 字）截断并标 `content_truncated`；单次回复条数超 `COOLAPK_REPLY_MAX_ITEMS`（默认 60）时保留前 N 条并标 `replies_omitted`（`all_replies` 一条帖能翻 300 条）；被本地条数上限裁掉的部分不再给 `next_page`（那是本地裁剪不是上游翻页），要继续往后看请传 `reply_page`；三项设 `0` 均可关闭限制。
+- CLI `coolapk feed` 与服务端语义对齐：`--focus` 活跃时不再预拉默认回复（那一页会被整份替换，白排一次限速窗口），聚焦两路都空/失败时回拉一页兜底并标 `comments_focus.fallback`；新增 `--focus-page` 消费 `focus_meta.next_page`；`--grep` 与 MCP 工具一样改为在条数截断之前检索。
 - 结构化日志细节：`httpx`/`mcp`/`uvicorn` 固定压到 `WARNING`（它们的 INFO 会把带 token/sessid 的完整请求 URL 写进日志流）；U+2028/U+2029/U+0085 转义保证「一条一行」；只替换自己上次装的 handler，宿主（pytest、外层 uvicorn）已装的 handler 不再被丢弃。
 
 ### 修复
@@ -47,6 +49,7 @@
 - `coolapk_get_url` 路径校验漏掉 fragment：`/v6/feed/like#x` 能绕过写端点拦截（httpx 发包时会丢掉 `#` 之后的内容，实际请求的正是写端点），现在按去掉 fragment 的路径判定。
 - `/img` 遇到非 ASCII 签名不再 500：`hmac.compare_digest` 对含非 ASCII 的字符串会抛 `TypeError`，任何扫描器都能稳定触发；现在先按 32 位十六进制形态挡掉再比较，统一返回 403。
 - `/img` 跳转校验改为「建连前 + 事后」双闸：原先先发起请求才检查 `resp.url.host`，指向内网的 GET 已经发出；现在主机/端口白名单在任何网络动作之前判定，跟随重定向后再复检最终 host。`coolapk_read_image` 同样校验最终 host（响应体会回给模型，属于可读 SSRF）。
+- `coolapk_feed_detail` 的关键词检索改为在条数截断之前执行：此前先把回复截到前 60 条再按关键词过滤，命中落在第 61 条之后的评论会被报成「没有」（假阴性，而用户问的正是「有没有人提到 X」）；现在按全部已取回复检索，命中数超过上限时裁到上限并用 `replies_omitted` 与 `comment_search.truncated` 说明。
 - 分页中途失败不再丢已取结果：第 3 页报错时前两页会被整体丢弃，还会谎报「没有评论」；现在保留已取条目并标 `truncated` / `next_page`。
 - `comments_focus` 单路失败不再谎称取全：楼主/热门任一路失败时 `truncated=true` 并给出 `missing_sources`；`next_page` 取两路较大值，新增 `start_page`（对应 `coolapk_feed_detail` 的 `focus_page`）支持续抓。
 - `uid_index.json` 写盘不再丢更新：刷盘前先拍快照再清脏标记，`close()` 无条件保存；此前在途写盘会覆盖 `close()` 前的最后一次更新。
@@ -55,6 +58,13 @@
 - `coolapk login --adb` 失败不再静默返回：输出异常类型与三条排查提示（adb 是否在 PATH、手机是否授权 USB 调试、酷安是否已登录且 root）。
 - Windows 凭据文件不再继承目录 ACL：`config.json` 与 `img_secret` 写入后调用 `icacls /inheritance:r /grant:r <当前用户>:F`，只保留当前用户可读写（此前 Windows 分支完全没做权限收紧，同机其他账户可读 token 与完整 Cookie）。
 - 弱 `COOLAPK_HTTP_TOKEN` 启动时给警告：少于 16 位、含首尾空白或等于示例值 `coolapk-mcp-dev` 都会在日志里点名（不阻止启动）。这类问题此前只会表现成「客户端莫名 401」。
+- 列表类接口的运营卡片不再变成幽灵条目：卡片本身没有帖子 id，此前被当成帖子收下（`id=null`），既撑大 `fetched` 又把 `has_more` 顶成 true；现在卡片只保留内嵌的 `feed` 实体，卡位仍计入本页条数，末页判定不受影响。
+- 搜索空结果的「只剩卡片/广告位」提示不再建议改 `strict`：卡片是固定运营位，与严格过滤无关，按旧提示重试只会拿到完全一样的结果；现在直接建议换页码或换个更通用的关键词。
+- 搜索分页按真实页大小判定：搜索一页约 20 条，此前沿用列表类的 10 条阈值，真实末页也会标 `has_more=true` 让人白翻一页；现在用 `COOLAPK_SEARCH_PAGE_SIZE`（默认 20）。
+- 关键词过滤改用未截断的原始正文匹配：此前拿已经截到 2000 字的 `content` 去比，关键词落在正文后半段时会被误判成不命中。
+- 环境变量填 `inf` / `1e400` 不再让进程在 import 期崩溃：`COOLAPK_PAGE_SIZE`、`COOLAPK_SEARCH_PAGE_SIZE`、`COOLAPK_FEED_CONTENT_MAX` 等解析时的 `OverflowError` 现在与其他非法值一样回落默认。
+- `coolapk_read_image` 对重复 URL 去重：同一张图粘两遍不再下载两次。
+- 分页阈值传 `0` 或负数时不再被抬成 1：旧行为会让 `has_more` 恒为 true，现在直接判定为「已达上限」返回 `has_more=false`。
 
 ### 优化
 
