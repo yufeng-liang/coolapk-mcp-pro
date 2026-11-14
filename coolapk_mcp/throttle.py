@@ -70,6 +70,11 @@ def bucket_for(path: str) -> str:
     return "default"
 
 
+async def _sleep(delay: float) -> None:
+    """限速等待的唯一出口：测试里替换成假时钟，断言"该睡多久"而不是"墙钟过了多久"。"""
+    await asyncio.sleep(delay)
+
+
 class RateLimiter:
     """限速器：默认全局串行；bucket 模式下按桶各自计时
 
@@ -92,7 +97,7 @@ class RateLimiter:
             async with self._lock:
                 wait = self._last + self.min_interval - time.monotonic()
                 if wait > 0:
-                    await asyncio.sleep(wait)
+                    await _sleep(wait)
                 self._last = time.monotonic()
             return
         key = bucket or "default"
@@ -100,7 +105,7 @@ class RateLimiter:
         async with lock:
             wait = self._bucket_last.get(key, 0.0) + self.min_interval - time.monotonic()
             if wait > 0:
-                await asyncio.sleep(wait)
+                await _sleep(wait)
             self._bucket_last[key] = time.monotonic()
 
 
@@ -129,9 +134,16 @@ class TTLCache:
             self._store.popitem(last=False)
 
 
-async def backoff_sleep(attempt: int) -> None:
-    """指数退避 + 抖动：0.8s, 1.6s, ...，单次不超过 MAX_BACKOFF"""
+async def backoff_sleep(attempt: int, floor: float = 0.0) -> None:
+    """指数退避 + 抖动：0.8s, 1.6s, ...，单次不超过 MAX_BACKOFF。
+
+    floor 是调用方要求的最小等待（例如服务端 429 的 Retry-After）：
+    退避曲线追不上服务端要求的等待时间时，按服务端要求睡够，否则重试等于
+    白撞一次限流窗口，反而加深封禁。最终值仍受 MAX_BACKOFF 约束。
+    """
     delay = 0.8 * (2 ** attempt) + random.uniform(0, 0.4)
+    if floor > delay:
+        delay = floor
     if MAX_BACKOFF:
         delay = min(delay, MAX_BACKOFF)
     await asyncio.sleep(delay)

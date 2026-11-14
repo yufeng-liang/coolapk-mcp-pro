@@ -1,6 +1,7 @@
-"""MCP Server — 酷安社区只读工具集（13 个工具）"""
+"""MCP Server — 酷安社区只读工具集（17 个工具）"""
 
 import asyncio
+import contextlib
 import functools
 import hashlib
 import hmac
@@ -8,6 +9,7 @@ import inspect
 import json
 import logging
 import os
+import secrets
 import time
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -21,9 +23,19 @@ from coolapk_mcp import postfilter
 from coolapk_mcp import scoring
 
 
+from coolapk_mcp.boards import BOARD_URLS
 from coolapk_mcp.budget import Budget, BudgetExceeded
-from coolapk_mcp.client import CoolapkClient, CoolapkError
+# FOCUS_MAX_PAGES 用冗余别名导入即为「显式再导出」：测试与 CLI 都靠 server 上的这个名字
+from coolapk_mcp.focus import FOCUS_MAX_PAGES as FOCUS_MAX_PAGES
+from coolapk_mcp.focus import collect_focus
+from coolapk_mcp.client import (
+    CoolapkClient,
+    CoolapkError,
+    aclose_image_client,
+    image_client,
+)
 from coolapk_mcp.models import (
+    AppModel,
     FeedDetail,
     FeedModel,
     ReplyModel,
@@ -33,7 +45,7 @@ from coolapk_mcp.models import (
     _strip_html as _strip_html_keep_links,
     apply_tool_whitelist,
 )
-from coolapk_mcp.config import AppConfig
+from coolapk_mcp.config import CONFIG_DIR, AppConfig
 
 # 图片中转只允许这些酷安域名，避免被当成任意 URL 的开放代理
 IMAGE_HOSTS = frozenset({"image.coolapk.com", "avatar.coolapk.com", "static.coolapk.com"})
@@ -43,12 +55,74 @@ IMAGE_UA = (
     "+CoolMarket/16.2.0-2604201-universal"
 )
 
-# comments_focus 每个来源（楼主回复 / 热门评论）最多抓取的页数
-FOCUS_MAX_PAGES = 5
+# FOCUS_MAX_PAGES 由 focus 模块提供（server 与 CLI 共用一份实现）
+# coolapk_notify 支持的通知类型（与 client.get_notifications 的 ntype 一致）
+NOTIFY_TYPES = (
+    "atMeMeFeed", "atComment", "comment", "feedLike", "contactsFollow", "message",
+)
 # /img 中转的单次响应体上限（15MB）：超限直接拒绝，避免单张大图把进程内存撑爆
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
+# /img 签名密钥的落盘位置（未配置 COOLAPK_HTTP_TOKEN 时使用）
+IMG_SECRET_FILE = CONFIG_DIR / "img_secret"
+
+
+def _resolve_img_secret(token: str) -> str:
+    """/img 的 HMAC 签名密钥。
+
+    优先级：COOLAPK_IMG_SECRET → 本机持久化随机密钥 → 本次进程内临时随机密钥。
+
+    历史实现回落到硬编码 "coolapk-mcp-dev"：只要服务对公网可达，任何人都能
+    用公开字符串伪造 /img 链接，等于把它变成开放图片代理。
+    也不复用 COOLAPK_HTTP_TOKEN：/img 链接会出现在聊天记录与日志里，
+    拿签名串离线爆破 token 等于把 Bearer 凭据暴露在另一种信道上。
+    """
+    del token  # 保留参数以兼容调用方，但不再作为签名密钥来源
+    env_secret = os.environ.get("COOLAPK_IMG_SECRET", "").strip()
+    if env_secret:
+        return env_secret
+    try:
+        existing = IMG_SECRET_FILE.read_text(encoding="utf-8").strip()
+        if len(existing) >= 16:
+            return existing
+    except OSError:
+        pass
+    secret = secrets.token_urlsafe(32)
+    try:
+        IMG_SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        IMG_SECRET_FILE.write_text(secret, encoding="utf-8")
+        if os.name == "posix":
+            IMG_SECRET_FILE.chmod(0o600)
+    except OSError as exc:
+        logger.warning(
+            "无法持久化 /img 签名密钥（%s）：本次运行使用临时密钥，"
+            "重启后此前生成的所有 /img 链接都会失效；"
+            "容器部署请确认挂载目录属主与容器 uid 一致（见 README）",
+            IMG_SECRET_FILE,
+            exc_info=exc,
+        )
+    return secret
+
 
 logger = logging.getLogger("coolapk_mcp.server")
+
+
+@contextlib.asynccontextmanager
+async def _server_lifespan(_server: Any):
+    """MCP 服务生命周期：退出时释放全局 httpx 连接池。
+
+    stdio 模式进程结束前会走这里（此前没有关闭钩子，连接池与后台任务悬空到
+    进程被强杀）；HTTP 模式由 _build_http_app 的 Starlette lifespan 负责，
+    两处都调 _reset_client()，它是幂等的（client 已为 None 时直接返回）。
+    """
+    try:
+        yield None
+    finally:
+        await _reset_client()
+        # 退休队列里的旧实例此时已无人持有，统一关闭
+        await _close_retired()
+        # 图片连接池同为进程级资源，stdio 退出时一并释放
+        await aclose_image_client()
+
 
 mcp = FastMCP(
     "coolapk",
@@ -56,6 +130,8 @@ mcp = FastMCP(
     # 该校验按 Host 头白名单拦截，「Host: <公网IP>:端口」的合法直连（远程部署常态）
     # 会被误判 421；Bearer 鉴权已由 _build_http_app 强制，防护足够
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    # stdio 模式的关闭钩子：进程退出时关闭全局 client（HTTP 模式用 Starlette lifespan）
+    lifespan=_server_lifespan,
     instructions=(
         "酷安社区只读工具集：搜索帖子/用户/话题/应用、查看帖子详情与评论、"
         "用户资料与动态、话题详情、首页动态、登录状态、图片下载、通用只读接口透传、"
@@ -78,7 +154,7 @@ mcp = FastMCP(
 
 _client: CoolapkClient | None = None
 # 当前 client 对应的配置指纹（uid/token/desktop_cookie/api_base），用于配置热加载
-_client_fp: tuple[str, str, str, str] | None = None
+_client_fp: tuple[str, ...] | None = None
 # 串行化 client 创建/重建，避免并发工具调用各建一个 httpx 连接池
 _client_lock: asyncio.Lock | None = None
 
@@ -91,14 +167,36 @@ def _get_lock() -> asyncio.Lock:
     return _client_lock
 
 
-def _config_fingerprint(config: AppConfig) -> tuple[str, str, str, str]:
-    """登录态与接口地址指纹：任一项变化即视为需要重建 client。"""
+def _config_fingerprint(config: AppConfig) -> tuple[str, ...]:
+    """登录态与接口地址指纹：任一项变化即视为需要重建 client。
+
+    device_code 也必须在内：X-App-Token 由它派生，换机/重装后设备码变了，
+    但 uid/token 可能一模一样——漏掉它就会一直用旧设备码签 token。
+    """
     return (
         str(config.uid or ""),
         str(config.token or ""),
         str(config.desktop_cookie or ""),
         str(config.api_base or ""),
+        str(config.device_code or ""),
     )
+
+
+# 退休队列：热加载/登录重置时把旧 client 放进来，延后到 lifespan 收尾统一关闭。
+# 立刻关会让「已取到旧实例、正在发请求」的并发工具撞 httpx RuntimeError。
+_retired: list[CoolapkClient] = []
+
+
+def _retire(old: CoolapkClient | None) -> None:
+    """把旧 client 交给退休队列（不立即关闭）。"""
+    if old is not None:
+        _retired.append(old)
+
+
+async def _close_retired() -> None:
+    """关闭所有退休 client；lifespan 收尾调用。"""
+    while _retired:
+        await _close_client(_retired.pop())
 
 
 async def _close_client(old: CoolapkClient | None) -> None:
@@ -128,7 +226,7 @@ async def _reset_client() -> None:
         old = _client
         _client = None
         _client_fp = None
-    await _close_client(old)
+    _retire(old)
 
 
 async def _get_client() -> CoolapkClient:
@@ -141,7 +239,7 @@ async def _get_client() -> CoolapkClient:
     global _client, _client_fp
     try:
         config: AppConfig | None = AppConfig.load()
-        fp = _config_fingerprint(config)
+        fp = _config_fingerprint(config) if config is not None else _client_fp
     except Exception:  # noqa: BLE001 —— 配置读坏了不阻断工具调用，沿用现状
         logger.warning("读取 AppConfig 失败，沿用现有 client", exc_info=True)
         config, fp = None, _client_fp
@@ -156,9 +254,8 @@ async def _get_client() -> CoolapkClient:
         _client = replacement
         _client_fp = fp
         current = replacement
-    # 旧实例在锁外关闭
-    if old is not None:
-        await _close_client(old)
+    # 旧实例交给退休队列：正在用它的并发请求还能把这一轮跑完
+    _retire(old)
     return current
 
 
@@ -216,48 +313,82 @@ async def _fetch_upstream_image(
     返回 (状态码, 响应体, content-type, 结构化错误体, 错误状态码)。
     出错时响应体为空、结构化错误体非 None，由调用方直接转成 JSONResponse。
 
-    安全点：follow_redirects=True 时上游可用 30x 把我们引到任意地址（SSRF），
-    因此请求后必须校验 resp.url 的最终 host 仍在 IMAGE_HOSTS 内。
+    安全点：上游可用 30x 把我们引到任意地址（SSRF）。因此不交给 httpx 自动跟随
+    （那是「先连上内网地址、再看 host 决定要不要把结果给出去」——连接已经发出去了，
+    等于送出盲 SSRF/端口探测原语），改为手工最多跟 3 跳，每一跳发请求前先验 host
+    与端口。
     """
-    async with client.stream("GET", target, headers=headers) as resp:
-        final_host = (resp.url.host or "").lower()
-        if final_host not in IMAGE_HOSTS:
+    current = target
+    for _hop in range(4):
+        parts = urlsplit(current)
+        host_now = (parts.hostname or "").lower()
+        if parts.scheme not in ("http", "https") or host_now not in IMAGE_HOSTS:
             return (
                 0,
                 b"",
                 "",
                 {
                     "error": "forbidden_host",
-                    "detail": f"跳转后域名 {final_host or '?'} 不在酷安图片域名白名单",
+                    "detail": f"域名 {host_now or '?'} 不在酷安图片域名白名单",
                 },
                 403,
             )
-        if resp.status_code != 200:
-            return resp.status_code, b"", "", None, 0
-        declared = (resp.headers.get("content-length") or "").strip()
-        if declared.isdigit() and int(declared) > MAX_IMAGE_BYTES:
+        if parts.port not in (None, 80, 443):
             return (
                 0,
                 b"",
                 "",
-                {
-                    "error": "image_too_large",
-                    "detail": f"上游声明 {int(declared)} 字节，超过 15MB 上限",
-                },
+                {"error": "forbidden_host", "detail": "只允许 80/443 端口"},
+                403,
+            )
+        async with client.stream(
+            "GET", current, headers=headers, follow_redirects=False
+        ) as resp:
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("location") or ""
+                if not location:
+                    return resp.status_code, b"", "", None, 0
+                # 下一跳统一在循环顶部校验，不在这里「边跳边信」
+                current = str(httpx.URL(current).join(location))
+                continue
+            return await _read_image_body(resp)
+    return (
+        0,
+        b"",
+        "",
+        {"error": "too_many_redirects", "detail": "上游跳转超过 3 次"},
+        403,
+    )
+
+
+async def _read_image_body(resp: "httpx.Response") -> tuple[int, bytes, str, dict | None, int]:
+    """读取图片响应体：声明长度与流式累计两道 15MB 闸门。"""
+    if resp.status_code != 200:
+        return resp.status_code, b"", "", None, 0
+    declared = (resp.headers.get("content-length") or "").strip()
+    if declared.isdigit() and int(declared) > MAX_IMAGE_BYTES:
+        return (
+            0,
+            b"",
+            "",
+            {
+                "error": "image_too_large",
+                "detail": f"上游声明 {int(declared)} 字节，超过 15MB 上限",
+            },
+            413,
+        )
+    buf = bytearray()
+    async for chunk in resp.aiter_bytes():
+        buf.extend(chunk)
+        if len(buf) > MAX_IMAGE_BYTES:
+            return (
+                0,
+                b"",
+                "",
+                {"error": "image_too_large", "detail": "图片超过 15MB 上限"},
                 413,
             )
-        buf = bytearray()
-        async for chunk in resp.aiter_bytes():
-            buf.extend(chunk)
-            if len(buf) > MAX_IMAGE_BYTES:
-                return (
-                    0,
-                    b"",
-                    "",
-                    {"error": "image_too_large", "detail": "图片超过 15MB 上限"},
-                    413,
-                )
-        return 200, bytes(buf), resp.headers.get("content-type", "image/jpeg"), None, 0
+    return 200, bytes(buf), resp.headers.get("content-type", "image/jpeg"), None, 0
 
 
 def _parse_feed_list(raw: Any) -> list[FeedModel]:
@@ -266,15 +397,27 @@ def _parse_feed_list(raw: Any) -> list[FeedModel]:
     return [FeedModel.from_api(f) for f in raw if isinstance(f, dict)]
 
 
+def _normalize_keyword_mode(value: str) -> str:
+    """keyword_mode 只认 any/all，其余（含大小写、空格）一律回落 any。
+
+    静默降级要能看见：调用方把生效值回显进 payload，否则传了 all 却按 any
+    过滤时，agent 会以为「只有这些命中」。
+    """
+    return "all" if str(value or "").strip().lower() == "all" else "any"
+
+
 def _prepare_feeds(
-    raw: Any, keyword: str = "", sort: str = "default"
+    raw: Any, keyword: str = "", sort: str = "default", keyword_mode: str = "any"
 ) -> tuple[list[dict], int]:
     """把原始动态列表加工成带质量分的输出：过模型 → 关键词过滤 → 打分 → 排序。
 
-    keyword 空格分隔多词，任一命中标题或正文即保留（OR；与 search strict 的
-    AND 语义不同，这里用于作者/话题聚合时放宽召回）。
+    keyword 空格分隔多词：keyword_mode=any（默认）任一命中标题或正文即保留；
+    all 要求全部命中，用于精确圈定同一主题。注意与 coolapk_search 的 strict
+    并不等价：这里是「标题+正文的纯子串匹配」，不做 #话题# 归一化、也不匹配
+    作者名，所以带话题符号的词在 search 能命中、在这里可能漏。
     sort=hot 按 post_score（点赞+评论×3+转发×2）降序，latest 按发布时间降序。
     """
+    keyword_mode = _normalize_keyword_mode(keyword_mode)
     if not isinstance(raw, list):
         return [], 0
     items = [
@@ -283,14 +426,12 @@ def _prepare_feeds(
     total = len(items)
     words = [w for w in (keyword or "").lower().split() if w]
     if words:
-        items = [
-            it
-            for it in items
-            if any(
-                w in f"{it.get('title') or ''} {it.get('content') or ''}".lower()
-                for w in words
-            )
-        ]
+        def _hit(it: dict) -> bool:
+            haystack = f"{it.get('title') or ''} {it.get('content') or ''}".lower()
+            hits = [w in haystack for w in words]
+            return all(hits) if keyword_mode == "all" else any(hits)
+
+        items = [it for it in items if _hit(it)]
     for it in items:
         scoring.annotate_post(it)
     if sort == "hot":
@@ -349,8 +490,12 @@ def _catch_api_error(fn):
             )
         except (asyncio.TimeoutError, httpx.HTTPError) as exc:
             logger.warning("工具 %s 网络异常：%s", getattr(fn, "__name__", "?"), exc)
+            # retryable=True 与 README 的「network 可重试」保持一致：只有显式
+            # 带 retryable 的客户端才敢重试，缺了这个键等于劝退重试
             return _error_json(
-                f"网络请求失败（{type(exc).__name__}），可稍后重试", "network"
+                f"网络请求失败（{type(exc).__name__}），可稍后重试",
+                "network",
+                retryable=True,
             )
         except Exception as exc:  # noqa: BLE001 —— 兜底，异常不向上抛给 MCP 客户端
             logger.exception("工具 %s 未预期异常：%s", getattr(fn, "__name__", "?"), exc)
@@ -408,6 +553,7 @@ async def coolapk_feed_detail(
     comments_focus: str = "default",
     with_history: bool = False,
     expand_sub_replies: bool = False,
+    focus_page: int = 1,
 ) -> str:
     """获取酷安帖子的完整详情和回复（详情接口被风控时自动回落）。
 
@@ -432,6 +578,8 @@ async def coolapk_feed_detail(
         expand_sub_replies: 深度展开楼中楼（对回复数多的父评论补全子回复，
             楼主答疑常在楼中楼深处；会额外发请求，只在需要时开）。
             有父评论没取全时返回 sub_replies_truncated=True
+        focus_page: 焦点评论起始页（消费上一次的 focus_meta.next_page 用；
+            只在 comments_focus 为 smart/author/hot 时生效）
     """
     client = await _get_client()
     focus = (comments_focus or "default").strip().lower()
@@ -462,100 +610,18 @@ async def coolapk_feed_detail(
         detail.replies_next_page = getattr(raw_replies, "next_page", None)
 
     # ---- 评论聚焦模式：单独拉楼主评论 / 热门评论替换默认列表 ----
-    # 两个来源共用一份请求预算：各最多 FOCUS_MAX_PAGES 页（每页一次上游请求，
-    # 某页不足 10 条即末页），另留 2 次余量，避免评论上千的帖子把一次工具调用
-    # 拖进超时。翻页、跨页去重与截断判定都在 client 的分页方法里完成。
+    # 翻页、去重、预算与截断判定都在 focus.collect_focus 里（与 CLI 共用一份实现）
     focus_meta: dict | None = None
-    merged: list[dict] = []
     if focus in ("smart", "author", "hot"):
-        budget = Budget(max_requests=FOCUS_MAX_PAGES * 2 + 2, deadline=25.0)
-        # 两路评论并发发起：global 限速模式下仍会被限速器串行化（行为与串行等价），
-        # 只有 COOLAPK_RATE_LIMIT_MODE=bucket 时才真正并行压延迟。
-        # Budget.take() 是同步自增，共享同一个 Budget 不需要额外加锁。
-        jobs: list[tuple[str, Any]] = []
-        if focus in ("smart", "author"):
-            jobs.append(
-                (
-                    "author",
-                    client.get_author_replies_paged(
-                        feed_id, max_pages=FOCUS_MAX_PAGES, budget=budget
-                    ),
-                )
-            )
-        if focus in ("smart", "hot"):
-            jobs.append(
-                (
-                    "hot",
-                    client.get_popular_replies_paged(
-                        feed_id, max_pages=FOCUS_MAX_PAGES, budget=budget
-                    ),
-                )
-            )
-        outcomes = await asyncio.gather(*(job for _, job in jobs), return_exceptions=True)
-        error_note = ""
-        budget_hit = False
-        fetched: dict[str, Any] = {}
-        for (name, _), res in zip(jobs, outcomes):
-            if isinstance(res, BudgetExceeded):
-                # 预算耗尽：已拿到的来源照常展示，没取的部分按截断处理
-                budget_hit = True
-                error_note = "请求预算耗尽，已返回部分评论"
-            elif isinstance(res, CoolapkError):
-                error_note = "评论聚焦拉取失败，已回落默认列表"
-            elif isinstance(res, BaseException):
-                # 非预期异常照旧向上抛，由 _catch_api_error 统一兜底
-                raise res
-            else:
-                fetched[name] = res
-        author_res = fetched.get("author")
-        hot_res = fetched.get("hot")
-
-        author_list: list[dict] = list(author_res or [])
-        hot_list: list[dict] = list(hot_res or [])
-        seen: set[str] = set()
-        for item in author_list + hot_list:
-            if isinstance(item, dict) and str(item.get("id")) not in seen:
-                seen.add(str(item.get("id")))
-                merged.append(item)
-
-        sources = [res for res in (author_res, hot_res) if res is not None]
-        truncated = budget_hit or any(
-            bool(getattr(res, "truncated", False)) for res in sources
+        merged, focus_meta = await collect_focus(
+            client, feed_id, focus, start_page=max(1, int(focus_page or 1))
         )
-        next_pages = [
-            p
-            for p in (getattr(res, "next_page", None) for res in sources)
-            if isinstance(p, int)
-        ]
-        pages_fetched = sum(int(getattr(res, "requests", 0) or 0) for res in sources)
-        if not pages_fetched:
-            # client 没上报请求数时回退到预算计数（两者语义都是"发出的页请求数"）
-            pages_fetched = budget.used
-        focus_meta = {
-            "mode": focus,
-            "author_replies": len(author_list),
-            "hot_replies": len(hot_list),
-            "total_shown": len(merged),
-            "total_replynum": (smart["data"].get("replynum") or 0),
-            # 翻页统计：pages_fetched 为本次实际发出的页请求数合计；
-            # truncated=True 表示撞到 FOCUS_MAX_PAGES 或请求/时间预算上限，
-            # 后面还有评论没取；next_page 是继续深入的起始页码（未截断时为 None）
-            "pages_fetched": pages_fetched,
-            "truncated": truncated,
-            "next_page": (
-                min(next_pages)
-                if (truncated and next_pages)
-                else (FOCUS_MAX_PAGES + 1 if truncated else None)
-            ),
-            "budget": budget.meta(),
-        }
-        if error_note:
-            focus_meta["error"] = error_note
-
-    if focus_meta is not None:
-        detail.comments_focus = focus_meta
+        if focus_meta is not None:
+            focus_meta["total_replynum"] = smart["data"].get("replynum") or 0
         if merged:
             detail.replies = [ReplyModel.from_api(r) for r in merged]
+    if focus_meta is not None:
+        detail.comments_focus = focus_meta
 
     # ---- 修改历史 ----
     if with_history:
@@ -616,9 +682,8 @@ async def coolapk_feed_detail(
             stats["truncated"] = True
             if detail.replies_next_page is not None:
                 stats["next_page"] = detail.replies_next_page
-        return json.dumps(
-            apply_tool_whitelist("feed_detail", dumped), ensure_ascii=False
-        )
+        # 与默认分支同源：_json 内部做 dump + 白名单裁剪
+        return _json(dumped, whitelist="feed_detail")
     return _json(detail, whitelist="feed_detail")
 
 
@@ -647,6 +712,7 @@ async def coolapk_user_feeds(
     pages: int = 1,
     keyword: str = "",
     sort: str = "default",
+    keyword_mode: str = "any",
 ) -> str:
     """查看酷安用户发布的帖子（支持多页聚合、关键词过滤与热度排序）。
 
@@ -656,10 +722,12 @@ async def coolapk_user_feeds(
         pages: 连续抓取页数 1-5，默认 1；想看某作者的历史干货时设 2-3
         keyword: 只保留标题或正文含该词的帖子（空格分隔多词=任一命中）
         sort: 排序，default(接口原始顺序) / hot(互动热度) / latest(发布时间)
+        keyword_mode: any(默认，任一命中) / all(全部命中，用于精确圈定同一主题)
     """
     client = await _get_client()
     start = max(1, int(page or 1))
     wanted = max(1, min(int(pages or 1), 5))
+    raw: Any
     if wanted > 1:
         # 多页聚合走统一预算：页数即请求上限，另留 2 次余量（重试/补偿页），
         # 超限时 client 返回已抓到的部分并把 truncated/next_page 标出来。
@@ -671,7 +739,8 @@ async def coolapk_user_feeds(
         raw = await client.get_user_feeds(uid, start)
     if not isinstance(raw, list):
         return _json(raw)
-    items, total = _prepare_feeds(raw, keyword, sort)
+    mode = _normalize_keyword_mode(keyword_mode)
+    items, total = _prepare_feeds(raw, keyword, sort, mode)
     return _json(
         {
             "uid": uid,
@@ -680,6 +749,7 @@ async def coolapk_user_feeds(
             "matched": len(items),
             "sort": sort,
             "keyword": keyword or None,
+            "keyword_mode": mode,
             # 翻页截断：truncated=True 说明还有页没取（预算或页数上限）；
             # next_page 是续抓起点，未截断时为 null
             "truncated": bool(getattr(raw, "truncated", False)),
@@ -716,7 +786,7 @@ async def coolapk_author(uid: int) -> str:
 @mcp.tool()
 @_catch_api_error
 async def coolapk_author_digest(
-    uid: int, keyword: str = "", pages: int = 2, top: int = 10
+    uid: int, keyword: str = "", pages: int = 2, top: int = 10, keyword_mode: str = "any"
 ) -> str:
     """深挖某作者：一次调用拿到他在指定主题下的全部高赞帖（按热度排序）。
 
@@ -729,13 +799,15 @@ async def coolapk_author_digest(
         keyword: 主题关键词（空格分隔多词=任一命中），留空返回全部帖子
         pages: 抓取页数 1-5，默认 2（约 40 条）
         top: 返回条数上限，默认 10，最多 50
+        keyword_mode: any(默认，任一命中) / all(全部命中，避免「解锁」类泛词召回)
     """
     client = await _get_client()
     wanted = max(1, min(int(pages or 1), 5))
     # 与 coolapk_user_feeds 同一预算口径：页数上限 + 2 次余量
     budget = Budget(max_requests=wanted + 2, deadline=20.0)
     raw = await client.get_user_feeds_pages(uid, pages=wanted, budget=budget)
-    posts, total = _prepare_feeds(raw, keyword, "hot")
+    mode = _normalize_keyword_mode(keyword_mode)
+    posts, total = _prepare_feeds(raw, keyword, "hot", mode)
     limit = max(1, min(int(top or 10), 50))
     posts = posts[:limit]
     space = await client.get_user_space(uid)
@@ -760,6 +832,7 @@ async def coolapk_author_digest(
             "username": author.get("username"),
             "author": author,
             "keyword": keyword or None,
+            "keyword_mode": mode,
             "pages": wanted,
             "fetched": total,
             "matched": len(posts),
@@ -778,20 +851,118 @@ async def coolapk_author_digest(
 async def coolapk_home(tab: str = "recommend", page: int = 1) -> str:
     """获取酷安首页动态。
 
+    返回 {"tab", "page", "fetched", "feeds"}：tab 回显实际分栏（未知取值按
+    recommend 处理），feeds 为动态列表。旧版本返回裸列表，调用方按 dict 解析。
+
     Args:
         tab: 类型，可选 recommend(推荐) hot(热门) latest(最新)
         page: 页码
     """
     client = await _get_client()
+    # tab 归一：未知取值按 recommend 处理，并在返回里回显真实分栏（此前直接
+    # 返回裸列表，agent 无从判断拿到的是哪一栏、也没有分页信息）
+    tab = (tab or "").strip().lower()
     if tab == "hot":
         data = await client.get_hot_feeds(page)
     elif tab == "latest":
         data = await client.get_latest_feeds(page)
     else:
+        tab = "recommend"
         data = await client.get_home_feeds(page)
     if isinstance(data, list):
-        return _json(_parse_feed_list(data), whitelist="home")
+        feeds = _parse_feed_list(data)
+        return _json(
+            {"tab": tab, "page": page, "fetched": len(feeds), "feeds": feeds},
+            whitelist="home",
+        )
     return _json(data)
+
+
+def _resolve_board_arg(board: str) -> tuple[str, str] | None:
+    """把用户/agent 给的板块标识解析成 (board_id, url)。
+
+    与 client 里的宽松回落不同：这里要求能落到已知板块或显式 page_name/url，
+    否则返回 None 让工具报「未知板块 + 可用列表」，而不是拿乱串去请求接口。
+    """
+    name = (board or "").strip()
+    if not name:
+        return None
+    if name in BOARD_URLS:
+        return name, BOARD_URLS[name][1]
+    # 中文板块名（数码/手机/二手交易…）此前未支持：README 与工具描述都写了
+    # 「支持板块 id 或中文名」，但这里只认英文 id 与 page_name，传中文会落到
+    # 「未知板块」。按标题精确匹配一次即可（21 项，开销可忽略）。
+    for board_id, (title, url) in BOARD_URLS.items():
+        if name == title:
+            return board_id, url
+    for board_id, (_title, url) in BOARD_URLS.items():
+        if "url=" in url and url.split("url=", 1)[1] == name:
+            return board_id, url
+    # 显式完整 url / page 路径（含 / 或 #）：原样透传，交给接口判定
+    if "/" in name or name.startswith("#"):
+        return name, name
+    return None
+
+
+@mcp.tool()
+@_catch_api_error
+async def coolapk_board(board: str, page: int = 1) -> str:
+    """浏览酷安板块（数码、二手、摄影、汽车、好物等 21 个板块）。
+
+    板块动态与首页动态是两套入口：想看「数码区最近在聊什么」「二手区的行情」
+    用这个工具，不要用 coolapk_home。板块 ID 见 boards 映射，常用：
+    digital(数码) phone(手机) computer(电脑) system(系统ROM) sheying(摄影)
+    meihua(美化) car(汽车) waishe(外设) goods(好物) kaixiang(开箱)
+    secondhand(二手) secondhand_apple(二手苹果) hot(热榜) news(快讯) video(视频)
+    wenda(问答) topic(话题) headline(头条) xianliao(闲聊) coolpic(酷图)
+    newphone(新机)。
+
+    Args:
+        board: 板块 ID（如 digital）、中文名（如 手机/数码/二手交易）或
+            page_name（如 V10_DIGITAL_HOME）
+        page: 页码，默认 1
+    """
+    resolved = _resolve_board_arg(board)
+    if resolved is None:
+        return _error_json(
+            f"未知板块: {board}（可用板块 id：{'/'.join(sorted(BOARD_URLS))}；"
+            f"也可直接传中文名，如 数码/手机/二手交易）",
+            "api",
+        )
+    board_id, _url = resolved
+    page = max(1, int(page or 1))
+    client = await _get_client()
+    raw = await client.get_board_feeds(board_id, page)
+    if isinstance(raw, list):
+        feeds = _parse_feed_list(raw)
+        return _json(
+            {"board": board_id, "page": page, "fetched": len(feeds), "feeds": feeds},
+            whitelist="board",
+        )
+    return _json(raw)
+
+
+@mcp.tool()
+@_catch_api_error
+async def coolapk_secondhand(brand: int = 0, page: int = 1) -> str:
+    """二手交易区动态（想了解某机型二手行情、看出售帖时用）。
+
+    Args:
+        brand: 品牌 ID，0 表示全部；1005=苹果（其余品牌 ID 可先用 coolapk_search
+            搜到手机话题后按需试）
+        page: 页码，默认 1
+    """
+    page = max(1, int(page or 1))
+    brand_id = int(brand or 0)
+    client = await _get_client()
+    raw = await client.get_secondhand_feeds(brand_id or None, page)
+    if isinstance(raw, list):
+        feeds = _parse_feed_list(raw)
+        return _json(
+            {"brand": brand_id or None, "page": page, "fetched": len(feeds), "feeds": feeds},
+            whitelist="secondhand",
+        )
+    return _json(raw)
 
 
 @mcp.tool()
@@ -810,14 +981,24 @@ async def coolapk_topic(
     """
     client = await _get_client()
     result: dict[str, Any] = {}
-    detail = await client.get_topic_detail(tag)
+    # 详情与动态分开降级：话题详情接口被风控时，动态列表往往还能取到，
+    # 此前一个失败就整次失败，等于白丢一份可用数据
+    try:
+        detail = await client.get_topic_detail(tag)
+    except CoolapkError as exc:
+        detail = None
+        result["topic_error"] = str(exc)[:200]
     if isinstance(detail, list) and detail:
         detail = detail[0]
     if isinstance(detail, dict):
         result["topic"] = TopicModel.from_api(detail)
 
     if with_feeds:
-        feeds = await client.get_topic_feeds(tag, page)
+        try:
+            feeds = await client.get_topic_feeds(tag, page)
+        except CoolapkError as exc:
+            feeds = None
+            result["feeds_error"] = str(exc)[:200]
         if isinstance(feeds, list):
             parsed = _parse_feed_list(feeds)
             if hot_first:
@@ -830,6 +1011,80 @@ async def coolapk_topic(
                 )
             result["feeds"] = parsed
     return _json(result, whitelist="topic")
+
+
+@mcp.tool()
+@_catch_api_error
+async def coolapk_app_detail(package_name: str) -> str:
+    """查看酷安应用详情（包名 → 应用名、简介、关注数、下载量、版本）。
+
+    搜到应用相关动态后，用包名查应用本身：判断「这是不是同一个 App」
+    「现在的最新版本号」比只看帖子标题可靠。
+
+    Args:
+        package_name: 应用包名（如 com.coolapk.market）
+    """
+    pkg = (package_name or "").strip()
+    if not pkg:
+        return _error_json("package_name 不能为空", "api")
+    client = await _get_client()
+    data: Any = await client.get_app_detail(pkg)
+    if isinstance(data, list):
+        data = data[0] if data else None
+    if not isinstance(data, dict):
+        return _json(data)
+    return _json(_dump(AppModel.from_api(data)), whitelist="app_detail")
+
+
+@mcp.tool()
+@_catch_api_error
+async def coolapk_notify(ntype: str = "message", page: int = 1, with_count: bool = False) -> str:
+    """查看通知（@我的、评论、点赞、关注、私信）。
+
+    适合「有人回复我了吗」「私信里说了什么」这类需要个人时间线的场景；
+    只读，不会标记已读或回复。
+
+    Args:
+        ntype: 通知类型，可选 atMeMeFeed(@我的动态) atComment(@我的评论)
+            comment(评论) feedLike(点赞) contactsFollow(关注) message(私信)，
+            默认 message
+        page: 页码，默认 1
+        with_count: 是否附带各类型未读/总数统计（多一次请求）
+    """
+    kind = (ntype or "message").strip()
+    if kind not in NOTIFY_TYPES:
+        return _error_json(
+            f"未知通知类型: {kind}（可用：{'/'.join(NOTIFY_TYPES)}）",
+            "api",
+        )
+    page = max(1, int(page or 1))
+    client = await _get_client()
+    raw = await client.get_notifications(kind, page)
+    items = raw if isinstance(raw, list) else []
+    # 通知接口返回的是原始 camelCase 条目，dateline 是裸 Unix 秒；其它工具统一
+    # 输出 ISO8601+08:00，这里不归一会让 agent 拿到两套时间口径没法比较
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("dateline"):
+            item["dateline"] = _format_time(item["dateline"])
+        # 其它工具输出统一 snake_case，通知条目来自原始 API，这里把唯一的
+        # camelCase 字段（entityType）改名后再进白名单
+        if "entityType" in item:
+            item["entity_type"] = item.pop("entityType")
+    payload: dict[str, Any] = {
+        "ntype": kind,
+        "page": page,
+        "fetched": len(items),
+        "items": items,
+    }
+    if with_count:
+        try:
+            payload["counts"] = await client.get_notification_count()
+        except CoolapkError as exc:
+            # 统计失败不该拖垮通知本体
+            payload["counts"] = {"error": str(exc)[:200]}
+    return _json(payload, whitelist="notification")
 
 
 @mcp.tool()
@@ -923,7 +1178,10 @@ async def coolapk_image_link(urls: str, ttl_minutes: int = 120) -> str:
             },
             ensure_ascii=False,
         )
-    secret = os.environ.get("COOLAPK_HTTP_TOKEN", "") or "coolapk-mcp-dev"
+    # 与 /img 端点同源解析签名密钥：此前这里独立读 token 并回落到硬编码
+    # "coolapk-mcp-dev"，与端点侧（随机持久化密钥）不一致时签名必然对不上，
+    # 且硬编码密钥等于公开签名——任何知道字符串的人都能伪造 /img 链接。
+    secret = _resolve_img_secret(os.environ.get("COOLAPK_HTTP_TOKEN", "").strip())
     try:
         ttl = max(1, min(int(ttl_minutes), 10080))
     except (TypeError, ValueError):
@@ -1010,7 +1268,7 @@ def _build_http_app():
         raise SystemExit(
             f"[coolapk-mcp] COOLAPK_HTTP_PORT={port_raw!r} 不是有效端口号，"
             "请设置为 1-65535 的整数。"
-        )
+        ) from None
     token = os.environ.get("COOLAPK_HTTP_TOKEN", "")
 
     # 非回环地址必须显式配 token，防止登录态裸奔公网。
@@ -1025,13 +1283,22 @@ def _build_http_app():
             is_loopback = addr.is_loopback
         except (socket.gaierror, ValueError):
             is_loopback = False
-    if not is_loopback and not token:
+    allow_anonymous = os.environ.get("COOLAPK_ALLOW_ANONYMOUS", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    # streamable-http 一律要求 token：只听回环也不够安全——本机浏览器里的任意网页
+    # 可以借 DNS rebinding 打到 127.0.0.1（本项目显式关掉了 rebinding 保护），
+    # 就等于把 17 个工具连同登录态交给它。
+    if not token and not allow_anonymous:
+        where = "回环地址" if is_loopback else "非回环地址"
         raise SystemExit(
-            "[coolapk-mcp] 拒绝启动：COOLAPK_HTTP_HOST 绑定非回环地址（"
-            f"{host}）但未设置 COOLAPK_HTTP_TOKEN。\n"
-            "  HTTP 服务不设防 = 任何人都能用你的酷安登录态查数据。\n"
-            "  设置 COOLAPK_HTTP_TOKEN=<随机长随机串> 后重试，"
-            "公网部署请务必用 Nginx/Caddy 反代加 TLS（见 README 远程部署章）。"
+            f"[coolapk-mcp] 拒绝启动：COOLAPK_HTTP_HOST 绑定{where}（{host}）"
+            "但未设置 COOLAPK_HTTP_TOKEN。\n"
+            "  streamable-http 传输一律要求 Bearer 鉴权；HTTP 服务不设防 = 任何人都能\n"
+            "  用你的酷安登录态查数据。\n"
+            "  设置 COOLAPK_HTTP_TOKEN=<随机长串> 后重试（公网部署请用 Nginx/Caddy\n"
+            "  反代加 TLS，见 README 远程部署章）。仅离线本机调试确需免鉴权时，\n"
+            "  显式设 COOLAPK_ALLOW_ANONYMOUS=1。"
         )
 
     # ---- 图片中转：把酷安 CDN 的防盗链图片转成可公开访问的签名链接 ----
@@ -1041,9 +1308,9 @@ def _build_http_app():
     if public_base and not token:
         logger.warning(
             "COOLAPK_PUBLIC_BASE 已设置但 COOLAPK_HTTP_TOKEN 为空："
-            "/img 将使用开发默认签名密钥，链接可被伪造；请配置随机长 token"
+            "/img 将使用本机随机签名密钥（非硬编码），仍建议配置长 token 以便轮换"
         )
-    img_secret = token or "coolapk-mcp-dev"
+    img_secret = _resolve_img_secret(token)
     state = {"token": token, "public_base": public_base, "img_secret": img_secret}
 
     def _bearer_endpoint(inner_app):
@@ -1051,14 +1318,19 @@ def _build_http_app():
 
         async def _endpoint(scope, receive, send):
             if state["token"]:
-                headers = dict(scope.get("headers") or [])
-                auth = headers.get(b"authorization", b"").decode("latin-1")
-                # RFC 9110：scheme 大小写不敏感；token 用恒定时间比较防时序侧信道
-                scheme, _, cred = auth.partition(" ")
-                expected = f"Bearer {state['token']}".encode()
-                if scheme.lower() != "bearer" or not hmac.compare_digest(
-                    cred.encode(), expected[len(b"Bearer "):]
-                ):
+                # 全程按字节比较：先 decode 成 str 再 encode 会变成 UTF-8 往返，
+                # 非 ASCII token 在标准客户端上恒定 401、在 latin-1 原始字节下反而通过
+                raw_headers = scope.get("headers") or []
+                auth_values = [v for k, v in raw_headers if k.lower() == b"authorization"]
+                if len(auth_values) == 1:
+                    scheme, _, cred = auth_values[0].partition(b" ")
+                    ok = scheme.lower() == b"bearer" and hmac.compare_digest(
+                        cred, state["token"].encode("utf-8")
+                    )
+                else:
+                    # 缺失或重复：重复头会让反代与进程各自取到不同的 Authorization
+                    ok = False
+                if not ok:
                     resp = JSONResponse(
                         {"error": "unauthorized", "detail": "缺少或错误的 Bearer Token"},
                         status_code=401,
@@ -1073,6 +1345,9 @@ def _build_http_app():
     def _health(request):
         # 不暴露任何状态细节，只证明服务活着
         return JSONResponse({"status": "ok"})
+
+    # 图片中转并发闸门（见上方 _img 内注释）
+    img_semaphore = asyncio.Semaphore(4)
 
     def _img_sig(url: str, exp: int) -> str:
         return hmac.new(
@@ -1098,14 +1373,28 @@ def _build_http_app():
             return JSONResponse(
                 {"error": "expired", "detail": "链接已过期，请重新生成"}, status_code=403
             )
+        # 先做格式闸门再比较：hmac.compare_digest 对含非 ASCII 的 str 会抛
+        # TypeError（免鉴权端点可被任意扫描器稳定打成 500），且长度不等时
+        # compare_digest 仍会做完整比较，提前按十六进制形态挡掉更省事
+        if len(sig) != 32 or any(c not in "0123456789abcdef" for c in sig):
+            return JSONResponse(
+                {"error": "bad_signature", "detail": "签名校验失败"}, status_code=403
+            )
+        # 先验签名、再验 host：反过来的话任何人不需要有效签名就能通过
+        # bad_signature/forbidden_host 的差异判断某域名是否在白名单里
+        if not hmac.compare_digest(sig.encode(), _img_sig(url, exp).encode()):
+            return JSONResponse(
+                {"error": "bad_signature", "detail": "签名校验失败"}, status_code=403
+            )
         parsed = urlsplit(url)
         if parsed.scheme not in ("http", "https") or (parsed.hostname or "").lower() not in IMAGE_HOSTS:
             return JSONResponse(
                 {"error": "forbidden_host", "detail": "只允许转发酷安图片域名"}, status_code=403
             )
-        if not hmac.compare_digest(sig, _img_sig(url, exp)):
+        if parsed.port not in (None, 80, 443):
+            # 端口不限制的话，签名持有者可以让服务端对酷安主机任意端口建连
             return JSONResponse(
-                {"error": "bad_signature", "detail": "签名校验失败"}, status_code=403
+                {"error": "forbidden_host", "detail": "只允许 80/443 端口"}, status_code=403
             )
         # 缩略优先：带 @WxH 尺寸后缀的图先试酷安服务端缩略 .m.jpg（大图省约 40% 流量），
         # 上游非 200 自动回落原图；COOLAPK_IMG_THUMBNAIL=0 关闭。
@@ -1116,7 +1405,12 @@ def _build_http_app():
             "Referer": "https://www.coolapk.com/",
         }
         try:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True, trust_env=False) as client:
+            # 共享连接池：此前每张图都新建 AsyncClient，图片墙场景下 TLS 握手是
+            # 主要开销；这里复用进程级 client（关停时由 lifespan 统一关闭）
+            client = image_client()
+            # 免鉴权端点 + 单请求最多缓冲 15MB：不设并发闸门时 20 个并发就能
+            # 占掉 300MB 常驻内存
+            async with img_semaphore:
                 status, body, ctype, err, err_status = await _fetch_upstream_image(
                     client, thumb_url or url, fetch_headers
                 )
@@ -1137,10 +1431,19 @@ def _build_http_app():
                 {"error": "upstream_status", "detail": f"上游返回 {status}"},
                 status_code=502,
             )
-        if not ctype.startswith("image/"):
-            ctype = "image/jpeg"
+        # 只放行四种位图：image/svg+xml 是活文档，同源嵌入时可执行脚本
+        base_ctype = ctype.split(";", 1)[0].strip().lower()
+        if base_ctype not in ("image/jpeg", "image/png", "image/webp", "image/gif"):
+            base_ctype = "image/jpeg"
+        # 缓存寿命跟随签名：固定 86400 会让过期链接被中间层继续供给一天
+        max_age = max(0, exp - int(time.time()))
         return Response(
-            body, media_type=ctype, headers={"Cache-Control": "public, max-age=86400"}
+            body,
+            media_type=base_ctype,
+            headers={
+                "Cache-Control": f"public, max-age={max_age}",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     http_app = mcp.streamable_http_app()
@@ -1157,6 +1460,8 @@ def _build_http_app():
             # HTTP 服务退出/容器重启时释放全局 httpx 连接池，
             # 避免 keep-alive 连接与后台任务悬挂到进程强制结束
             await _reset_client()
+            await _close_retired()
+            await aclose_image_client()
 
     routes = [
         Route("/health", _health, methods=["GET"]),

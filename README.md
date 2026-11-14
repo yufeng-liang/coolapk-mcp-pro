@@ -34,7 +34,7 @@
 
 ## 特性
 
-- **13 个只读工具**：搜索、帖子详情、话题、用户资料、用户动态、首页动态、图片读取、登录状态、搜索联想词、URL 透传、作者画像、作者深挖聚合、图片外链中转
+- **17 个只读工具**：搜索、帖子详情、话题、用户资料、用户动态、首页动态、板块、二手、应用详情、通知、图片读取、登录状态、搜索联想词、URL 透传、作者画像、作者深挖聚合、图片外链中转
 - **风控回落**：帖子详情接口被验证码拦截时自动改从作者动态列表取全文（`fetch_source` 字段标注来源），回复走独立接口
 - **请求节制**：全局限速（相邻请求 ≥1.2 s）、GET 按 TTL 缓存、瞬态错误指数退避重试、验证码端点负缓存冷却
 - **搜索净化**：严格关键词过滤 + 去重 + 疑似广告标记，滤掉酷安搜索混入的不相关结果
@@ -90,19 +90,23 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | - | - | - |
 | `coolapk_search` | 搜索帖子 / 用户 / 话题 / 应用，严格过滤 + 去重 + 广告标记；结果带热度字段 | `keyword`、`type=feed\|user\|feedTopic\|app`、`page`、`strict`、`sort=hot\|reply\|default`（默认 hot，结果质量显著更好） |
 | `coolapk_feed_detail` | 帖子详情 + 回复（风控自动回落）；评论聚焦与金矿挖掘 | `feed_id`、`all_replies`、`comment_keyword`、`comments_focus`（`smart`=楼主补充+热门评论，找工具/资源首选；`author`=只看楼主；`hot`=热门评论；`all`=全部）、`with_history`（正文修改历史）、`expand_sub_replies`（深度展开楼中楼，楼主答疑常在其中）；输出含 `share_url`（带分享码的网页链接，人在浏览器打开可看全文，不耗服务器图片流量） |
-| `coolapk_topic` | 话题详情 / 话题下动态（默认按热度排序） | `tag`、`with_feeds`、`page`、`hot_first`（默认 true） |
+| `coolapk_topic` | 话题详情 / 话题下动态（默认按热度排序）；详情或动态任一路被风控时降级返回，并在 `topic_error` / `feeds_error` 标注原因 | `tag`、`with_feeds`、`page`、`hot_first`（默认 true） |
 | `coolapk_user_profile` | 用户资料 | `uid` |
-| `coolapk_user_feeds` | 用户发布的帖子（支持多页聚合 + 关键词过滤 + 热度排序） | `uid`、`page`、`pages=1-5`、`keyword`、`sort=default\|hot\|latest` |
-| `coolapk_home` | 首页动态 | `tab=recommend\|hot\|latest`、`page` |
+| `coolapk_user_feeds` | 用户发布的帖子（支持多页聚合 + 关键词过滤 + 热度排序；撞页数/预算上限时 `truncated=true` 并用 `next_page` 续抓） | `uid`、`page`、`pages=1-5`、`keyword`、`sort=default\|hot\|latest`、`keyword_mode=any\|all`（生效值回显在同名字段） |
+| `coolapk_home` | 首页/热门/最新动态，返回 `{tab, page, fetched, feeds}` 包装（未知 tab 归 recommend） | `tab=recommend\|hot\|latest`、`page` |
+| `coolapk_board` | 板块动态（21 个板块：数码/二手交易/摄影/问答/酷安头条…），支持板块 id 或中文名，未知板块直接报错并列出可用清单 | `board`（如 `digital` / `手机` / `二手交易`）、`page` |
+| `coolapk_secondhand` | 二手市场动态，可按品牌过滤 | `brand`（品牌 id，0=全部）、`page` |
+| `coolapk_app_detail` | 应用详情（简介、关注数、下载量、版本） | `package_name`（如 `com.coolapk.market`） |
+| `coolapk_notify` | 消息通知：@我的、评论我的、赞我的、关注、私信；可选带未读数 | `ntype=atMeMeFeed\|atComment\|comment\|feedLike\|contactsFollow\|message`、`page`、`with_count` |
 | `coolapk_read_image` | 读取图片消息（带 Referer 下载，解决图片 CDN 直连 567）；默认缩略优先（长边 1080px，省 70~80% 流量，`COOLAPK_IMG_THUMBNAIL=0` 关闭） | 图片 URL |
 | `coolapk_image_link` | 把酷安图片转成可在任意聊天窗口显示的签名 https 链接（仅远程 HTTP 模式，需 `COOLAPK_PUBLIC_BASE`） | `urls`（逗号/空格/换行分隔）、`ttl_minutes`（默认 120） |
 | `coolapk_login_status` | 查询当前登录态与登录方式 | 无 |
 | `coolapk_suggest` | 搜索联想词（把口语化需求改写成酷安习惯用词） | `keyword` |
 | `coolapk_get_url` | 只读 GET 透传（访问上表未覆盖的酷安只读接口）；`COOLAPK_GET_URL_STRICT=1` 时只放行形态像只读的末段（`detail`/`list`/`space` 等） | 接口路径与参数 |
 | `coolapk_author` | 作者画像与权威度评分（`author_tier` / `is_expert` / `fans_per_feed` / `expertise`），判断「这人是不是该领域大佬」 | `uid` |
-| `coolapk_author_digest` | 作者深挖聚合：一次抓多页他的帖子、按主题过滤并按热度排序，拿到完整攻略链 | `uid`、`keyword`、`pages=1-5`（默认 2）、`top`（默认 10） |
+| `coolapk_author_digest` | 作者深挖聚合：一次抓多页他的帖子、按主题过滤并按热度排序，拿到完整攻略链；同样带 `truncated`/`next_page` 续抓 | `uid`、`keyword`、`pages=1-5`（默认 2）、`top`（默认 10）、`keyword_mode=any\|all` |
 
-前 6 个工具基座已实现；`coolapk_read_image` / `coolapk_login_status` / `coolapk_get_url` 为 0.2.0 新增；`coolapk_suggest` 为 0.4.0 新增；`coolapk_author` / `coolapk_author_digest` 为 0.5.0 新增；`coolapk_image_link` 为 0.6.0 新增。
+前 6 个工具基座已实现；`coolapk_read_image` / `coolapk_login_status` / `coolapk_get_url` 为 0.2.0 新增；`coolapk_suggest` 为 0.4.0 新增；`coolapk_author` / `coolapk_author_digest` 为 0.5.0 新增；`coolapk_image_link` 为 0.6.0 新增；`coolapk_board` / `coolapk_secondhand` / `coolapk_app_detail` / `coolapk_notify` 为 0.7.0 新增（此前只能靠 `coolapk_get_url` 手拼路径）。
 
 帖子类结果统一带质量分：`post_score`（点赞 + 评论×3 + 转发×2）与 `discussion_ratio`（评论/点赞），可直接用于排序和判断「这条是干货还是凑数」。
 
@@ -117,7 +121,9 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `auth_expired` | 登录态失效 | 引导用户重登，重试无效 |
 | `risk` | 风控/频率拦截（HTTP 403 + 风控文案） | 等 `retry_after` 秒再试，**不需要重新登录** |
 | `rate_limit` | 服务端限流（HTTP 429） | 按 `retry_after` 等待；太久则放弃本轮 |
-| `network` / `transient` | 超时 / 连接失败 / 5xx | 可重试（`retryable: true`） |
+| `network` / `transient` | 超时 / 连接失败 / 5xx | 可重试（`retryable: true`；重试前的等待会取退避曲线与 `Retry-After` 的较大值） |
+| `config` | 本机配置/凭据不可用（缺登录态、缺 `libauth` blob） | 运行 `coolapk login` 或把酷安 APK 放到 `~/.coolapk-mcp/coolapk.apk` |
+| `internal` | 服务端未预期异常 | 重试无效，把 `error` 文本回给维护者（堆栈只在服务端日志） |
 | `http` | 其他非 2xx 状态码 | 多半是参数或路径问题，重试无效 |
 | `parse` | 响应不是预期 JSON | 多半撞到风控页，换端点或稍后 |
 
@@ -138,6 +144,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `COOLAPK_BROWSER` | 未设 | 指定浏览器可执行文件路径（`coolapk login --web` 用）；不设则自动查找 Chrome / Edge |
 | `COOLAPK_CDP_PORT` | 未设 | 连接已在运行的浏览器调试端口（需该浏览器带 `--remote-debugging-port` 启动）；设置后 `--web` 不再自己拉起浏览器 |
 | `COOLAPK_IMG_THUMBNAIL` | `1` | 图片缩略优先开关（默认开）：`coolapk_read_image` 与 `/img` 中转对带尺寸后缀的图先取酷安服务端缩略 `.m.jpg`（长边约 1080px，仍在多模态模型视觉窗口内，大图省约 70~80% 流量），上游非 200 自动回落原图；设 `0` 关闭 |
+| `COOLAPK_IMG_SECRET` | 未设 | `/img` 中转与 `coolapk_image_link` 的 HMAC 签名密钥。不设时随机生成并持久化到 `~/.coolapk-mcp/img_secret`（POSIX 权限 600）；**不复用** `COOLAPK_HTTP_TOKEN`，也不再有硬编码默认值 |
 | `COOLAPK_PUBLIC_BASE` | 未设 | 远程 HTTP 模式下的对外访问前缀（如 `https://mcp.example.com`）。设置后 `coolapk_image_link` 才能生成图片外链，`/img` 中转也随之生效 |
 
 数据文件（自动生成，勿提交仓库）：`~/.coolapk-mcp/config.json`（设备码与登录态）、`~/.coolapk-mcp/uid_index.json`（feed_id → 作者 uid 索引，供详情回落）。
@@ -211,15 +218,16 @@ export COOLAPK_HTTP_TOKEN=<上一步生成的随机串>
 | 变量 | 默认 | 说明 |
 | - | - | - |
 | `COOLAPK_MCP_TRANSPORT` | `stdio` | 传输形态：`streamable-http`（别名 `http` / `streamable_http` 等效）启用远程 HTTP 服务；不设或设 `stdio` 即本地形态 |
-| `COOLAPK_HTTP_HOST` | `127.0.0.1` | HTTP 监听地址。绑 `0.0.0.0` 等非回环地址时**必须**同时设置 `COOLAPK_HTTP_TOKEN`，否则服务拒绝启动 |
+| `COOLAPK_HTTP_HOST` | `127.0.0.1` | HTTP 监听地址。**无论绑哪个地址**，未设 `COOLAPK_HTTP_TOKEN` 都会拒绝启动（见下方「安全」） |
 | `COOLAPK_HTTP_PORT` | `8000` | HTTP 监听端口 |
 | `COOLAPK_HTTP_TOKEN` | 空 | Bearer Token。客户端请求须带 `Authorization: Bearer <token>`；校验失败返回 401 |
+| `COOLAPK_ALLOW_ANONYMOUS` | 空 | 仅在**内网联调**时设为 `1`：允许无 token 启动（回环地址也一样）。生产不要开——开了等于 `/mcp` 完全无鉴权，叠加已关闭的 DNS rebinding 防护，本机任意网页都能打进来 |
 
 > **uvicorn workers 必须为 1**：服务内部以单进程方式启动 uvicorn（`uvicorn.Config(...)` 未设 `workers` 参数）。请勿自行用 `--workers N` 多进程拉起——全局限速（`COOLAPK_MIN_INTERVAL`）、GET 缓存与验证码负缓存都是**进程内状态**，多进程互不共享：限速被 worker 数稀释、缓存命中率下降、验证码冷却互不感知，风控风险成倍上升。需要扩容时按「一台服务器一个实例」拆分部署，不要在同一实例上开多进程。
 
 ### 安全
 
-- **强制 Bearer Token**：绑非回环地址而未设 `COOLAPK_HTTP_TOKEN` 时服务直接拒绝启动；token 用随机长串（生成命令见快速启动），不要用可猜的短串。
+- **强制 Bearer Token**：未设 `COOLAPK_HTTP_TOKEN` 时服务直接拒绝启动——**回环地址也不例外**。旧版只对非回环拒绝，而「127.0.0.1 + 反代」正是本文推荐的拓扑，等于公网可达却零鉴权。确实要做无鉴权的内网联调，显式设 `COOLAPK_ALLOW_ANONYMOUS=1`。token 用随机长串（生成命令见快速启动），不要用可猜的短串。
 - **必须走 TLS**：Bearer Token 是明文凭据，裸 HTTP 公网传输会被中间人截获。请勿把 `8000` 端口直接暴露公网，务必套一层 TLS 反向代理（Nginx 或 Caddy 示例如下），并在防火墙 / 云安全组里关闭直连端口。
 - **Host 校验（DNS rebinding 防护）已关闭**：FastMCP 自带的 DNS rebinding 防护按 Host 头白名单拦截请求，远程部署常态的「公网 IP 直连」会被其误判 421 拒绝，因此本服务显式关闭了该层（`enable_dns_rebinding_protection=False`）。此取舍以 Bearer Token 鉴权强制生效为前提——公网部署务必配置 `COOLAPK_HTTP_TOKEN` 并走 TLS 反代。
 - Nginx 反代示例（假设已有 `your-domain` 的证书配置）：
@@ -283,11 +291,13 @@ docker build -t coolapk-mcp .
 docker run -d --name coolapk-mcp \
   -p 127.0.0.1:8000:8000 \
   -e COOLAPK_HTTP_TOKEN=<你的随机长串> \
-  -v ~/.coolapk-mcp:/root/.coolapk-mcp \
+  -v ~/.coolapk-mcp:/home/coolapk/.coolapk-mcp \
   coolapk-mcp
 ```
 
 `-e` 只需覆盖 `COOLAPK_HTTP_TOKEN`（传输形态与监听地址已内置默认值）；`-v` 挂载持久化目录后，设备码、登录态与 `auth_blob.bin` 重启容器不丢。同样建议只映射到 `127.0.0.1`，交给 TLS 反代对外。
+
+容器以非 root 用户 `coolapk`（uid `10001`）运行，持久化目录是 `/home/coolapk/.coolapk-mcp`（即上面的挂载点）；挂载宿主机目录前先确认宿主机侧对该 uid 可写，例如 `sudo chown -R 10001 ~/.coolapk-mcp`。
 
 > **不传 token 容器会「启动即退出」——这是预期的 fail-closed 行为，不是故障**：镜像默认监听 `0.0.0.0`（非回环地址），服务端规定「绑非回环地址必须设置 `COOLAPK_HTTP_TOKEN`」，缺 token 时进程打印「拒绝启动」提示并以非零码退出（`docker logs coolapk-mcp` 可见原因）。这是防止登录态裸奔公网的保护逻辑，补上 `-e COOLAPK_HTTP_TOKEN=<随机长串>` 重新 `docker run` 即可。
 
@@ -361,7 +371,7 @@ Environment=COOLAPK_PUBLIC_BASE=https://mcp.example.com
 
 设计要点：
 
-- **签名防滥用**：链接带 `exp`（过期时间戳）与 `sig`（HMAC-SHA256，密钥取 `COOLAPK_HTTP_TOKEN`），任何拿到链接的人都能取图，但改不动参数、也访问不了别的域名——`/img` 只接受 `image.coolapk.com`、`avatar.coolapk.com`、`static.coolapk.com` 三个域名，不接受任意 URL。
+- **签名防滥用**：链接带 `exp`（过期时间戳）与 `sig`（HMAC-SHA256，密钥取 `COOLAPK_IMG_SECRET`，未设则随机生成并持久化到 `~/.coolapk-mcp/img_secret`，**不再复用** `COOLAPK_HTTP_TOKEN`——避免一次签名泄露连带 Bearer 凭据），任何拿到链接的人都能取图，但改不动参数、也访问不了别的域名——`/img` 只接受 `image.coolapk.com`、`avatar.coolapk.com`、`static.coolapk.com` 三个域名与 80/443 端口，且在**发起任何网络动作之前**完成校验，跟随重定向后再复检最终 host。
 - **默认有效期 120 分钟**，单次最长 7 天；图片在服务端不做落盘，取到即转发。
 - 只影响图片显示，`/img` 免 Bearer 鉴权（否则 `<img>` 标签加载不了），安全边界完全靠签名与域名白名单。
 - 本地 stdio 模式没有对外地址，不生成外链，直接用 `coolapk_read_image` 返回图片即可。
@@ -377,6 +387,24 @@ Environment=COOLAPK_PUBLIC_BASE=https://mcp.example.com
 具体命令与两步验证流程见上文[登录（四通道）](#登录四通道)一节，blob 获取方式见[安装](#安装)一节的前置说明——两者在服务器上同样适用，不赘述。
 
 > ⚠️ **风控提示**：多端 / 多人共享同一部署时，所有请求都从服务器出口 IP 发出，且共用同一设备码——对酷安侧表现为**同一设备高频调用**，比单机 stdio 更容易触发风控。好在缓存与全局限速（默认开启，`COOLAPK_MIN_INTERVAL` / `COOLAPK_NO_CACHE` 可调）会兜底；如出现 `captcha` 风控回落，优先降低多端调用频率，详见[故障排查](#故障排查)。
+
+## 开发与测试
+
+本地开发装齐工具链（版本与 CI 完全一致）：
+
+```bash
+python -m pip install -e ".[dev]"     # 或 pip install -e . -r requirements-dev.txt（转发到同一份依赖）
+ruff check .                          # 静态检查
+mypy                                  # 类型检查（配置在 pyproject [tool.mypy]）
+pytest -q                             # 单元测试
+pytest -q --cov=coolapk_mcp           # 带覆盖率（只打印不设门槛，用来盯 /img、cli 这些盲区）
+```
+
+- 测试覆盖模型解析、白名单裁剪、限速/分桶/退避、缓存键与单飞、预算截断、HTTP 图片中转、配置与板块映射等；`pytest -q` 应全绿。
+- `tests/manual/regression_probe.py` 是零真实网络的离线回归探针（99 项断言），不进 CI，改协议/解析逻辑后可手动跑一遍做冒烟。
+- 覆盖率当前基线约 56%：`client.py` 55%、`server.py` 77%，`cli.py` 与 `browser_login.py` 仍在低位，属于优先补测区。
+- 测试不依赖本机登录态：`conftest.py` 默认把 `generate_token_v3` 打桩成假 token，并把 `~/.coolapk-mcp` 下所有导入期路径常量重定向到临时目录，跑测试不会碰真实 `config.json` / `img_secret` / `auth_blob`。
+- CI（`.github/workflows/ci.yml`）在 Python 3.10 / 3.12 / 3.14 上执行 ruff + mypy + pytest（带覆盖率）+ `coolapk --help` + compileall。
 
 ## 故障排查
 
@@ -406,7 +434,7 @@ Environment=COOLAPK_PUBLIC_BASE=https://mcp.example.com
 （仓库根）
 ├── pyproject.toml
 ├── coolapk_mcp/
-│   ├── server.py       # MCP 服务与 13 个工具
+│   ├── server.py       # MCP 服务与 17 个工具
 │   ├── cli.py          # coolapk 命令行（搜索 / 详情 / login 等）
 │   ├── client.py       # API 客户端（风控回落、全量评论检索）
 │   ├── browser_login.py  # --web 网页登录：系统浏览器 CDP 抓 Cookie（回退 pywebview）

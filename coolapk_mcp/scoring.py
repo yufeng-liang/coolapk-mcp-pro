@@ -34,7 +34,7 @@ def _as_int(value: object) -> int:
     if value is None or value == "":
         return 0
     try:
-        return int(value)
+        return int(str(value))
     except (TypeError, ValueError):
         try:
             return int(float(str(value)))

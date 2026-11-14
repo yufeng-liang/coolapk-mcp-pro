@@ -45,6 +45,10 @@ coolapk_topic         刷话题：with_feeds=true 默认热度排序，前排即
 coolapk_feed_detail   读帖：拿正文与回复；找工具/资源首选 comments_focus=smart（楼主补充+热评+links 链接字段）
 coolapk_read_image    看关键截图：教程帖的步骤截图、模块配置截图（image.coolapk.com 直连 567，必须走此工具）
 coolapk_image_link    客户端显示不了 base64 图片时（如手机语音助手），把图片转成签名 https 外链；仅远程 HTTP 模式可用
+coolapk_board         按板块刷（digital/手机/摄影/问答/二手… 共 21 个），比话题更贴近栏目编辑口味
+coolapk_secondhand   二手市场，可按品牌过滤
+coolapk_app_detail   应用详情（简介/关注数/下载量/版本），判断工具是否还在维护
+coolapk_notify       看 @/评论/点赞/关注/私信（需要「我关注的人有没有回我」时用）
 ```
 
 要点：

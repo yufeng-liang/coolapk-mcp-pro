@@ -69,7 +69,7 @@ def _extract_pics(pic_arr: list[str] | str) -> list[str]:
         try:
             pic_arr = json.loads(pic_arr)
         except (json.JSONDecodeError, TypeError):
-            return [pic_arr] if pic_arr else []
+            return [str(pic_arr)] if pic_arr else []
     if isinstance(pic_arr, list):
         return [p for p in pic_arr if isinstance(p, str) and p]
     return []
@@ -511,12 +511,24 @@ _TOOL_FIELDS: dict[str, tuple[str, ...]] = {
                "author_tier", "author_tier_label", "is_expert",
                "fans_per_feed", "expertise"),
     # 作者领域聚合：作者画像 + 过滤后的高赞帖列表
-    "author_digest": ("uid", "username", "author", "keyword", "pages",
+    "author_digest": ("uid", "username", "author", "keyword", "keyword_mode", "pages",
                       "fetched", "matched", "truncated", "next_page", "posts"),
 
     "home": _FEED_FIELDS,
     "topic": ("id", "title", "tag", "follow_num", "comment_num", "description"),
     "topic_feeds": _FEED_FIELDS,
+    # 板块 / 二手：与 home 同构的包装（feeds 走动态白名单，元字段单独保留）
+    "board": _FEED_FIELDS,
+    "secondhand": _FEED_FIELDS,
+    # 应用详情：AppModel dump 后的字段名（camelCase 由 pydantic 字段名决定）
+    # 键名对齐 AppModel.model_dump()（snake_case，未走 alias）
+    "app_detail": ("id", "title", "package_name", "description",
+                   "follow_num", "download_num", "version"),
+    # 通知：各类型（@我的、评论、点赞、关注、私信）共用一套宽松键名，
+    # 具体哪些键出现取决于通知类型，缺的就不输出
+    "notification": ("id", "uid", "username", "message", "dateline", "title",
+                     "content", "feed_id", "reply_id", "is_read", "pic", "ukey",
+                     "entity_type", "url", "target_url"),
 }
 # get_url 透传响应里必须剔除的敏感字段（递归匹配，键名小写比较）；
 # 键名含敏感词也算（accessToken/sessionId/userToken 等变体），config 可能
@@ -528,8 +540,16 @@ _GET_URL_SENSITIVE_SUBSTR = ("token", "session", "cookie", "sessid", "passwd", "
 
 # user_feeds 新版包装结构的元数据字段（feeds 列表单独按动态白名单裁剪）
 _USER_FEEDS_META = (
-    "uid", "pages", "fetched", "matched", "sort", "keyword", "truncated", "next_page",
+    "uid", "pages", "fetched", "matched", "sort", "keyword", "keyword_mode",
+    "truncated", "next_page",
 )
+# home 包装结构的元字段（feeds 单独按动态白名单裁剪）
+_HOME_META = ("tab", "page", "fetched")
+# 板块 / 二手包装的元字段
+_BOARD_META = ("board", "page", "fetched")
+_SECONDHAND_META = ("brand", "page", "fetched")
+# 通知包装的元字段（items 单独按通知白名单裁剪）
+_NOTIFY_META = ("ntype", "page", "fetched", "counts")
 
 
 def _apply_whitelist(obj: Any, fields: tuple[str, ...]) -> Any:
@@ -548,7 +568,7 @@ def _prune_list(items: Any, fields: tuple[str, ...]) -> list[Any]:
     """按白名单裁剪动态/评论列表，丢弃裁剪后为空的占位条目（酷安列表
     常混广告位/空位条目，留着只会输出 {} 噪声）。"""
     if not isinstance(items, list):
-        return items  # type: ignore[return-value]
+        return items
     pruned = [_apply_whitelist(v, fields) for v in items]
     return [v for v in pruned if not (isinstance(v, dict) and not v)]
 
@@ -610,22 +630,49 @@ def apply_tool_whitelist(tool: str, data: Any) -> Any:
         return data
 
     if tool == "home":
+        # {"tab","page","fetched","feeds":[...]} 包装结构；纯 list 保持兼容
+        if isinstance(data, dict) and "feeds" in data:
+            out = {k: data[k] for k in _HOME_META if k in data}
+            out["feeds"] = _prune_list(data["feeds"], _TOOL_FIELDS["home"])
+            return out
         return _prune_list(data, _TOOL_FIELDS["home"])
+
+    if tool == "board" or tool == "secondhand":
+        meta = _BOARD_META if tool == "board" else _SECONDHAND_META
+        if isinstance(data, dict) and "feeds" in data:
+            out = {k: data[k] for k in meta if k in data}
+            out["feeds"] = _prune_list(data["feeds"], _TOOL_FIELDS[tool])
+            return out
+        return _prune_list(data, _TOOL_FIELDS[tool])
+
+    if tool == "app_detail":
+        return _apply_whitelist(data, _TOOL_FIELDS["app_detail"])
+
+    if tool == "notification":
+        if isinstance(data, dict) and "items" in data:
+            out = {k: data[k] for k in _NOTIFY_META if k in data}
+            out["items"] = _prune_list(data["items"], _TOOL_FIELDS["notification"])
+            return out
+        return _prune_list(data, _TOOL_FIELDS["notification"])
 
     if tool == "topic_feeds":
         return _prune_list(data, _TOOL_FIELDS["topic_feeds"])
 
     if tool == "topic":
-        # server 传入 {"topic": {...}, "feeds": [...]} 包装结构，分别裁剪
-        if isinstance(data, dict) and ("topic" in data or "feeds" in data):
-            out: dict[str, Any] = {}
+        # server 传入 {"topic": {...}, "feeds": [...], "topic_error"/"feeds_error"}：
+        # 详情与动态各自可空，错误字段必须透传，否则 agent 看不出是「没有」还是「取不到」
+        if isinstance(data, dict) and ("topic" in data or "feeds" in data or "topic_error" in data):
+            wrapped: dict[str, Any] = {}
+            for key in ("topic_error", "feeds_error"):
+                if data.get(key):
+                    wrapped[key] = data[key]
             topic = data.get("topic")
             if isinstance(topic, dict):
-                out["topic"] = _apply_whitelist(topic, _TOOL_FIELDS["topic"])
+                wrapped["topic"] = _apply_whitelist(topic, _TOOL_FIELDS["topic"])
             feeds = data.get("feeds")
             if feeds is not None:
-                out["feeds"] = _prune_list(feeds, _TOOL_FIELDS["topic_feeds"])
-            return out
+                wrapped["feeds"] = _prune_list(feeds, _TOOL_FIELDS["topic_feeds"])
+            return wrapped
         out = _apply_whitelist(data, _TOOL_FIELDS["topic"])
         feeds = data.get("feeds") if isinstance(data, dict) else None
         if feeds is not None:

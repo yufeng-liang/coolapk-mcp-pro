@@ -11,9 +11,12 @@ from urllib.parse import unquote
 import click
 
 from coolapk_mcp.boards import BOARD_URLS
+from coolapk_mcp.budget import Budget, BudgetExceeded
 from coolapk_mcp.client import CoolapkClient, CoolapkError
 from coolapk_mcp.config import AppConfig, has_valid_sessid, parse_cookie_str
 from coolapk_mcp.models import (
+    _format_time,
+    _strip_html,
     FeedDetail,
     FeedModel,
     ReplyModel,
@@ -43,10 +46,13 @@ def _output(data):
 
 def _output_error(err: CoolapkError):
     """错误输出（error_type 供调用方区分 captcha/网络/业务错误，避免盲目重试）"""
-    click.echo(json.dumps(
-        {"error": err.message, "code": err.error_code, "error_type": err.kind},
-        ensure_ascii=False,
-    ))
+    payload = {"error": err.message, "code": err.error_code, "error_type": err.kind}
+    # 与服务端同口径：等多久、能不能原样重试，CLI 用户同样需要
+    if err.retry_after is not None:
+        payload["retry_after"] = round(float(err.retry_after), 1)
+    if err.retryable:
+        payload["retryable"] = True
+    click.echo(json.dumps(payload, ensure_ascii=False))
     sys.exit(1)
 
 
@@ -169,13 +175,25 @@ async def secondhand(brand, page):
               help="拉全部一级评论（自动翻页，含内联楼中楼）")
 @click.option("--grep", "comment_keyword", default=None,
               help="按关键词检索评论/楼中楼（隐含 --all-replies；空格分隔多词=任一命中）")
+@click.option("--focus", "comments_focus", default="default",
+              type=click.Choice(["default", "smart", "author", "hot", "all"]),
+              help="评论聚焦：smart(楼主回复+热门)/author(仅楼主)/hot(仅热门)")
+@click.option("--history", "with_history", is_flag=True, help="附带正文修改历史")
+@click.option("--expand-sub-replies", is_flag=True,
+              help="深度展开楼中楼（每条父评论最多补 3 页，有预算上限）")
 @async_command
-async def feed(feed_id, replies, reply_page, feed_type, author_uid, all_replies, comment_keyword):
+async def feed(feed_id, replies, reply_page, feed_type, author_uid, all_replies,
+               comment_keyword, comments_focus, with_history, expand_sub_replies):
     """动态详情（详情接口被验证码拦截时自动从作者动态列表回落）"""
+    from coolapk_mcp.focus import collect_focus
+
+    focus = comments_focus
+    if focus == "all":
+        all_replies = True
     async with CoolapkClient() as client:
         smart = await client.get_feed_detail_smart(
             feed_id, author_uid=author_uid,
-            with_replies=replies or bool(comment_keyword),
+            with_replies=replies or bool(comment_keyword) or focus in ("smart", "author", "hot"),
             reply_page=reply_page,
             all_replies=all_replies or bool(comment_keyword),
         )
@@ -184,10 +202,57 @@ async def feed(feed_id, replies, reply_page, feed_type, author_uid, all_replies,
             smart["replies"] if isinstance(smart["replies"], list) else None,
             fetch_source=smart["source"],
         )
+        raw_replies = smart.get("replies")
+        if raw_replies is not None:
+            detail.replies_truncated = bool(getattr(raw_replies, "truncated", False))
+            detail.replies_next_page = getattr(raw_replies, "next_page", None)
+        if focus in ("smart", "author", "hot"):
+            merged, meta = await collect_focus(client, feed_id, focus)
+            if meta is not None:
+                meta["total_replynum"] = smart["data"].get("replynum") or 0
+                detail.comments_focus = meta
+            if merged:
+                detail.replies = [ReplyModel.from_api(r) for r in merged]
+        if with_history:
+            try:
+                hist = await client.get_feed_history(feed_id)
+            except CoolapkError:
+                hist = []
+            if isinstance(hist, list):
+                detail.edit_history = [
+                    {
+                        "id": h.get("id", 0),
+                        "content": _strip_html(h.get("message", "")),
+                        "dateline": _format_time(h.get("lastupdate", 0)),
+                    }
+                    for h in hist
+                    if isinstance(h, dict)
+                ]
+        if expand_sub_replies and detail.replies:
+            budget = Budget(max_requests=24, deadline=20.0)
+            for i, r in enumerate(detail.replies[:12]):
+                need = (r.reply_count or 0) - len(r.sub_replies or [])
+                if need <= 0:
+                    continue
+                try:
+                    subs = await client.get_sub_replies_paged(r.id, 1, max_pages=3, budget=budget)
+                except (BudgetExceeded, CoolapkError):
+                    break
+                if getattr(subs, "truncated", False):
+                    detail.sub_replies_truncated = True
+                if subs:
+                    detail.replies[i].sub_replies = [ReplyModel.from_api(sr) for sr in subs]
+                    detail.sub_replies_expanded = (detail.sub_replies_expanded or 0) + len(subs)
     data = _dump(detail)
     if comment_keyword:
         from coolapk_mcp import postfilter
         data = postfilter.filter_comments(data, comment_keyword)
+        if detail.replies_truncated:
+            # 与服务端同源：不标出来会被误读成「关键词只命中这些」
+            stats = data.setdefault("comment_search", {})
+            stats["truncated"] = True
+            if detail.replies_next_page is not None:
+                stats["next_page"] = detail.replies_next_page
     _output(data)
 
 
@@ -202,13 +267,16 @@ async def feed(feed_id, replies, reply_page, feed_type, author_uid, all_replies,
 @click.option("--strict/--no-strict", default=True,
               help="严格关键词过滤（默认开）：归一化后每个关键词都需命中标题/正文/作者名")
 @click.option("--meta", is_flag=True, help="输出过滤统计信息（默认只输出结果列表）")
+@click.option("--sort", default="hot",
+              type=click.Choice(["hot", "reply", "default"]),
+              help="帖子排序（hot 高赞优先，推荐）")
 @async_command
-async def search(keyword, search_type, page, strict, meta):
+async def search(keyword, search_type, page, strict, meta, sort):
     """搜索内容（自动去重 + 严格过滤 + 疑似广告标记）"""
     from coolapk_mcp import postfilter
 
     async with CoolapkClient() as client:
-        raw = await client.search(keyword, search_type, page)
+        raw = await client.search(keyword, search_type, page, sort=sort)
     if not isinstance(raw, list):
         _output(raw)
         return
@@ -375,8 +443,10 @@ def _run_pywebview_login() -> str | None:
         width=480,
         height=760,
     )
+    if window is None:
+        raise RuntimeError("创建登录窗口失败（pywebview 未初始化）")
     window.events.closed += lambda _w=None: result.update(closed=True)
-    webview.start(poll, window)
+    webview.start(poll, (window,))
     return result["cookie_str"] or None
 
 
@@ -606,6 +676,14 @@ def _extract_cookie_from_adb() -> str | None:
         if xml:
             break
     else:
+        if last_error is not None:
+            # 别静默返回 None：adb 缺失 / 手机没连 / 未 root 三种最常见的失败
+            # 都只会走到这里，用户拿不到任何线索
+            click.echo(
+                f"ADB 提取失败：{type(last_error).__name__}: {last_error}\n"
+                "请确认：① adb 在 PATH 中；② 手机已连接并授权 USB 调试；③ 酷安已登录且手机已 root",
+                err=True,
+            )
         return None
 
     if not xml:

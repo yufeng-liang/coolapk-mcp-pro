@@ -213,7 +213,14 @@ class AppConfig:
             indent=2,
         )
         tmp = CONFIG_FILE.with_suffix(".json.tmp")
-        tmp.write_text(payload, encoding="utf-8")
+        if os.name == "posix":
+            # 先按 0600 建文件再写：write_text 沿用 umask（常见 022 → 0644），
+            # 在下面的 chmod 之前存在一段「token/SESSID 全局可读」的窗口
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+        else:
+            tmp.write_text(payload, encoding="utf-8")
         os.replace(tmp, CONFIG_FILE)
         # POSIX：配置里有 uid/token/完整 Cookie，收紧成仅本人可读写；
         # Windows 没有该权限位（os.chmod 只能改只读位），失败一律忽略

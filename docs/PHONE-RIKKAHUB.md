@@ -81,7 +81,7 @@ RikkaHub 的 MCP 页面右上角有导入按钮，**支持标准 `mcpServers` JS
 | **服务器地址** | `https://<你的域名>/mcp` |
 | **自定义请求头** | 名称 `Authorization`，值 `Bearer <TOKEN>` |
 
-「工具」标签页里能看到 13 个工具（`coolapk_search`、`coolapk_feed_detail`、`coolapk_topic`、`coolapk_author`、`coolapk_author_digest`、`coolapk_suggest`、`coolapk_user_profile`、`coolapk_user_feeds`、`coolapk_home`、`coolapk_login_status`、`coolapk_read_image`、`coolapk_image_link`、`coolapk_get_url`），可以按需关掉不想暴露给模型的。
+「工具」标签页里能看到 17 个工具（`coolapk_search`、`coolapk_feed_detail`、`coolapk_topic`、`coolapk_board`、`coolapk_secondhand`、`coolapk_app_detail`、`coolapk_notify`、`coolapk_author`、`coolapk_author_digest`、`coolapk_suggest`、`coolapk_user_profile`、`coolapk_user_feeds`、`coolapk_home`、`coolapk_login_status`、`coolapk_read_image`、`coolapk_image_link`、`coolapk_get_url`），可以按需关掉不想暴露给模型的。
 
 ---
 

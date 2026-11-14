@@ -48,3 +48,36 @@ def isolated_uid_index(tmp_path, monkeypatch):
     index_file = tmp_path / "uid_index.json"
     monkeypatch.setattr(CoolapkClient, "INDEX_FILE", index_file)
     return index_file
+
+@pytest.fixture(autouse=True)
+def isolated_import_time_paths(tmp_path, monkeypatch):
+    """隔离"导入时就固化"的路径常量
+
+    server.IMG_SECRET_FILE、libauth.BLOB_CACHE_FILE / APK_CACHE_FILE、
+config.DESKTOP_CONFIG_DIR 都在 import 那一刻算好，isolated_config 之后再改
+CONFIG_DIR 也带不动它们。此前靠各用例自行 patch，漏一处就会写进开发者真实的
+~/.coolapk-mcp（img_secret、auth_blob 被踩掉后线上签名直接失效）。
+    """
+    from coolapk_mcp import config, server
+    from coolapk_mcp.auth import libauth
+
+    # 用独立子目录：isolated_config 会占 tmp_path/.coolapk-mcp
+    home = tmp_path / "import-time-home" / ".coolapk-mcp"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(server, "IMG_SECRET_FILE", home / "img_secret")
+    monkeypatch.setattr(libauth, "BLOB_CACHE_FILE", home / "auth_blob.bin")
+    monkeypatch.setattr(libauth, "APK_CACHE_FILE", home / "coolapk.apk")
+    monkeypatch.setattr(config, "DESKTOP_CONFIG_DIR", tmp_path / "desktop")
+    return home
+
+@pytest.fixture(autouse=True)
+def stub_app_token(monkeypatch):
+    """默认给一个假 X-App-Token：测试不再依赖本机 auth_blob/APK
+
+    真实签名每次约 60ms 纯 CPU（bcrypt），且要求开发者本机有 libauth blob——
+    这曾让整套测试只在装了登录态的机器上变绿。需要走 blob 缺失报错路径的用例
+    自己 monkeypatch 回会抛异常的 generate_token_v3 即可覆盖本夹具。
+    """
+    from coolapk_mcp import client as client_mod
+
+    monkeypatch.setattr(client_mod, "generate_token_v3", lambda device_code: ("v3-test-token", 0))

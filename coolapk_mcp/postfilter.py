@@ -144,7 +144,7 @@ def convert_search_items(items: list[dict]) -> list[dict]:
     results: list[dict] = []
     for item in items:
         et = item.get("entityType", "")
-        model = None
+        model: Any = None
         if et == "feed":
             model = FeedModel.from_api(item)
         elif et == "user":

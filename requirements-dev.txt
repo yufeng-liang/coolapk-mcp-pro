@@ -1,0 +1,5 @@
+# 开发工具链的唯一真源是 pyproject.toml 的 [project.optional-dependencies].dev
+# （pytest / pytest-asyncio / ruff / mypy 都在那里带精确版本）。
+# 这里只做转发，避免两份锁定各自漂移。
+# 用法：pip install -e . -r requirements-dev.txt
+-e .[dev]

@@ -1,17 +1,23 @@
 name: CI
 
-# push 与 PR 都触发；matrix 覆盖声明的最低版本 3.10 与较新的 3.12
+# push 与 PR 都触发；matrix 覆盖声明的最低版本 3.10、常用的 3.12 与本地实测的 3.14
 on:
   push:
   pull_request:
 
+# 同一分支的旧运行直接取消：push 风暴时别占满 runner 还发一堆过期通知
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
 
@@ -29,8 +35,16 @@ jobs:
       - name: Ruff 静态检查
         run: ruff check .
 
-      - name: Pytest 单元测试
-        run: pytest -q
+      - name: Mypy 类型检查
+        run: mypy
+
+      - name: Pytest 单元测试 + 覆盖率
+        # pyproject 的 addopts 已带 -q，这里再传 -q 会叠成 -qq 把通过数一起吞掉。
+        # 覆盖率只打印不卡门槛（先在 PR 日志里暴露 /img、CLI、热加载等盲区）
+        run: pytest -q -o addopts="" -rs --cov=coolapk_mcp --cov-report=term-missing:skip-covered
+
+      - name: CLI 冒烟（入口点装配是否完好）
+        run: coolapk --help > /dev/null
 
       - name: 字节码编译检查（语法级冒烟）
         run: python -m compileall -q coolapk_mcp

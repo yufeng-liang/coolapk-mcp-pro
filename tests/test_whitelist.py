@@ -10,6 +10,44 @@ from coolapk_mcp.models import apply_tool_whitelist
 
 
 # ---------------------------------------------------------------------------
+# home / topic：包装结构裁剪，元字段保留、错误字段透传
+# ---------------------------------------------------------------------------
+
+
+def test_home_wrapper_keeps_meta_and_prunes_feeds() -> None:
+    data = {
+        "tab": "hot",
+        "page": 1,
+        "fetched": 1,
+        "businessInfo": "推广位",
+        "feeds": [{"id": 7, "content": "正文", "template": "card", "username": "u"}],
+    }
+
+    out = apply_tool_whitelist("home", data)
+
+    assert out["tab"] == "hot" and out["page"] == 1 and out["fetched"] == 1
+    assert "businessInfo" not in out
+    assert set(out["feeds"][0]) == {"id", "content", "username"}
+
+
+def test_home_plain_list_still_supported() -> None:
+    out = apply_tool_whitelist("home", [{"id": 1, "content": "x", "template": "card"}])
+    assert out == [{"id": 1, "content": "x"}]
+
+
+def test_topic_error_fields_pass_through() -> None:
+    data = {
+        "topic_error": "验证码",
+        "feeds": [{"id": 2, "content": "y", "template": "card"}],
+    }
+
+    out = apply_tool_whitelist("topic", data)
+
+    assert out["topic_error"] == "验证码"
+    assert out["feeds"] == [{"id": 2, "content": "y"}]
+
+
+# ---------------------------------------------------------------------------
 # feed_detail：顶层用动态白名单，replies 树递归用评论白名单
 # ---------------------------------------------------------------------------
 
@@ -223,3 +261,61 @@ def test_unknown_tool_and_none_pass_through() -> None:
     # feed_detail 传入非 dict（例如直接给了 list）时不做结构假设
     raw = [{"id": 1, "junk": "x"}]
     assert apply_tool_whitelist("feed_detail", raw) is raw
+
+
+def test_board_wrapper_keeps_meta_and_prunes_feeds() -> None:
+    """board 包装结构：元信息保留，动态逐条裁剪"""
+    payload = {
+        "board": "digital",
+        "page": 2,
+        "fetched": 1,
+        "feeds": [{"id": 1, "title": "t", "content": "c", "template": "card"}],
+    }
+
+    out = apply_tool_whitelist("board", payload)
+
+    assert (out["board"], out["page"], out["fetched"]) == ("digital", 2, 1)
+    assert out["feeds"][0]["id"] == 1 and "template" not in out["feeds"][0]
+
+
+def test_secondhand_plain_list_supported() -> None:
+    out = apply_tool_whitelist("secondhand", [{"id": 3, "content": "出", "junk": 1}])
+
+    assert out == [{k: v for k, v in _out_first()}]
+
+
+def _out_first():
+    return {"id": 3, "content": "出"}.items()
+
+
+def test_app_detail_prunes_alias_keys() -> None:
+    """app_detail 白名单用 model_dump 的 snake_case 键名"""
+    payload = {
+        "id": 9,
+        "title": "酷安",
+        "package_name": "com.coolapk.market",
+        "follow_num": 1,
+        "junk": "x",
+    }
+
+    out = apply_tool_whitelist("app_detail", payload)
+
+    assert out == {
+        "id": 9,
+        "title": "酷安",
+        "package_name": "com.coolapk.market",
+        "follow_num": 1,
+    }
+
+
+def test_notification_wrapper_and_plain_list() -> None:
+    item = {"id": 1, "message": "hi", "dateline": "2023-11-15T06:13+08:00", "junk": "x"}
+
+    wrapped = apply_tool_whitelist(
+        "notification", {"ntype": "message", "page": 1, "fetched": 1, "items": [item], "counts": {"m": 2}}
+    )
+    assert wrapped["ntype"] == "message" and wrapped["counts"] == {"m": 2}
+    assert wrapped["items"] == [{"id": 1, "message": "hi", "dateline": "2023-11-15T06:13+08:00"}]
+
+    plain = apply_tool_whitelist("notification", [item])
+    assert plain == wrapped["items"]

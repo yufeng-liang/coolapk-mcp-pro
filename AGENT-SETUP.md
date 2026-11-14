@@ -2,7 +2,7 @@
 
 > **读者是 AI agent**：如果你是运行在某个 harness / MCP 客户端里的 AI，正在帮用户安装并接入 coolapk-mcp-pro，本文就是写给你的。按步骤执行，读完即可一步步装好、跑通、验收。
 >
-> 本文基于 **v0.6.1**（`tools/list` 应恰好返回 **13 个工具**）。工具数量以 `tools/list` 实际返回为准；行为细节以 `coolapk_mcp/` 源码为准。
+> 本文基于 **v0.7.0（未发布）**（`tools/list` 应恰好返回 **17 个工具**）。工具数量以 `tools/list` 实际返回为准；行为细节以 `coolapk_mcp/` 源码为准。
 
 ---
 
@@ -405,7 +405,7 @@ server {
 
 | # | 验收项 | 通过标准 |
 | - | - | - |
-| 1 | 拉取工具清单 | `tools/list` 恰好返回 **13 个** `coolapk_*` 工具（search / feed_detail / user_profile / user_feeds / author / author_digest / home / topic / suggest / login_status / read_image / image_link / get_url） |
+| 1 | 拉取工具清单 | `tools/list` 恰好返回 **17 个** `coolapk_*` 工具（search / feed_detail / user_profile / user_feeds / author / author_digest / home / board / secondhand / topic / app_detail / notify / suggest / login_status / read_image / image_link / get_url） |
 | 2 | 登录态 | 调 `coolapk_login_status`，返回 `is_logged_in: true` 且 `uid` 与用户预期一致（注意与 CLI `coolapk login --status` 的 `logged_in` 字段名不同） |
 | 3 | 真实搜索 | 调 `coolapk_search`（keyword 任选，如 `Magisk 模块`），返回非空列表 |
 | 4 | 图片链路 | 本地：`coolapk_read_image` 传入上一步结果里任一帖子的图片 URL，能返回图片；远程：改用 `coolapk_image_link` 生成外链且链接能打开 |
@@ -452,4 +452,4 @@ server {
 - **远程必须 TLS**：Bearer Token 是明文凭据，裸 HTTP 公网传输会被中间人截获；8000 端口不直连公网；
 - **纯只读**：本服务没有任何写操作（点赞 / 回复 / 关注 / 发帖），客户端接上也不会有——这是特性不是缺陷；
 - 工具数量与行为以 `tools/list` 实际返回与 `coolapk_mcp/` 源码为准（登录：`coolapk_mcp/cli.py`；配置：`coolapk_mcp/config.py`；服务与工具：`coolapk_mcp/server.py`；签名 blob：`coolapk_mcp/auth/libauth.py`）；
-- 本文基于 v0.6.1（13 个工具）；接口或行为变化时欢迎提 PR 更新本文。装好之后的**使用方法**（怎么搜得准、调用策略、风控礼仪）见 [skills/coolapk-research/SKILL.md](skills/coolapk-research/SKILL.md)。
+- 本文基于 v0.7.0（未发布，17 个工具）；接口或行为变化时欢迎提 PR 更新本文。装好之后的**使用方法**（怎么搜得准、调用策略、风控礼仪）见 [skills/coolapk-research/SKILL.md](skills/coolapk-research/SKILL.md)。

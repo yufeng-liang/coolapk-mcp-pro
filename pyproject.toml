@@ -1,7 +1,24 @@
 [project]
 name = "coolapk-mcp-pro"
-version = "0.6.9"
+version = "0.7.0"
 description = "酷安社区 MCP Server — AI 原生搜索工具"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "yufeng-liang" }]
+keywords = ["coolapk", "mcp", "model-context-protocol", "coolapk-api", "ai-agent"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Natural Language :: Chinese (Simplified)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+]
 requires-python = ">=3.10"
 dependencies = [
     # server.py 顶层 from mcp.server.fastmcp import TransportSecuritySettings 需要较新 mcp（实测 1.30.0）
@@ -21,19 +38,34 @@ dependencies = [
 
 [project.optional-dependencies]
 # 开发/CI 依赖：pip install -e ".[dev]"
+# 精确锁定：与 CI matrix 实测通过的版本一致，避免工具链漂移导致「本地过 CI 不过」
 dev = [
-    "pytest>=8",
-    "pytest-asyncio>=0.23",
-    "ruff>=0.6",
+    "pytest==9.2.0",
+    "pytest-asyncio==1.5.0",
+    "ruff==0.17.5",
+    "mypy==1.11.2",
+    # 覆盖率只做观测：先让 /img、CLI、热加载这些"零覆盖区"可见，暂不设 fail-under
+    "pytest-cov==7.1.0",
 ]
 
 [project.scripts]
 coolapk = "coolapk_mcp.cli:cli"
 coolapk-mcp = "coolapk_mcp.server:main"
 
+[project.urls]
+Homepage = "https://github.com/yufeng-liang/coolapk-mcp-pro"
+Repository = "https://github.com/yufeng-liang/coolapk-mcp-pro"
+Issues = "https://github.com/yufeng-liang/coolapk-mcp-pro/issues"
+Changelog = "https://github.com/yufeng-liang/coolapk-mcp-pro/blob/main/CHANGELOG.md"
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# sdist/wheel 里带上 MIT 许可证正文（PEP 639 之前仍由该字段声明文件）
+# NOTICE.md 也要进产物：MIT 归属声明与第三方来源说明都在里面
+license-files = ["LICENSE", "NOTICE.md"]
 
 [tool.setuptools.packages.find]
 include = ["coolapk_mcp*"]
@@ -53,5 +85,27 @@ target-version = "py310"
 exclude = [".venv", "tmp*"]
 
 [tool.ruff.lint]
-# 只开真实错误：语法/未定义名/未使用变量等，风格类规则等业务代码清理完再逐步加
-select = ["E9", "F63", "F7", "F82"]
+# 之前只开 E9/F63/F7/F82，等于只查语法错误：F841（cli 的 last_error 死变量）
+# 与 B904（except 里裸 raise 丢原因链）都是这么漏过去的
+select = ["E4", "E7", "E9", "F", "B", "W"]
+ignore = ["E501"] # 行宽不做硬门禁
+
+[tool.ruff.lint.per-file-ignores]
+# 手动探针是单文件脚本式写法，导入顺序不按库代码要求
+"tests/manual/regression_probe.py" = ["E402"]
+[tool.coverage.run]
+source = ["coolapk_mcp"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+# 不设 fail_under：当前目标是把盲区显性化，不是拿数字卡合并
+show_missing = true
+skip_covered = true
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+check_untyped_defs = true
+# 只对 coolapk_mcp 生效；tests/ 里有大量 monkeypatch 与假对象，不强求类型完整
+files = ["coolapk_mcp"]
+warn_unused_ignores = true

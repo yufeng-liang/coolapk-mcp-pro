@@ -160,7 +160,7 @@ def _jar_ready(jar: dict[str, str]) -> bool:
 def _login_on_port(port: int, url: str, timeout: float = 300) -> tuple[str | None, str]:
     """连接已在运行的浏览器（COOLAPK_CDP_PORT），等待用户完成登录"""
     try:
-        import websocket  # type: ignore
+        import websocket
     except Exception:
         return None, "no_browser"
 
@@ -194,6 +194,64 @@ def _login_on_port(port: int, url: str, timeout: float = 300) -> tuple[str | Non
             pass
 
 
+def _dispose(proc: subprocess.Popen, profile_dir: Path) -> None:
+    """收尸：结束浏览器进程并删掉带登录态的临时 profile"""
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    shutil.rmtree(profile_dir, ignore_errors=True)
+
+
+def _spawn_and_wait(browser: Path, url: str) -> tuple[subprocess.Popen, int, Path, str, str]:
+    """起浏览器并等 DevTools 端口就绪，返回 (proc, port, profile_dir, ws_url, failure)
+
+    failure 取值：exited_early / exited_late / no_cdp（进程在但调试口连不上），
+    成功时为空串。
+    """
+    port = _free_port()
+    profile_dir = Path(tempfile.mkdtemp(prefix="coolapk-login-"))
+    args = [
+        str(browser),
+        f"--remote-debugging-port={port}",
+        # Chrome 111+ 起，非浏览器来源的 CDP WebSocket 需要显式放行。
+        # 只放行本机调试端口自身的来源：通配 "*" 会让同一台机器上任何网页
+        # 都能连上这个调试端口（配合 user-data-dir 里的登录态等同交出账号）。
+        f"--remote-allow-origins=http://127.0.0.1:{port},http://localhost:{port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-sync",
+        "--disable-extensions",
+        "--new-window",
+        url,
+    ]
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+    )
+
+    start_deadline = time.time() + _DEVTOOLS_START_TIMEOUT
+    launched_at = time.time()
+    while time.time() < start_deadline:
+        if proc.poll() is not None:
+            # 刚启动就退出：多半是受限环境里浏览器无法存活
+            failure = "exited_early" if time.time() - launched_at < 5 else "exited_late"
+            return proc, port, profile_dir, "", failure
+        ws_url = _devtools_ws_url(port) or ""
+        if ws_url:
+            return proc, port, profile_dir, ws_url, ""
+        time.sleep(0.3)
+    return proc, port, profile_dir, "", "no_cdp"
+
+
 def run_browser_login(url: str, timeout: float = 300) -> tuple[str | None, str]:
     """打开系统浏览器让用户登录，返回 (cookie 串, 状态)
 
@@ -212,7 +270,7 @@ def run_browser_login(url: str, timeout: float = 300) -> tuple[str | None, str]:
         return None, "no_browser"
 
     try:
-        import websocket  # type: ignore
+        import websocket
     except Exception:
         return None, "no_browser"
 
@@ -220,46 +278,19 @@ def run_browser_login(url: str, timeout: float = 300) -> tuple[str | None, str]:
     if attach_port.isdigit():
         return _login_on_port(int(attach_port), url, timeout)
 
-    port = _free_port()
-    profile_dir = Path(tempfile.mkdtemp(prefix="coolapk-login-"))
-    args = [
-        str(browser),
-        f"--remote-debugging-port={port}",
-        # Chrome 111+ 起，非浏览器来源的 CDP WebSocket 需要显式放行
-        "--remote-allow-origins=*",
-        f"--user-data-dir={profile_dir}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-sync",
-        "--disable-extensions",
-        "--new-window",
-        url,
-    ]
+    proc, port, profile_dir, ws_url, failure = _spawn_and_wait(browser, url)
+    if failure == "no_cdp":
+        # 端口从 _free_port() 释放到浏览器真正绑定之间被别的进程抢走时的典型症状：
+        # 进程活着但调试口连不上。换一个端口重试一次，避免无限重试。
+        _dispose(proc, profile_dir)
+        proc, port, profile_dir, ws_url, failure = _spawn_and_wait(browser, url)
+    if not ws_url:
+        _dispose(proc, profile_dir)
+        if failure == "exited_early":
+            return None, "launch_failed"
+        return None, "closed" if failure == "exited_late" else "timeout"
 
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-    proc = subprocess.Popen(
-        args,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=creationflags,
-    )
-
-    ws_url = ""
-    start_deadline = time.time() + _DEVTOOLS_START_TIMEOUT
-    launched_at = time.time()
     try:
-        while time.time() < start_deadline:
-            if proc.poll() is not None:
-                # 刚启动就退出：多半是受限环境里浏览器无法存活
-                return None, "launch_failed" if time.time() - launched_at < 5 else "closed"
-            ws_url = _devtools_ws_url(port) or ""
-            if ws_url:
-                break
-            time.sleep(0.3)
-
-        if not ws_url:
-            return None, "timeout"
-
         ws = websocket.create_connection(ws_url, timeout=10)
         jar: dict[str, str] = {}
         deadline = time.time() + timeout

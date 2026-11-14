@@ -42,7 +42,7 @@ def _make_client(handler) -> CoolapkClient:
     return client
 
 
-async def _noop_backoff(_attempt: int) -> None:
+async def _noop_backoff(_attempt: int, floor: float = 0.0) -> None:
     """退避等待的空实现：用例不关心真实等待时长"""
     return None
 
@@ -189,7 +189,7 @@ def test_read_error_becomes_network(monkeypatch):
 
     client = _make_client(handler)
 
-    async def _no_sleep(attempt):
+    async def _no_sleep(attempt, floor: float = 0.0):
         return None
 
     # 退避等待对断言无意义，置空保持用例秒级
@@ -207,31 +207,33 @@ def test_read_error_becomes_network(monkeypatch):
 # ---------------- 限速后的二次缓存复查 ----------------
 
 
-class _SecondCheckHitCache(throttle.TTLCache):
-    """首查必定 miss、次查必定 hit —— 用来证明限速等待后确实又查了一次缓存"""
+class _CountingCache(throttle.TTLCache):
+    """记录读写次数的缓存壳"""
 
-    def __init__(self, payload):
+    def __init__(self, payload=None):
         super().__init__()
         self.payload = payload
         self.get_calls = 0
 
     def get(self, key):
         self.get_calls += 1
-        return self.payload if self.get_calls >= 2 else None
+        return self.payload
 
 
-@pytest.mark.skipif(not throttle.CACHE_ENABLED, reason="环境变量禁用了缓存")
-def test_cache_is_rechecked_after_rate_limit_wait():
+def test_cache_hit_short_circuits_before_any_request(monkeypatch):
+    """首查命中缓存即返回；限速后的二次复查已随单飞重构删除，不再查第二次"""
+    # 不跟环境变量走：CACHE_ENABLED 是 import 期快照，设 COOLAPK_NO_CACHE 的机器上会静默跳过
+    monkeypatch.setattr(throttle, "CACHE_ENABLED", True)
     calls: list[httpx.Request] = []
     client = _make_client(_recording_handler(calls))
-    fake = _SecondCheckHitCache({"id": "cached-value"})
+    fake = _CountingCache({"id": "cached-value"})
     client._cache = fake
 
     data = asyncio.run(client.get("/v6/user/profile", {"uid": 1}))
 
     assert data == {"id": "cached-value"}
-    assert fake.get_calls == 2  # 首查 + 限速后复查
-    assert calls == []  # 复查命中，没有真正发请求
+    assert fake.get_calls == 1
+    assert calls == [], "缓存命中不该发请求"
 
 # ---------------- 分页预算 / FetchResult ----------------
 
@@ -344,6 +346,13 @@ def test_cache_key_carries_identity():
     assert key.startswith("10086:")
     # 参数顺序不影响键
     assert key == client._cache_key("/v6/feed/replyList", {"page": 1, "id": 1})
+    # device_code 也在键里：换设备码后 X-App-Token 变了，不能共用响应
+    assert client.config.device_code in key
+    other_device = _make_client(_recording_handler([]))
+    other_device.config.device_code = "another-device"
+    assert key != other_device._cache_key("/v6/feed/replyList", params)
+    # None / True 的编码要与真实查询串一致（不再是 "None"/"True"）
+    assert "a=&b=true" in client._cache_key("/v6/x", {"a": None, "b": True})
 
     # 换账号 -> 键不同
     other_uid = _make_client(_recording_handler([]))
@@ -502,6 +511,28 @@ class TestHttpStatusClassification:
         assert excinfo.value.retryable is True
         assert len(calls) == throttle.MAX_RETRIES + 1
 
+    async def test_429_retry_waits_at_least_retry_after(self, monkeypatch):
+        """Retry-After 短于退避上限时，按服务端要求等待而不是按退避曲线"""
+        floors: list[float] = []
+
+        async def _record(attempt: int, floor: float = 0.0) -> None:
+            floors.append(floor)
+
+        monkeypatch.setattr(throttle, "backoff_sleep", _record)
+        calls: list[httpx.Request] = []
+
+        def handler(request):
+            calls.append(request)
+            if len(calls) == 1:
+                return httpx.Response(429, headers={"Retry-After": "5"})
+            return httpx.Response(200, json={"data": []})
+
+        client = _make_client(handler)
+        await client.get("/v6/feed/replyList?id=1&page=1")
+
+        assert floors == [5.0]
+        assert len(calls) == 2
+
 
 class TestStatusHelpers:
     def test_retry_after_seconds_parses_number(self):
@@ -588,9 +619,9 @@ class TestUidIndexDebounce:
         writes: list[int] = []
         original = client._save_uid_index
 
-        def counting() -> None:
+        def counting(snapshot=None) -> None:
             writes.append(1)
-            original()
+            original(snapshot)
 
         monkeypatch.setattr(client, "_save_uid_index", counting)
 
@@ -613,3 +644,104 @@ class TestUidIndexDebounce:
 
         saved = json.loads(CoolapkClient.INDEX_FILE.read_text(encoding="utf-8"))
         assert saved == {"9": 8}
+
+
+# ---------------- 共享图片客户端与字节上限 ----------------
+
+
+class TestImageClient:
+    async def test_image_client_is_shared_and_reusable(self):
+        """同一进程内复用同一个 AsyncClient，不再每张图新建连接池"""
+        first = client_mod.image_client()
+        second = client_mod.image_client()
+        assert first is second
+        assert first.is_closed is False
+
+    async def test_aclose_image_client_closes_and_resets(self):
+        """关闭后缓存清空，再次取用拿到新实例"""
+        client_mod._IMAGE_CLIENTS.clear()
+        before = client_mod.image_client()
+        await client_mod.aclose_image_client()
+
+        assert before.is_closed is True
+        assert client_mod._IMAGE_CLIENTS == {}
+
+        after = client_mod.image_client()
+        assert after is not before
+        await client_mod.aclose_image_client()
+
+
+class TestFetchImageBytes:
+    async def test_rejects_by_content_length(self, monkeypatch):
+        """声明长度超限时一眼拒绝，不读 body"""
+        monkeypatch.setattr(client_mod, "IMAGE_MAX_BYTES", 1024)
+        override = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, content=b"x" * 4096, headers={"content-type": "image/jpeg"}
+                )
+            )
+        )
+        monkeypatch.setattr(client_mod, "_IMAGE_CLIENT_OVERRIDE", override)
+
+        with pytest.raises(CoolapkError) as exc:
+            await client_mod._fetch_image_bytes("https://image.coolapk.com/a.jpg", {})
+        assert exc.value.error_code == 413 and exc.value.kind == "http"
+        assert "上限" in str(exc.value)
+        await override.aclose()
+
+    async def test_rejects_oversized_stream_without_length(self, monkeypatch):
+        """没有 Content-Length 时按累计流量掐断，防止无限读"""
+        monkeypatch.setattr(client_mod, "IMAGE_MAX_BYTES", 1024)
+
+        async def handler(request):
+            async def body():
+                for _ in range(4):
+                    yield b"y" * 512
+
+            return httpx.Response(200, content=body(), headers={"content-type": "image/jpeg"})
+
+        override = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(client_mod, "_IMAGE_CLIENT_OVERRIDE", override)
+
+        with pytest.raises(CoolapkError) as exc:
+            await client_mod._fetch_image_bytes("https://image.coolapk.com/a.jpg", {})
+        assert exc.value.error_code == 413
+        await override.aclose()
+
+    async def test_network_error_is_structured(self, monkeypatch):
+        def handler(request):
+            raise httpx.ConnectError("boom", request=request)
+
+        override = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(client_mod, "_IMAGE_CLIENT_OVERRIDE", override)
+
+        with pytest.raises(CoolapkError) as exc:
+            await client_mod._fetch_image_bytes("https://image.coolapk.com/a.jpg", {})
+        assert exc.value.kind == "network"
+        await override.aclose()
+
+
+class TestDownloadImageThumbnail:
+    async def test_thumbnail_404_falls_back_to_original(self, monkeypatch):
+        """缩略图不存在时回落到原图，且只回落一次"""
+        seen: list[str] = []
+        png = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+
+        def handler(request):
+            seen.append(request.url.path)
+            if request.url.path.endswith(".m.jpg"):
+                return httpx.Response(404)
+            return httpx.Response(200, content=png, headers={"content-type": "image/png"})
+
+        override = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(client_mod, "_IMAGE_CLIENT_OVERRIDE", override)
+
+        client = _make_client(_recording_handler([]))
+        data, fmt = await client.download_image(
+            "https://image.coolapk.com/feed/2024/0329/abc@1080x1080.jpg"
+        )
+
+        assert fmt == "png" and data == png
+        assert len(seen) == 2 and seen[0].endswith(".jpg.m.jpg")
+        await override.aclose()

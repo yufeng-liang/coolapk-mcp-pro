@@ -1,9 +1,12 @@
 """server.py / config.py 关键回归测试（全部离线，不发起任何网络请求）。"""
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 
+import httpx
 import pytest
 
 from coolapk_mcp import config as config_module
@@ -42,19 +45,116 @@ class _FakeClient:
         self.closed = True
 
 
-def test_reset_client_awaits_aclose(monkeypatch: pytest.MonkeyPatch) -> None:
-    """_reset_client 要真正 await 旧实例的 aclose()，并把全局引用清空。"""
+def test_reset_client_retires_without_closing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_reset_client 只摘引用、不立刻关：并发工具可能还拿着旧实例在发请求。
+
+    立刻 aclose 会让那些请求撞 httpx RuntimeError（已关闭的 client），
+    在工具层表现为「服务内部错误」。改由 lifespan 收尾统一关闭。
+    """
     fake = _FakeClient()
     monkeypatch.setattr(server, "_client", fake)
     monkeypatch.setattr(server, "_client_fp", ("uid", "token", "cookie", "https://api.coolapk.com"))
     # 每个用例独立事件循环，避免复用别处创建的 Lock
     monkeypatch.setattr(server, "_client_lock", None)
+    monkeypatch.setattr(server, "_retired", [])
 
     asyncio.run(server._reset_client())
 
-    assert fake.closed is True, "aclose() 没有被 await 完成"
     assert server._client is None
     assert server._client_fp is None
+    assert fake.closed is False, "重置时不该立即关闭（在途请求还在用）"
+    assert fake in server._retired, "旧实例必须进退休队列，否则永不关闭"
+
+    asyncio.run(server._close_retired())
+    assert fake.closed is True
+    assert server._retired == []
+
+
+class _FakeReadClient:
+    """最小只读假 client：只为 coolapk_home / coolapk_topic 提供数据源。"""
+
+    def __init__(self, home=None, detail_exc=None, feeds=None) -> None:
+        self._home = home or []
+        self._detail_exc = detail_exc
+        self._feeds = feeds or []
+
+    async def get_home_feeds(self, page: int = 1):
+        return self._home
+
+    async def get_hot_feeds(self, page: int = 1):
+        return self._home
+
+    async def get_latest_feeds(self, page: int = 1):
+        return self._home
+
+    async def get_topic_detail(self, tag: str):
+        if self._detail_exc is not None:
+            raise self._detail_exc
+        return [{"id": 1, "tag": tag, "title": "话题"}]
+
+    async def get_topic_feeds(self, tag: str, page: int = 1):
+        return self._feeds
+
+
+_FEED_RAW = {
+    "entityType": "feed",
+    "id": 1,
+    "message": "正文内容",
+    "username": "作者",
+    "dateline": 1700000000,
+    "likenum": 3,
+}
+
+
+def _patch_client(monkeypatch: pytest.MonkeyPatch, fake: object) -> None:
+    async def _fake_get_client():
+        return fake
+
+    monkeypatch.setattr(server, "_get_client", _fake_get_client)
+
+
+def test_home_returns_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
+    """coolapk_home 不再返回裸列表：带 tab/page/fetched，且未知 tab 归 recommend。"""
+    _patch_client(monkeypatch, _FakeReadClient(home=[_FEED_RAW]))
+
+    payload = json.loads(asyncio.run(server.coolapk_home("unknown-tab", 2)))
+
+    assert payload["tab"] == "recommend"
+    assert payload["page"] == 2
+    assert payload["fetched"] == 1
+    assert payload["feeds"][0]["id"] == 1
+
+
+def test_topic_detail_failure_degrades(monkeypatch: pytest.MonkeyPatch) -> None:
+    """话题详情被风控时仍返回动态列表，并用 topic_error 标注原因。"""
+    fake = _FakeReadClient(
+        detail_exc=CoolapkError("验证码", error_code=403, kind="captcha"),
+        feeds=[_FEED_RAW],
+    )
+    _patch_client(monkeypatch, fake)
+
+    payload = json.loads(asyncio.run(server.coolapk_topic("安卓", with_feeds=True)))
+
+    assert "topic" not in payload
+    assert payload["topic_error"]
+    assert payload["feeds"][0]["id"] == 1
+
+
+def test_server_lifespan_closes_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """stdio 模式退出时 _server_lifespan 必须关闭全局 client（此前无钩子）。"""
+    fake = _FakeClient()
+    monkeypatch.setattr(server, "_client", fake)
+    monkeypatch.setattr(server, "_client_fp", ("uid", "token", "cookie", "https://api.coolapk.com"))
+    monkeypatch.setattr(server, "_client_lock", None)
+
+    async def _run() -> None:
+        async with server._server_lifespan(None):
+            assert fake.closed is False
+
+    asyncio.run(_run())
+
+    assert fake.closed is True
+    assert server._client is None
 
 
 def test_thumb_variant_keeps_query_string() -> None:
@@ -132,6 +232,7 @@ class _FocusClient:
         self._author = author
         self._hot = hot
         self.budgets: list[Budget] = []
+        self.start_pages: list[int] = []
 
     async def get_feed_detail_smart(self, feed_id, **kwargs) -> dict:
         return {"source": "api", "data": _feed_data(), "replies": []}
@@ -143,12 +244,18 @@ class _FocusClient:
             budget.take()
         return res
 
-    async def get_author_replies_paged(self, feed_id, max_pages=5, budget=None):
+    async def get_author_replies_paged(
+        self, feed_id, max_pages=5, budget=None, start_page=1
+    ):
         assert max_pages == server.FOCUS_MAX_PAGES
+        self.start_pages.append(start_page)
         return await self._paged(self._author, budget)
 
-    async def get_popular_replies_paged(self, feed_id, max_pages=5, budget=None):
+    async def get_popular_replies_paged(
+        self, feed_id, max_pages=5, budget=None, start_page=1
+    ):
         assert max_pages == server.FOCUS_MAX_PAGES
+        self.start_pages.append(start_page)
         return await self._paged(self._hot, budget)
 
 
@@ -172,6 +279,7 @@ def test_feed_detail_focus_meta_reports_paging(monkeypatch: pytest.MonkeyPatch) 
     assert meta["next_page"] == 3
     assert meta["budget"]["requests"] == 4
     assert fake.budgets[0] is fake.budgets[1], "两个来源必须共用同一份 budget"
+    assert fake.start_pages == [1, 1], "默认从第 1 页起翻"
     assert [r["id"] for r in payload["replies"]] == [11, 12, 13]
 
 
@@ -355,3 +463,142 @@ def test_catch_api_error_only_marks_retryable_when_true() -> None:
     bad = json.loads(asyncio.run(expired()))
     assert "retryable" not in bad
     assert bad["error_type"] == "auth_expired"
+
+
+def test_catch_network_error_marks_retryable() -> None:
+    """超时/连接失败必须带 retryable，与 README 的「network 可重试」一致。"""
+
+    @server._catch_api_error
+    async def broken() -> str:
+        raise httpx.ConnectError("boom")
+
+    payload = json.loads(asyncio.run(broken()))
+    assert payload["error_type"] == "network"
+    assert payload["retryable"] is True
+
+def test_server_lifespan_closes_image_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """stdio 退出时同时释放共享图片连接池。"""
+    closed: list[bool] = []
+
+    async def _aclose() -> None:
+        closed.append(True)
+
+    monkeypatch.setattr(server, "aclose_image_client", _aclose)
+    monkeypatch.setattr(server, "_client", None)
+    monkeypatch.setattr(server, "_client_lock", None)
+
+    async def _run() -> None:
+        async with server._server_lifespan(None):
+            assert closed == []
+
+    asyncio.run(_run())
+
+    assert closed == [True]
+
+
+class TestImgSecret:
+    def test_token_is_not_reused_as_signing_secret(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """/img 签名密钥不复用 Bearer token：链接会进聊天记录与日志，
+        拿到签名就能离线爆破 token"""
+        monkeypatch.setattr(server, "IMG_SECRET_FILE", tmp_path / "img_secret")
+        monkeypatch.setenv("COOLAPK_IMG_SECRET", "env-secret-value")
+
+        secret = server._resolve_img_secret("tok-123")
+        assert secret == "env-secret-value"
+        assert secret != "tok-123"
+
+    def test_env_secret_used_when_no_token(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        monkeypatch.setattr(server, "IMG_SECRET_FILE", tmp_path / "img_secret")
+        monkeypatch.setenv("COOLAPK_IMG_SECRET", "env-secret-value")
+
+        assert server._resolve_img_secret("") == "env-secret-value"
+
+    def test_random_secret_is_persisted_and_reused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """没有 token 也没有 env：生成一次随机密钥并持久化，重启后旧链接仍有效"""
+        path = tmp_path / "img_secret"
+        monkeypatch.setattr(server, "IMG_SECRET_FILE", path)
+        monkeypatch.delenv("COOLAPK_IMG_SECRET", raising=False)
+
+        first = server._resolve_img_secret("")
+        second = server._resolve_img_secret("")
+
+        assert first == second and len(first) >= 16
+        assert path.read_text(encoding="utf-8") == first
+        assert "coolapk-mcp-dev" not in first
+
+    def test_persisted_secret_is_read_back(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        path = tmp_path / "img_secret"
+        path.write_text("persisted-random-secret", encoding="utf-8")
+        monkeypatch.setattr(server, "IMG_SECRET_FILE", path)
+        monkeypatch.delenv("COOLAPK_IMG_SECRET", raising=False)
+
+        assert server._resolve_img_secret("") == "persisted-random-secret"
+
+
+def test_image_link_uses_resolved_secret(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """coolapk_image_link 与 /img 必须用同一把密钥，且不再回落硬编码字符串"""
+    monkeypatch.setattr(server, "IMG_SECRET_FILE", tmp_path / "img_secret")
+    monkeypatch.delenv("COOLAPK_IMG_SECRET", raising=False)
+    monkeypatch.setenv("COOLAPK_PUBLIC_BASE", "https://mcp.example.com")
+    monkeypatch.delenv("COOLAPK_HTTP_TOKEN", raising=False)
+
+    payload = json.loads(
+        asyncio.run(server.coolapk_image_link("https://image.coolapk.com/a.jpg"))
+    )
+
+    expected = hmac.new(
+        server._resolve_img_secret("").encode(),
+        f"https://image.coolapk.com/a.jpg|{payload['items'][0]['expires_at']}".encode(),
+        hashlib.sha256,
+    ).hexdigest()[:32]
+    item = payload["items"][0]
+    query = dict(
+        part.split("=", 1)
+        for part in item["link"].split("?", 1)[1].split("&")
+    )
+    assert item["expires_at"] == int(query["exp"])
+    assert query["sig"] == expected
+
+
+def test_user_feeds_echoes_normalized_keyword_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """非法/带空格的 keyword_mode 回落 any，但必须回显生效值。"""
+
+    class _Fake:
+        async def get_user_feeds(self, uid, page=1):
+            return [{"id": 1, "message": "解锁 刷机", "dateline": 1700000000}]
+
+    async def _client():
+        return _Fake()
+
+    monkeypatch.setattr(server, "_get_client", _client)
+
+    payload = json.loads(
+        asyncio.run(server.coolapk_user_feeds(1, 1, 1, "解锁 刷机", "default", "AND"))
+    )
+    assert payload["keyword_mode"] == "any"
+    assert payload["matched"] == 1
+
+    payload = json.loads(
+        asyncio.run(server.coolapk_user_feeds(1, 1, 1, "解锁 刷机", "default", " all "))
+    )
+    assert payload["keyword_mode"] == "all"
+
+
+def test_prepare_feeds_keyword_mode_all() -> None:
+    """keyword_mode=all 要求每个词都出现，any 只需一个"""
+    raw = [
+        {"id": 1, "message": "解锁与刷机教程"},
+        {"id": 2, "message": "只有解锁"},
+        {"id": 3, "message": "刷机日常"},
+    ]
+
+    any_items, total = server._prepare_feeds(raw, "解锁 刷机", "hot")
+    all_items, _ = server._prepare_feeds(raw, "解锁 刷机", "hot", "all")
+
+    assert total == 3
+    assert {it["id"] for it in any_items} == {1, 2, 3}
+    assert {it["id"] for it in all_items} == {1}

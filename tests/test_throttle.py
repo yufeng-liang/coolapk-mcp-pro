@@ -84,42 +84,54 @@ def test_ttl_for_endpoint_prefix(clock):
 # ------------------------------------------------------------ RateLimiter
 
 
+@pytest.fixture()
+def fake_tick_sleep(monkeypatch):
+    """把限速器的等待出口换成记录器：断言"该睡多久"，不赌 runner 的墙钟"""
+    sleeps: list[float] = []
+
+    async def fake(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(throttle, "_sleep", fake)
+    return sleeps
+
+
 @pytest.mark.asyncio
-async def test_rate_limiter_enforces_min_interval():
-    """两次 acquire 的实际间隔不小于 min_interval"""
+async def test_rate_limiter_enforces_min_interval(fake_tick_sleep):
+    """首次立即放行，第二次（刚刚过）要等满 min_interval"""
     limiter = throttle.RateLimiter(min_interval=0.05)
 
-    start = time.perf_counter()
     await limiter.acquire()
-    first = time.perf_counter() - start
-    await limiter.acquire()
-    second = time.perf_counter() - start
+    assert fake_tick_sleep == []          # 冷启动 _last=0，无等待
 
-    assert first < 0.05          # 首次立即放行
-    assert second - first >= 0.045  # 第二次至少等满间隔（留 5ms 计时误差余量）
+    limiter._last = throttle.time.monotonic()   # 人为把"上次放行"钉在现在
+    await limiter.acquire()
+
+    assert len(fake_tick_sleep) == 1
+    # wait = _last + min_interval - now，只可能 ≤ min_interval 且接近它
+    assert 0.04 < fake_tick_sleep[0] <= 0.05
 
 
 @pytest.mark.asyncio
-async def test_rate_limiter_zero_interval_passes_immediately():
+async def test_rate_limiter_zero_interval_passes_immediately(fake_tick_sleep):
     """min_interval=0 时不等待（关闭限速的开发/测试路径）"""
     limiter = throttle.RateLimiter(min_interval=0)
 
-    start = time.perf_counter()
     for _ in range(3):
         await limiter.acquire()
 
-    assert time.perf_counter() - start < 0.05
+    assert fake_tick_sleep == []
 
 
 @pytest.mark.asyncio
-async def test_rate_limiter_serializes_concurrent_callers():
-    """并发调用串行化：3 个协程总计至少 2 * min_interval"""
+async def test_rate_limiter_serializes_concurrent_callers(fake_tick_sleep):
+    """并发调用串行化：3 个协程里有 2 个要各自等一个 interval"""
     limiter = throttle.RateLimiter(min_interval=0.02)
 
-    start = time.perf_counter()
     await asyncio.gather(*(limiter.acquire() for _ in range(3)))
 
-    assert time.perf_counter() - start >= 0.035
+    assert len(fake_tick_sleep) == 2
+    assert all(0.015 < delay <= 0.02 for delay in fake_tick_sleep)
 
 
 # --------------------------------------------------------------- backoff
@@ -158,6 +170,27 @@ async def test_backoff_sleep_respects_max_backoff(fake_sleep, monkeypatch):
         await throttle.backoff_sleep(attempt)
 
     assert fake_sleep == [0.8, 1.6, 3.0, 3.0, 3.0, 3.0]
+
+
+@pytest.mark.asyncio
+async def test_backoff_sleep_honours_retry_after_floor(fake_sleep, monkeypatch):
+    """服务端 Retry-After 大于退避曲线时，按 Retry-After 睡够"""
+    monkeypatch.setattr(throttle.random, "uniform", lambda a, b: 0.0)
+
+    await throttle.backoff_sleep(0, floor=5.0)
+
+    assert fake_sleep == [5.0]
+
+
+@pytest.mark.asyncio
+async def test_backoff_sleep_floor_is_capped(fake_sleep, monkeypatch):
+    """Retry-After 再大也不能突破 COOLAPK_MAX_BACKOFF"""
+    monkeypatch.setattr(throttle.random, "uniform", lambda a, b: 0.0)
+    monkeypatch.setattr(throttle, "MAX_BACKOFF", 3.0)
+
+    await throttle.backoff_sleep(0, floor=99.0)
+
+    assert fake_sleep == [3.0]
 
 
 # ------------------------------------------------------- 限速分桶（bucket 模式）

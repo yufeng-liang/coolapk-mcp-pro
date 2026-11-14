@@ -4,6 +4,7 @@ import asyncio
 import email.utils
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -21,6 +22,8 @@ from coolapk_mcp.auth.token_v3 import DEFAULT_APP_VERSION, DEFAULT_VERSION_CODE,
 from coolapk_mcp.budget import Budget, BudgetExceeded, FetchResult
 from coolapk_mcp.config import AppConfig, has_valid_sessid
 
+logger = logging.getLogger(__name__)
+
 
 # 登录态失效统一提示（error_type=auth_expired，AI 客户端据此引导用户重登）
 AUTH_EXPIRED_MESSAGE = (
@@ -29,6 +32,127 @@ AUTH_EXPIRED_MESSAGE = (
     "或运行 coolapk login --web 重新导入登录 Cookie（也可用 login --sms 短信登录、"
     "login --cookie 手动导入）；若按上述方式重新登录后仍提示失效，请重启 MCP 会话"
 )
+
+
+# ---- 图片下载：进程级共享连接池 ----
+# 此前每张图都新建 httpx.AsyncClient（一次 TLS 握手 + 连接池即用即弃），连续
+# 读图（详情页常见 9 张配图）时大部分时间花在建连上。改为共享 client，
+# 只把「带 Referer 的单次请求」交给它。
+IMAGE_MAX_BYTES = 15 * 1024 * 1024
+_IMAGE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+_IMAGE_CLIENTS: dict[bool, "httpx.AsyncClient"] = {}
+# 测试注入点：非 None 时直接复用（测试用 MockTransport 建一个即可）
+_IMAGE_CLIENT_OVERRIDE: "httpx.AsyncClient | None" = None
+
+
+def image_client(direct: bool = False) -> "httpx.AsyncClient":
+    """取进程级共享图片 client；direct=True 表示忽略环境代理（兜底路径）。"""
+    if _IMAGE_CLIENT_OVERRIDE is not None:
+        return _IMAGE_CLIENT_OVERRIDE
+    client = _IMAGE_CLIENTS.get(direct)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            follow_redirects=True,
+            trust_env=not direct,
+            headers={"User-Agent": _IMAGE_UA},
+            limits=httpx.Limits(
+                max_connections=16, max_keepalive_connections=8, keepalive_expiry=30.0
+            ),
+        )
+        _IMAGE_CLIENTS[direct] = client
+    return client
+
+
+async def aclose_image_client() -> None:
+    """关闭共享图片 client（进程退出 / 服务关停时调用）。"""
+    clients = list(_IMAGE_CLIENTS.values())
+    _IMAGE_CLIENTS.clear()
+    for client in clients:
+        if not client.is_closed:
+            await client.aclose()
+
+
+# 酷安图片 CDN 白名单（download_image 与 /img 中转共用同一份）
+_IMAGE_HOSTS = frozenset({"image.coolapk.com", "avatar.coolapk.com", "static.coolapk.com"})
+_IMAGE_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+
+
+def _image_url_ok(candidate: str) -> bool:
+    """图片 URL 是否指向白名单域名（不含 userinfo 混淆与非常规端口）。"""
+    parts = urlsplit(candidate)
+    if parts.scheme not in ("http", "https"):
+        return False
+    if (parts.hostname or "").lower() not in _IMAGE_HOSTS:
+        return False
+    return parts.port in (None, 80, 443)
+
+
+async def _fetch_image_bytes(
+    target: str, headers: dict[str, str]
+) -> tuple[int, bytes, str]:
+    """用共享 client 拉取图片字节，带 15MB 上限与环境代理兜底。
+
+    返回 (状态码, 字节, content-type)；非 200 时字节为空。
+    超过上限抛 CoolapkError(413)：宁可明确报「图太大」，也不把进程内存撑爆。
+    """
+    for direct in (False, True):
+        client = image_client(direct=direct)
+        try:
+            current = target
+            # 手工跟跳转：每一跳发请求前先验域名。交给 httpx 自动跟随就是
+            # 「先连上内网地址、再看结果」——连接已经发出去，等于可读 SSRF。
+            for _hop in range(4):
+                if not _image_url_ok(current):
+                    raise CoolapkError(
+                        f"图片跳转到非白名单域名或端口: {urlsplit(current).netloc or '?'}",
+                        error_code=403, kind="http",
+                    )
+                async with client.stream(
+                    "GET", current, headers=headers, follow_redirects=False
+                ) as resp:
+                    ctype = resp.headers.get("content-type") or ""
+                    if resp.status_code in _IMAGE_REDIRECT_CODES:
+                        location = resp.headers.get("location") or ""
+                        if not location:
+                            return resp.status_code, b"", ctype
+                        current = str(httpx.URL(current).join(location))
+                        continue
+                    return await _read_image_response(resp, ctype)
+            raise CoolapkError(
+                "图片下载失败: 上游跳转超过 3 次", error_code=403, kind="http"
+            )
+        except httpx.InvalidURL:
+            # NO_PROXY 等环境变量含非法值（如 [::1]）时 httpx 解析失败：换直连 client 重试
+            if direct:
+                raise
+            continue
+        except httpx.HTTPError as exc:
+            raise CoolapkError(f"图片下载失败: {exc}", kind="network") from exc
+    return 0, b"", ""
+
+
+async def _read_image_response(resp: "httpx.Response", ctype: str) -> tuple[int, bytes, str]:
+    """读取图片响应体：声明长度与流式累计两道 15MB 闸门。"""
+    if resp.status_code != 200:
+        return resp.status_code, b"", ctype
+    limit_mb = IMAGE_MAX_BYTES // (1024 * 1024)
+    declared = (resp.headers.get("content-length") or "").strip()
+    if declared.isdigit() and int(declared) > IMAGE_MAX_BYTES:
+        raise CoolapkError(
+            f"图片超过 {limit_mb}MB 上限，已拒绝下载", error_code=413, kind="http"
+        )
+    buf = bytearray()
+    async for chunk in resp.aiter_bytes():
+        buf.extend(chunk)
+        if len(buf) > IMAGE_MAX_BYTES:
+            raise CoolapkError(
+                f"图片超过 {limit_mb}MB 上限，已拒绝下载", error_code=413, kind="http"
+            )
+    return 200, bytes(buf), ctype
 
 
 class CoolapkError(Exception):
@@ -234,6 +358,8 @@ class CoolapkClient:
         self._uid_index: dict[int, int] = {}
         self._token_value: str = ""
         self._token_at: float = 0.0
+        # token 单飞：TTL 到期瞬间的并发请求共用一次 bcrypt 计算
+        self._token_fut: asyncio.Future | None = None
         self._index_dirty = False
         self._index_flush_task: asyncio.Task | None = None
         self._load_uid_index()
@@ -251,16 +377,23 @@ class CoolapkClient:
         except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
             self._uid_index = {}
 
-    def _save_uid_index(self) -> None:
+    def _save_uid_index(self, snapshot: dict[int, int] | None = None) -> None:
+        """落盘 uid 索引。
+
+        snapshot 由调用方在写盘前拍好：写盘在 to_thread 里跑，直接读
+        self._uid_index 会与事件循环里的更新交错，落盘内容既非旧表也非新表。
+        """
         try:
             self.INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
-            trimmed = dict(list(self._uid_index.items())[-self.INDEX_MAX:])
+            source = self._uid_index if snapshot is None else snapshot
+            trimmed = dict(list(source.items())[-self.INDEX_MAX:])
             # 原子写：先落临时文件再 replace，防止中断产生半截 JSON 被 load 静默清空
             tmp = self.INDEX_FILE.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(trimmed), encoding="utf-8")
             os.replace(tmp, self.INDEX_FILE)
         except OSError:
-            pass
+            # 索引丢了只会让详情回落多扫几页，但静默失败会让「越用越慢」无从排查
+            logger.warning("uid 索引写盘失败（不影响功能，下次有新 id 时重试）", exc_info=True)
 
     def _index_feeds(self, data: Any) -> None:
         """从列表响应记录 feed_id → 作者uid，供详情被风控时回落"""
@@ -310,8 +443,14 @@ class CoolapkClient:
             raise
         if not self._index_dirty:
             return
+        # 先拍快照、再清 dirty：写盘期间新到的 id 会把 dirty 再置 True，
+        # 下一轮补写；反过来（先清后拍）会让这期间的更新永久丢在内存里
+        snapshot = dict(self._uid_index)
         self._index_dirty = False
-        await asyncio.to_thread(self._save_uid_index)
+        try:
+            await asyncio.to_thread(self._save_uid_index, snapshot)
+        except OSError:
+            logger.warning("uid 索引后台写盘失败", exc_info=True)
 
     async def _app_token(self) -> str:
         """取 X-App-Token：短 TTL 复用 + 线程卸载
@@ -324,18 +463,46 @@ class CoolapkClient:
         now = time.monotonic()
         if ttl > 0 and self._token_value and now - self._token_at < ttl:
             return self._token_value
+
+        # token 单飞：TTL 到期瞬间多个并发请求会同时发现缓存失效，
+        # 不合并的话每个都算一遍 bcrypt（约 60ms 纯 CPU），把线程池占满
+        inflight = self._token_fut
+        if inflight is not None and not inflight.done():
+            return await asyncio.shield(inflight)
+
+        inflight = asyncio.get_running_loop().create_future()
+        inflight.add_done_callback(_consume_future_exception)
+        self._token_fut = inflight
         try:
             token, _ = await asyncio.to_thread(generate_token_v3, self.config.device_code)
-        except (RuntimeError, OSError) as exc:
-            raise CoolapkError(
-                f"无法生成 X-App-Token（{type(exc).__name__}: {exc}）"
-                f"修复：运行 coolapk login 重新导入登录态，"
-                f"或把酷安 APK 放到 {APK_CACHE_FILE}（下次生成 token 时自动提取 blob）",
-                kind="config",
-            ) from exc
+        except BaseException as exc:
+            err: CoolapkError | BaseException
+            if isinstance(exc, asyncio.CancelledError):
+                err = exc
+            else:
+                # 这里捕获面要宽：blob 缺失可能抛 RuntimeError/OSError，
+                # 解析异常可能是 ValueError/KeyError，都该归成 config 并给出修复路径
+                err = CoolapkError(
+                    f"无法生成 X-App-Token（{type(exc).__name__}: {exc}）"
+                    f"修复：运行 coolapk login 重新导入登录态，"
+                    f"或把酷安 APK 放到 {APK_CACHE_FILE}（下次生成 token 时自动提取 blob）",
+                    kind="config",
+                )
+            if not inflight.done():
+                if isinstance(err, asyncio.CancelledError):
+                    inflight.cancel()
+                else:
+                    inflight.set_exception(err)
+            if isinstance(err, asyncio.CancelledError):
+                raise
+            raise err from exc
+        finally:
+            self._token_fut = None
         if ttl > 0:
             self._token_value = token
-            self._token_at = now
+            self._token_at = time.monotonic()
+        if not inflight.done():
+            inflight.set_result(token)
         return token
 
     async def _build_headers(self) -> dict[str, str]:
@@ -396,8 +563,22 @@ class CoolapkClient:
         取空串哈希，保证键始终稳定。
         """
         token8 = hashlib.sha256((self.config.token or "").encode("utf-8")).hexdigest()[:8]
-        pairs = sorted((str(k), str(v)) for k, v in (params or {}).items())
-        return f"{self.config.uid}:{token8}:{path}?{pairs}"
+        # device_code 也进键：它决定 X-App-Token 的生成输入，换设备码后同一个
+        # path+params 拿到的其实是另一套身份下的响应，不能再共用缓存
+        def _norm(value: Any) -> str:
+            # 对齐 httpx 的查询串编码：None → 空串，bool → true/false，
+            # 否则 str(v) 会把两者拼成 "None"/"True"，与真正发出的请求不同键
+            if value is None:
+                return ""
+            if isinstance(value, bool):
+                return "true" if value else "false"
+            return str(value)
+
+        norm = "&".join(
+            f"{key}={_norm(value)}"
+            for key, value in sorted((params or {}).items(), key=lambda kv: str(kv[0]))
+        )
+        return f"{self.config.uid}:{token8}:{self.config.device_code}:{path}?{norm}"
 
     async def _request(self, method: str, path: str, **kwargs) -> Any:
         """统一请求方法：本地登录预检 → GET 缓存 → 单飞合并 → 限速/重试 → 错误分类
@@ -422,19 +603,19 @@ class CoolapkClient:
                 retry_after=remaining,
             )
 
-        cache_key = None
-        if method == "GET" and throttle.CACHE_ENABLED:
-            params = kwargs.get("params") or {}
-            cache_key = self._cache_key(path, params)
+        if method != "GET":
+            # 非 GET 没有可共享的键：直接走请求体
+            return await self._request_uncached(method, path, None, **kwargs)
+
+        params = kwargs.get("params") or {}
+        cache_key = self._cache_key(path, params)
+        if throttle.CACHE_ENABLED:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 return cached
 
-        if cache_key is None:
-            # 非 GET 或缓存关闭：没有可共享的键，直接走请求体
-            return await self._request_uncached(method, path, None, **kwargs)
-
         # ---- 单飞：同 key 已有在途请求时搭车，不再单独发一次 ----
+        # 注意单飞不以 CACHE_ENABLED 为条件：关缓存只该关掉读写，不该让并发合并失效
         inflight = self._inflight.get(cache_key)
         if inflight is not None:
             # shield：等待方被取消时不连带取消真正在发请求的那一路
@@ -446,10 +627,17 @@ class CoolapkClient:
         # asyncio 会打印 "Future exception was never retrieved" 告警
         inflight.add_done_callback(_consume_future_exception)
         try:
-            result = await self._request_uncached(method, path, cache_key, **kwargs)
+            result = await self._request_uncached(
+                method, path, cache_key if throttle.CACHE_ENABLED else None, **kwargs
+            )
         except asyncio.CancelledError:
-            # 生产方被取消：连带取消 Future，等待者收到 CancelledError 后可重试
-            inflight.cancel()
+            # 生产方被取消：不能直接 cancel Future——等待者会收到 CancelledError，
+            # 而 asyncio 的取消是穿透性的，客户端重试逻辑根本不接这个异常。
+            # 改成可重试的 network 错误，等待方拿到后能自己再发一次。
+            if not inflight.done():
+                inflight.set_exception(
+                    CoolapkError("共享请求被取消，请重试", kind="network", retryable=True)
+                )
             raise
         except BaseException as exc:
             # 其余异常（含 CoolapkError 的 kind 分类）原样转交给所有等待者
@@ -477,12 +665,6 @@ class CoolapkClient:
             # 限速桶：默认 global 模式下参数被忽略（行为与历史版本一致）；
             # COOLAPK_RATE_LIMIT_MODE=bucket 时按资源段各自计时
             await self._limiter.acquire(throttle.bucket_for(base))
-            # 二次缓存检查：并发调用都过了首查，但先到的那个已经在限速窗口内
-            # 打完请求并写好了缓存；这里命中就直接返回，不重复打服务器
-            if cache_key is not None:
-                cached = self._cache.get(cache_key)
-                if cached is not None:
-                    return cached
             headers = await self._build_headers()
             cookie = self._get_cookie_header()
             if cookie:
@@ -495,6 +677,17 @@ class CoolapkClient:
                 resp.raise_for_status()
                 last_err = None  # 本轮成功：清掉早前失败轮标记，避免循环后被误判为重试耗尽
                 break
+            except RuntimeError:
+                # 热加载/登录重置会把旧 client 关掉，而正在用旧实例的协程会撞上
+                # httpx 的 RuntimeError（不属于 httpx.HTTPError）。归成可重试 network，
+                # 让调用方重来一次即可拿到新实例，而不是看到「内部错误」
+                if getattr(self._client, "is_closed", False):
+                    last_status = None
+                    err = CoolapkError(
+                        "客户端已重建（登录态变更），请重试", kind="network", retryable=True
+                    )
+                else:
+                    raise
             except httpx.TimeoutException:
                 last_status = None
                 err = CoolapkError("请求超时", kind="network", retryable=True)
@@ -515,9 +708,11 @@ class CoolapkClient:
                             error_code=403,
                             kind="risk",
                             retry_after=retry_after if retry_after is not None else 120.0,
-                        )
+                        ) from e
                     # 其余 403 仍是登录态失效（captchaRequired / 会话无效）
-                    raise CoolapkError(AUTH_EXPIRED_MESSAGE, error_code=403, kind="auth_expired")
+                    raise CoolapkError(
+                        AUTH_EXPIRED_MESSAGE, error_code=403, kind="auth_expired"
+                    ) from e
                 if code == 429:
                     # 服务端明确限流：退避上限都追不上 Retry-After 时，重试只会
                     # 加深封禁，直接把这轮交回调用方（retryable=True 但要求久等）
@@ -529,7 +724,7 @@ class CoolapkClient:
                         retryable=True,
                     )
                     if retry_after is not None and retry_after > throttle.MAX_BACKOFF:
-                        raise err
+                        raise err from e
                 else:
                     kind = "transient" if code >= 500 else "http"
                     err = CoolapkError(
@@ -554,7 +749,8 @@ class CoolapkClient:
                 raise err
             last_err = err
             if attempt < throttle.MAX_RETRIES:
-                await throttle.backoff_sleep(attempt)
+                # 429/5xx 带 Retry-After 时按服务端要求睡够（受退避上限约束）
+                await throttle.backoff_sleep(attempt, floor=err.retry_after or 0.0)
 
         if last_err is not None:
             # 重试耗尽仍失败：瞬态错误（超时/连接/5xx/429）重试后依旧不成功。
@@ -575,7 +771,7 @@ class CoolapkClient:
             result = resp.json()
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
             # 风控页/网关错误页常返回 HTML；编码异常按同类处理
-            raise CoolapkError("响应解析失败", kind="parse")
+            raise CoolapkError("响应解析失败", kind="parse") from None
 
         # 检查业务错误。V6 错误响应两种形态：
         # ① 顶层 {error, message, ...}（无 data 键）；
@@ -681,6 +877,11 @@ class CoolapkClient:
             )
         if not path.startswith("/"):
             path = f"/{path}"
+        # fragment 不进请求行：httpx 发请求时会把它整段丢掉，而守卫是在含 # 的
+        # 原始串上做段匹配 —— 不先剥掉就会出现「守卫看到 like#x、线上发出 like」
+        # 的绕过（/v6/feed/like#x 曾是放行的）。剥完再重建，保证校验串=发送串。
+        if "#" in path:
+            path = path.split("#", 1)[0]
         if not path.startswith("/v6/"):
             raise CoolapkError(
                 f"仅允许 /v6/ 开头的接口路径，收到: {path}",
@@ -815,13 +1016,12 @@ class CoolapkClient:
         if url.startswith("//"):
             url = f"https:{url}"
         host = urlsplit(url).netloc.lower()
-        allowed_hosts = (
-            "image.coolapk.com", "avatar.coolapk.com", "static.coolapk.com",
-        )
-        if host not in allowed_hosts:
+        # 用 hostname+端口判定（netloc 含 userinfo 与端口，image.coolapk.com@evil.com
+        # 这类混淆在 netloc 比较下会误判；重定向后的每一跳也走同一判定）
+        if not _image_url_ok(url):
             raise CoolapkError(
                 f"图片域名不在白名单: {host or url}"
-                f"（仅允许 {'/'.join(allowed_hosts)}）",
+                f"（仅允许 {'/'.join(sorted(_IMAGE_HOSTS))}）",
                 error_code=403, kind="api",
             )
         if url.startswith("http://"):
@@ -831,51 +1031,26 @@ class CoolapkClient:
         fetch_url = self._thumb_fetch_url(url) or url
         thumbnail_used = fetch_url != url
 
-        import httpx
-        from httpx import HTTPError as _HTTPError
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Referer": "https://www.coolapk.com/",
-        }
-        try:
-            async with httpx.AsyncClient(
-                headers=headers, timeout=30, follow_redirects=True,
-            ) as client:
-                resp = await client.get(fetch_url)
-                if thumbnail_used and resp.status_code != 200:
-                    resp = await client.get(url)
-                    thumbnail_used = False
-        except httpx.InvalidURL:
-            # NO_PROXY 等环境变量含非法值（如 [::1]）时解析失败，禁用环境代理兜底
-            async with httpx.AsyncClient(
-                headers=headers, timeout=30, follow_redirects=True,
-                trust_env=False,
-            ) as client:
-                resp = await client.get(fetch_url)
-                if thumbnail_used and resp.status_code != 200:
-                    resp = await client.get(url)
-                    thumbnail_used = False
-        except _HTTPError as exc:
-            raise CoolapkError(f"图片下载失败: {exc}", kind="network") from exc
+        headers = {"User-Agent": _IMAGE_UA, "Referer": "https://www.coolapk.com/"}
+        status, data, ctype = await _fetch_image_bytes(fetch_url, headers)
+        if thumbnail_used and status != 200:
+            # 缩略不存在（404/567 等）：回落原图
+            status, data, ctype = await _fetch_image_bytes(url, headers)
+            thumbnail_used = False
 
-        if resp.status_code != 200:
+        if status != 200:
             raise CoolapkError(
-                f"图片下载失败: HTTP {resp.status_code}（URL 可能已失效，"
+                f"图片下载失败: HTTP {status}（URL 可能已失效，"
                 f"agent 可改用 coolapk_get_url 获取接口数据，或直接向用户呈现 URL）",
-                error_code=resp.status_code, kind="http",
+                error_code=status, kind="http",
             )
-        data = resp.content
         if not data:
             raise CoolapkError("图片下载失败: 响应体为空", kind="http")
 
         # 从 Content-Type 或 URL 扩展名推断格式（FastMCP Image 需要）。
         # FastMCP 直接 f"image/{format}" 拼 MIME，必须用标准名 "jpeg"，
         # "jpg" 会生成非法的 image/jpg 被客户端拒绝渲染。
-        ctype = (resp.headers.get("content-type") or "").lower()
+        ctype = (ctype or "").lower()
         for fmt in ("webp", "jpeg", "jpg", "png", "gif"):
             if fmt in ctype:
                 return data, "jpeg" if fmt in ("jpeg", "jpg") else fmt
@@ -1008,17 +1183,17 @@ class CoolapkClient:
         - 跑满 max_pages 且末页仍满（>=10 条）：truncated=True，next_page=下一页；
         - 空页 / 末页不足 10 条 / 整页重复：确实到底，truncated=False。
 
-        requests 用 budget.used 的起止差值统计，多个方法共享同一 budget 时
-        也能反映本次真实页请求数。
+        中途某页抛 CoolapkError 时保留已取内容并把该页标成可续抓；requests 按
+        本次真实发出的页请求数计（budget 被多路共享时也不重复计）。
         """
         budget = self._ensure_budget(budget, max_pages)
         pages = max(1, int(max_pages))
-        used_before = budget.used
         items: list[dict] = []
         seen: set[tuple[str, str]] = set()
         truncated = False
         next_page: int | None = None
         page = max(1, int(start_page))
+        taken = 0
         for _ in range(pages):
             try:
                 budget.take()
@@ -1026,7 +1201,17 @@ class CoolapkClient:
                 # 预算耗尽：已取部分照常返回，从当前页续抓
                 truncated, next_page = True, page
                 break
-            batch = await fetch_page(page)
+            taken += 1
+            try:
+                batch = await fetch_page(page)
+            except CoolapkError as exc:
+                # 某一页失败：前面已取到的必须保留下来。丢掉它们等于把「有 30 条
+                # 评论」变成「没有评论」，用户完全无法察觉。整批为空时才往上抛。
+                if not items:
+                    raise
+                logger.warning("翻页在第 %s 页失败，保留已取 %s 条：%s", page, len(items), exc)
+                truncated, next_page = True, page
+                break
             if not isinstance(batch, list) or not batch:
                 break
             fresh = 0
@@ -1054,27 +1239,34 @@ class CoolapkClient:
             items,
             truncated=truncated,
             next_page=next_page,
-            requests=budget.used - used_before,
+            requests=taken,
         )
 
     async def get_author_replies_paged(
-        self, feed_id: int, max_pages: int = 5, budget: Budget | None = None
+        self, feed_id: int, max_pages: int = 5, budget: Budget | None = None,
+        start_page: int = 1,
     ) -> FetchResult:
-        """只看楼主：多页聚合楼主回复（去重 + 预算控制）。"""
+        """只看楼主：多页聚合楼主回复（去重 + 预算控制）。
+
+        start_page 供 focus.next_page 续抓：调用方拿到 next_page 后下次从该页起。
+        """
         return await self._collect_paged(
             lambda page: self.get_author_replies(feed_id, page),
             max_pages=max_pages,
             budget=budget,
+            start_page=start_page,
         )
 
     async def get_popular_replies_paged(
-        self, feed_id: int, max_pages: int = 5, budget: Budget | None = None
+        self, feed_id: int, max_pages: int = 5, budget: Budget | None = None,
+        start_page: int = 1,
     ) -> FetchResult:
-        """热门评论：多页聚合高赞评论（去重 + 预算控制）。"""
+        """热门评论：多页聚合高赞评论（去重 + 预算控制 + 可续抓页码）。"""
         return await self._collect_paged(
             lambda page: self.get_popular_replies(feed_id, page),
             max_pages=max_pages,
             budget=budget,
+            start_page=start_page,
         )
 
     async def get_author_replies(self, feed_id: int, page: int = 1) -> list[dict]:
@@ -1262,15 +1454,19 @@ class CoolapkClient:
                 )
             source = "author_feed_fallback"
 
-        replies = None
+        replies: Any = None
         if with_replies:
             try:
                 if all_replies:
                     replies = await self.get_all_replies(feed_id, budget=budget)
                 else:
                     replies = await self.get_feed_replies(feed_id, reply_page)
-            except CoolapkError:
-                replies = None  # 回复接口也被拦时降级为只返回正文
+            except CoolapkError as exc:
+                # 不能降成 None：server 会把 None 当成「这条帖子没有评论」返回，
+                # 用户看到的是「0 条评论」而非「评论没取到」。空 FetchResult 带
+                # truncated=True 才能让上层如实告知并可续抓。
+                logger.warning("回复列表获取失败（feed %s）：%s", feed_id, exc)
+                replies = FetchResult([], truncated=True, next_page=reply_page)
 
         return {"source": source, "data": detail_raw, "replies": replies}
 
@@ -1350,12 +1546,12 @@ class CoolapkClient:
         pages = max(1, min(int(pages or 1), 5))
         start = max(1, int(start_page or 1))
         budget = self._ensure_budget(budget, pages)
-        used_before = budget.used
         seen: set[tuple[str, str]] = set()
         out: list[dict] = []
         truncated = False
         next_page: int | None = None
         page = start
+        taken = 0
         for offset in range(pages):
             page = start + offset
             try:
@@ -1363,11 +1559,15 @@ class CoolapkClient:
             except BudgetExceeded:
                 truncated, next_page = True, page
                 break
+            taken += 1
             try:
                 items = await self.get_user_feeds(uid, page, feed_type)
             except CoolapkError:
                 if offset == 0:
                     raise
+                # 后续页失败：保留已抓部分，并明确标「没翻到底」，否则调用方
+                # 会把「第 3 页 500」当成「这个用户只有两页动态」
+                truncated, next_page = True, page
                 break
             if not isinstance(items, list) or not items:
                 break
@@ -1394,7 +1594,7 @@ class CoolapkClient:
             out,
             truncated=truncated,
             next_page=next_page,
-            requests=budget.used - used_before,
+            requests=taken,
         )
 
     # ---- 话题 ----
@@ -1616,7 +1816,9 @@ class CoolapkClient:
             result = resp.json()
         except Exception:
             text = resp.text[:500] if resp.text else ""
-            raise CoolapkError(f"发送验证码响应解析失败: HTTP {resp.status_code}, body={text}")
+            raise CoolapkError(
+                f"发送验证码响应解析失败: HTTP {resp.status_code}, body={text}"
+            ) from None
         return result
 
     async def login_sms(self, sessid: str, validate_url: str, code: str) -> dict:
@@ -1692,7 +1894,9 @@ class CoolapkClient:
             result = resp.json()
         except Exception:
             text = resp.text[:500] if resp.text else ""
-            raise CoolapkError(f"短信验证码登录响应解析失败: HTTP {resp.status_code}, body={text}")
+            raise CoolapkError(
+                f"短信验证码登录响应解析失败: HTTP {resp.status_code}, body={text}"
+            ) from None
 
         # 从 Set-Cookie 提取 uid/username/token
         cookies = {}
@@ -1706,13 +1910,28 @@ class CoolapkClient:
         return result
 
     async def close(self):
-        # 退出前把待落盘的 uid 索引刷掉：合并窗口里的脏数据不能丢
+        # 退出前把待落盘的 uid 索引刷掉：合并窗口里的脏数据不能丢。
+        # 先等后台任务跑完（它可能正在写盘，取消会让线程继续跑而结果丢失），
+        # 再无条件补一次写——无条件是因为 dirty 标记可能已被后台任务清掉、
+        # 而写盘却在取消竞态里没落地。
+        # 先取消还没跑完的合并任务：它此刻多半还在 sleep 等窗口结束，
+        # 等它等于让退出多停一整个窗口（默认 1s，测试里被调到 30s）。
+        # 取消后由下面这次无条件写盘兜底，所以取消不会丢数据。
         task = self._index_flush_task
+        self._index_flush_task = None
         if task is not None and not task.done():
             task.cancel()
-        if self._index_dirty:
-            self._index_dirty = False
-            self._save_uid_index()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 - 合并任务异常不该阻断关闭
+                logger.debug("uid 索引合并任务异常退出", exc_info=True)
+        self._index_dirty = False
+        try:
+            await asyncio.to_thread(self._save_uid_index)
+        except OSError:
+            logger.warning("uid 索引退出前写盘失败", exc_info=True)
         await self._client.aclose()
 
     async def __aenter__(self):
