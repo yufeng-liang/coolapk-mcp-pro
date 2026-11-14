@@ -448,7 +448,7 @@ pytest -q --cov=coolapk_mcp --cov-fail-under=60   # 带覆盖率门槛（当前�
 2. 提交并打带注释 tag：`git tag -a vX.Y.Z -m "…"`，推分支与 tag；
 3. tag 推送后 `.github/workflows/release.yml` 自动校验三处版本一致 → `python -m build` 产出 sdist/wheel → 创建/更新 GitHub Release 并附加 `dist/*`（`generate_release_notes` 自动生成说明）。
 
-本项目按 git 安装分发，不往 PyPI 发布；需要手工补 release 说明时仍按 `skills/coolapk-mcp-release/SKILL.md` 的模板。
+本项目按 git 安装分发，不往 PyPI 发布；`generate_release_notes` 自动生成的说明是给人看不出所以然的 PR 标题，发布后按 `skills/coolapk-mcp-release/SKILL.md` 的口语化模板重写一遍（面向普通用户，首行一句话说清这版解决什么麻烦）。
 
 ## 故障排查
 
@@ -504,7 +504,7 @@ agent 侧使用指南（何时用酷安搜资料、话题映射表、风控礼�
 2. 保持纯只读定位——任何写操作（点赞 / 回复 / 关注 / 发帖）的改动不会被接受；
 3. 提交前跑通冒烟：`.venv\Scripts\coolapk search "Magisk"` 与 `python -m coolapk_mcp.server` 可正常启动；
 4. 注释与 commit message 用中文，遵循现有代码风格；
-5. 发版（打 tag / 发 release）遵循 [skills/coolapk-mcp-release/SKILL.md](skills/coolapk-mcp-release/SKILL.md)——含版本一致性检查、四步发布流程与 release 说明模板，tag 和 release 极易漏打，务必走完整流程。
+5. 发版（打 tag / 发 release）遵循 [skills/coolapk-mcp-release/SKILL.md](skills/coolapk-mcp-release/SKILL.md)——含版本一致性检查、四步发布流程与 release 说明模板（说明必须通俗易懂、面向普通用户），tag 和 release 极易漏打，务必走完整流程。
 
 发现酷安接口或风控行为有变化也欢迎开 Issue 反馈实测记录。
 
