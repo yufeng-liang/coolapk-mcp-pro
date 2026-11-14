@@ -1,3 +1,4 @@
+
 """client.py 单元测试 — 全程不联网（httpx.MockTransport / monkeypatch）
 
 覆盖本轮 P0 改动：
@@ -20,7 +21,7 @@ import pytest
 from coolapk_mcp import client as client_mod
 from coolapk_mcp import throttle
 from coolapk_mcp.budget import Budget, FetchResult
-from coolapk_mcp.client import CoolapkClient, CoolapkError
+from coolapk_mcp.client import CoolapkClient, CoolapkError, _looks_read_only
 from coolapk_mcp.config import AppConfig
 
 
@@ -39,6 +40,11 @@ def _make_client(handler) -> CoolapkClient:
     # 限速归零：用例不关心节流，避免每次请求白等 1.2s
     client._limiter = throttle.RateLimiter(min_interval=0.0)
     return client
+
+
+async def _noop_backoff(_attempt: int) -> None:
+    """退避等待的空实现：用例不关心真实等待时长"""
+    return None
 
 
 def _recording_handler(calls: list[httpx.Request], payload=None):
@@ -354,11 +360,6 @@ def test_cache_key_carries_identity():
     anonymous.config.token = ""
     assert anonymous._cache_key("/v6/x", None) == anonymous._cache_key("/v6/x", {})
     assert anonymous._cache_key("/v6/x", None) != key
-
-
-# ---------------- get_url 路径守卫 ----------------
-
-
 class TestGetUrlPathGuard:
     def test_normal_read_path_passes(self):
         path = "/v6/feed/detail?id=1&page=2"
@@ -383,3 +384,232 @@ class TestGetUrlPathGuard:
             CoolapkClient._check_get_url_path(path)
         assert excinfo.value.error_code == 403
 
+    def test_looks_read_only_shapes(self):
+        """只读形态判定：末段后缀命中/纯数字放行，层级不足与非 v6 一律拒"""
+        assert _looks_read_only("/v6/feed/detail")
+        assert _looks_read_only("/v6/feed/replyList")
+        assert _looks_read_only("/v6/user/space")
+        assert _looks_read_only("/v6/topic/newTagDetail")
+        assert _looks_read_only("/v6/user/123")
+        assert not _looks_read_only("/v6/feed/like")
+        assert not _looks_read_only("/v6/feed/like/")
+        assert not _looks_read_only("/v6/feed")
+        assert not _looks_read_only("/v5/feed/detail")
+
+    def test_strict_mode_allows_known_read_paths(self, monkeypatch):
+        monkeypatch.setattr(CoolapkClient, "GET_URL_STRICT", True)
+        for path in (
+            "/v6/feed/detail?id=1&page=2",
+            "/v6/feed/replyList?id=1",
+            "/v6/user/space?uid=1",
+            "/v6/search?q=x",
+            "/v6/topic/newTagDetail?tag=x",
+            "/v6/account/checkLoginInfo",
+        ):
+            assert CoolapkClient._check_get_url_path(path) == path
+
+    def test_strict_mode_rejects_unknown_shape(self, monkeypatch):
+        """开启严格模式后，形态不像只读端点的路径被挡（未知写端点也挡住）"""
+        monkeypatch.setattr(CoolapkClient, "GET_URL_STRICT", True)
+        for path in ("/v6/feed/obscureAction", "/v6/user/bindThing"):
+            with pytest.raises(CoolapkError) as excinfo:
+                CoolapkClient._check_get_url_path(path)
+            assert excinfo.value.error_code == 403
+            assert "严格模式" in excinfo.value.message
+
+    def test_default_mode_keeps_escape_hatch(self, monkeypatch):
+        """默认（非严格）仍放行上表未覆盖的只读接口，逃生舱不被收紧"""
+        monkeypatch.setattr(CoolapkClient, "GET_URL_STRICT", False)
+        assert CoolapkClient._check_get_url_path("/v6/feed/obscureAction") == "/v6/feed/obscureAction"
+
+
+# ---------------- 403 / 429 细分：risk vs auth_expired、Retry-After ----------------
+
+_RISK_BODY = {"message": "操作过于频繁，请稍后再试"}
+
+
+class TestHttpStatusClassification:
+    async def test_403_with_risk_hint_becomes_risk(self):
+        """403 + 风控文案：归 risk，不要误导用户去重新登录"""
+        client = _make_client(lambda request: httpx.Response(403, json=_RISK_BODY))
+
+        with pytest.raises(CoolapkError) as excinfo:
+            await client.get("/v6/feed/detail")
+
+        err = excinfo.value
+        assert err.kind == "risk"
+        assert err.retryable is False
+        # 服务端没给 Retry-After 时用保守默认值，而不是 None
+        assert err.retry_after == 120.0
+
+    async def test_403_risk_honours_retry_after_header(self):
+        """403 + Retry-After：把服务端建议等待时间透出来"""
+        client = _make_client(
+            lambda request: httpx.Response(
+                403, json=_RISK_BODY, headers={"Retry-After": "30"}
+            )
+        )
+
+        with pytest.raises(CoolapkError) as excinfo:
+            await client.get("/v6/feed/detail")
+
+        assert excinfo.value.kind == "risk"
+        assert excinfo.value.retry_after == 30.0
+
+    async def test_403_without_hint_stays_auth_expired(self):
+        """空响应体的 403 仍是登录态失效（原有语义不动）"""
+        client = _make_client(lambda request: httpx.Response(403))
+
+        with pytest.raises(CoolapkError) as excinfo:
+            await client.get("/v6/feed/detail")
+
+        assert excinfo.value.kind == "auth_expired"
+
+    async def test_429_with_long_retry_after_stops_retrying(self, monkeypatch):
+        """服务端要求久等（超过退避上限）时不再重试，避免加深封禁"""
+        calls: list[httpx.Request] = []
+
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(429, headers={"Retry-After": "600"})
+
+        client = _make_client(handler)
+
+        with pytest.raises(CoolapkError) as excinfo:
+            await client.get("/v6/feed/detail")
+
+        err = excinfo.value
+        assert err.kind == "rate_limit"
+        assert err.retryable is True
+        assert err.retry_after == 600.0
+        assert len(calls) == 1
+
+    async def test_429_without_header_is_retried(self, monkeypatch):
+        """没有 Retry-After 的 429 仍按可重试处理，耗尽后保留 rate_limit 语义"""
+        monkeypatch.setattr(throttle, "backoff_sleep", _noop_backoff)
+        calls: list[httpx.Request] = []
+
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(429)
+
+        client = _make_client(handler)
+
+        with pytest.raises(CoolapkError) as excinfo:
+            await client.get("/v6/feed/detail")
+
+        assert excinfo.value.kind == "rate_limit"
+        assert excinfo.value.retryable is True
+        assert len(calls) == throttle.MAX_RETRIES + 1
+
+
+class TestStatusHelpers:
+    def test_retry_after_seconds_parses_number(self):
+        resp = httpx.Response(429, headers={"Retry-After": "17"})
+        assert client_mod._retry_after_seconds(resp) == 17.0
+
+    def test_retry_after_seconds_parses_http_date(self):
+        resp = httpx.Response(
+            429, headers={"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"}
+        )
+        got = client_mod._retry_after_seconds(resp)
+        # 历史时间点：已过期按 0 处理，但必须解析成功而不是 None
+        assert got == 0.0
+
+    def test_retry_after_seconds_missing_or_garbage(self):
+        assert client_mod._retry_after_seconds(httpx.Response(429)) is None
+        assert (
+            client_mod._retry_after_seconds(
+                httpx.Response(429, headers={"Retry-After": "soon"})
+            )
+            is None
+        )
+
+    def test_response_hint_extracts_message(self):
+        resp = httpx.Response(403, json={"message": " 被限制 "})
+        assert client_mod._response_hint(resp) == "被限制"
+
+    def test_response_hint_ignores_html(self):
+        resp = httpx.Response(403, text="<html><body>403</body></html>")
+        assert client_mod._response_hint(resp) == ""
+
+
+# ---------------- X-App-Token 短 TTL 缓存 ----------------
+
+
+class TestTokenCache:
+    async def test_reuses_token_within_ttl(self, monkeypatch):
+        """TTL 内复用：连发两次请求只算一次 bcrypt（约 60ms/次）"""
+        calls: list[str] = []
+
+        def fake_token(device_code: str):
+            calls.append(device_code)
+            return f"tok-{len(calls)}", b"blob"
+
+        monkeypatch.setattr(client_mod, "generate_token_v3", fake_token)
+        client = _make_client(_recording_handler([]))
+
+        await client.get("/v6/feed/detail", params={"id": 1})
+        await client.get("/v6/feed/detail", params={"id": 2})
+
+        assert calls == ["test-device-code"]
+
+    async def test_ttl_zero_disables_cache(self, monkeypatch):
+        """TOKEN_CACHE_TTL=0：排障模式，每次请求都重算"""
+        calls: list[str] = []
+
+        def fake_token(device_code: str):
+            calls.append(device_code)
+            return "tok", b"blob"
+
+        monkeypatch.setattr(client_mod, "generate_token_v3", fake_token)
+        monkeypatch.setattr(CoolapkClient, "TOKEN_CACHE_TTL", 0.0)
+        client = _make_client(_recording_handler([]))
+
+        await client.get("/v6/feed/detail", params={"id": 1})
+        await client.get("/v6/feed/detail", params={"id": 2})
+
+        assert len(calls) == 2
+
+
+# ---------------- uid 索引延迟写盘 ----------------
+
+
+class TestUidIndexDebounce:
+    async def test_repeated_lists_collapse_into_one_write(self, monkeypatch):
+        """合并窗口内的多次列表响应只落盘一次，且内容完整"""
+        monkeypatch.setattr(CoolapkClient, "INDEX_SAVE_DELAY", 0.05)
+        payload = [
+            {"entityType": "feed", "id": 1, "uid": 2},
+            {"entityType": "feed", "id": 3, "uid": 4},
+        ]
+        client = _make_client(_recording_handler([], payload=payload))
+
+        writes: list[int] = []
+        original = client._save_uid_index
+
+        def counting() -> None:
+            writes.append(1)
+            original()
+
+        monkeypatch.setattr(client, "_save_uid_index", counting)
+
+        await client.get("/v6/feed/replyList", params={"id": 1})
+        await client.get("/v6/feed/replyList", params={"id": 2})
+        await asyncio.sleep(0.3)
+
+        assert writes == [1]
+        saved = json.loads(CoolapkClient.INDEX_FILE.read_text(encoding="utf-8"))
+        assert saved == {"1": 2, "3": 4}
+
+    async def test_close_flushes_pending_index(self, monkeypatch):
+        """进程退出前 close() 必须把窗口内的脏数据刷掉"""
+        monkeypatch.setattr(CoolapkClient, "INDEX_SAVE_DELAY", 30.0)
+        payload = [{"entityType": "feed", "id": 9, "uid": 8}]
+        client = _make_client(_recording_handler([], payload=payload))
+
+        await client.get("/v6/feed/replyList", params={"id": 1})
+        await client.close()
+
+        saved = json.loads(CoolapkClient.INDEX_FILE.read_text(encoding="utf-8"))
+        assert saved == {"9": 8}

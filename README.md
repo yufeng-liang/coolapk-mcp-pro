@@ -98,7 +98,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `coolapk_image_link` | 把酷安图片转成可在任意聊天窗口显示的签名 https 链接（仅远程 HTTP 模式，需 `COOLAPK_PUBLIC_BASE`） | `urls`（逗号/空格/换行分隔）、`ttl_minutes`（默认 120） |
 | `coolapk_login_status` | 查询当前登录态与登录方式 | 无 |
 | `coolapk_suggest` | 搜索联想词（把口语化需求改写成酷安习惯用词） | `keyword` |
-| `coolapk_get_url` | 只读 GET 透传（访问上表未覆盖的酷安只读接口） | 接口路径与参数 |
+| `coolapk_get_url` | 只读 GET 透传（访问上表未覆盖的酷安只读接口）；`COOLAPK_GET_URL_STRICT=1` 时只放行形态像只读的末段（`detail`/`list`/`space` 等） | 接口路径与参数 |
 | `coolapk_author` | 作者画像与权威度评分（`author_tier` / `is_expert` / `fans_per_feed` / `expertise`），判断「这人是不是该领域大佬」 | `uid` |
 | `coolapk_author_digest` | 作者深挖聚合：一次抓多页他的帖子、按主题过滤并按热度排序，拿到完整攻略链 | `uid`、`keyword`、`pages=1-5`（默认 2）、`top`（默认 10） |
 
@@ -106,7 +106,20 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 
 帖子类结果统一带质量分：`post_score`（点赞 + 评论×3 + 转发×2）与 `discussion_ratio`（评论/点赞），可直接用于排序和判断「这条是干货还是凑数」。
 
-所有工具返回 JSON；出错时返回 `{"error": "…", "error_type": "…"}`，`error_type` 取值：`api`（业务错误）、`captcha`（风控验证码）、`auth_expired`（登录失效）、`network` / `transient`（可重试）、`http`、`parse`。agent 应据 `error_type` 决定重试或引导用户，不要盲目重试。
+所有工具返回 JSON；出错时返回 `{"error": "…", "error_type": "…", "code": …}`，必要时附带 `retry_after`（建议等待秒数）与 `retryable`（只有 `true` 才表示原样重试有意义）。
+
+`error_type` 取值：
+
+| 取值 | 含义 | 建议动作 |
+| - | - | - |
+| `api` | 服务端业务错误 | 看 `error` 内容再决定，别原样重试 |
+| `captcha` | 风控验证码 | 等 `retry_after` 秒，或运行 `coolapk login` 解锁 |
+| `auth_expired` | 登录态失效 | 引导用户重登，重试无效 |
+| `risk` | 风控/频率拦截（HTTP 403 + 风控文案） | 等 `retry_after` 秒再试，**不需要重新登录** |
+| `rate_limit` | 服务端限流（HTTP 429） | 按 `retry_after` 等待；太久则放弃本轮 |
+| `network` / `transient` | 超时 / 连接失败 / 5xx | 可重试（`retryable: true`） |
+| `http` | 其他非 2xx 状态码 | 多半是参数或路径问题，重试无效 |
+| `parse` | 响应不是预期 JSON | 多半撞到风控页，换端点或稍后 |
 
 ## 配置项（环境变量）
 
@@ -115,6 +128,11 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `COOLAPK_LOGIN_MODE` | `auto` | 登录态来源：`auto` = 优先桌面端 accounts.json，回落本地配置；`desktop` = 锁定仅用桌面端；`native` = 仅用本地配置 |
 | `COOLAPK_MIN_INTERVAL` | `1.2` | 相邻 API 请求最小间隔（秒） |
 | `COOLAPK_MAX_RETRIES` | `2` | 瞬态错误（超时 / 5xx / 429）重试次数 |
+| `COOLAPK_MAX_BACKOFF` | `30` | 单次退避等待上限（秒）：重试次数配得很大时，防止一次等上百秒 |
+| `COOLAPK_RATE_LIMIT_MODE` | `global` | `global` = 全局串行（最保守，默认，与历史行为一致）；`bucket` = 按资源分桶各自计时，不同端点可并行、同一端点仍串行（延迟更低，瞬时并发数最多等于桶数） |
+| `COOLAPK_TOKEN_TTL` | `60` | `X-App-Token` 复用窗口（秒）：一次 v3 生成约 60ms 纯 CPU，窗口内复用；设 `0` 则每次重算（排障用） |
+| `COOLAPK_INDEX_SAVE_DELAY` | `1` | `uid_index.json` 落盘合并窗口（秒）：窗口内的新 id 累积成一次写盘，退出前自动刷盘 |
+| `COOLAPK_GET_URL_STRICT` | 未设 | 设为 `1` 开启 `coolapk_get_url` 严格模式：在写端点黑名单之上再加正向白名单，只放行末段形态像只读端点的路径（`detail`/`list`/`info`/`space`/`search`…），未知的新写端点也进不来。默认关闭，保留「透传未覆盖只读接口」的逃生舱 |
 | `COOLAPK_NO_CACHE` | 未设 | 设为 `1` 禁用 GET 缓存（调试用） |
 | `COOLAPK_MAX_REPLY_PAGES` | `30` | `all_replies` 全量评论翻页上限（1-100，大帖防刷屏防风控） |
 | `COOLAPK_BROWSER` | 未设 | 指定浏览器可执行文件路径（`coolapk login --web` 用）；不设则自动查找 Chrome / Edge |

@@ -1,5 +1,22 @@
 # 更新日志
 
+## 未发布
+
+### 新增
+
+- 错误响应新增 `retryable` 标记（仅在可重试时为 `true`）：`network` / `transient` / `rate_limit` 可原样重试，`auth_expired` / `risk` / `api` 重试无效，agent 不必靠 error_type 猜。
+- 新增 `error_type=risk`：HTTP 403 且响应体是风控/频率文案时归入此类，附 `retry_after`（优先用服务端 `Retry-After`，缺省 120 秒）。此前这类 403 一律报「登录态已失效」，会把用户误导去重新登录。
+- 新增 `error_type=rate_limit`：HTTP 429 单独归类并解析服务端 `Retry-After`；建议等待时间超过退避上限（`COOLAPK_MAX_BACKOFF`，默认 30 秒）时不再重试，直接交回调用方，避免加重封禁。
+- 新增 `COOLAPK_GET_URL_STRICT=1` 严格模式：`coolapk_get_url` 除写端点黑名单外，还要求末段形态像只读端点（`detail`/`list`/`info`/`space`…），未来新增的写端点也会被挡住；默认关闭以保留只读透传的逃生舱。
+
+### 优化
+
+- `X-App-Token` 增加短 TTL 复用（`COOLAPK_TOKEN_TTL`，默认 60 秒）并移出事件循环（`asyncio.to_thread`）：此前每个请求都在事件循环里同步跑一次 bcrypt（约 60ms 纯 CPU），既浪费算力又阻塞其它并发任务。
+- `uid_index.json` 改为合并写盘（`COOLAPK_INDEX_SAVE_DELAY`，默认 1 秒）并线程卸载：此前每来一个新 feed_id 就把整份索引（最多 2000 条）同步写一次盘，翻页时等于每页一次阻塞 I/O；退出前由 `close()` 兜底刷盘。
+- 限速器支持分桶（`COOLAPK_RATE_LIMIT_MODE=bucket`）：按 `/v6/<资源>` 分桶各自计时，跨桶可并行、桶内仍严格串行；默认 `global` 与历史行为完全一致。
+- `coolapk_feed_detail` 的 `comments_focus` 两路评论（楼主 / 热门）改为并发发起：默认全局限速下与串行等价，开启 `bucket` 模式后才真正并行缩短耗时。
+- 退避等待增加上限（`COOLAPK_MAX_BACKOFF`，默认 30 秒）：此前 `COOLAPK_MAX_RETRIES` 配到 8 时单次等待可超过 100 秒。
+
 ## 0.6.9（2026-11-08）
 
 ### 修复

@@ -335,3 +335,23 @@ def test_catch_api_error_omits_retry_after_when_unknown() -> None:
 
     assert payload["error_type"] == "api"
     assert "retry_after" not in payload
+
+
+def test_catch_api_error_only_marks_retryable_when_true() -> None:
+    """retryable 仅在为真时出现：可重试错误带键，登录失效/业务错误不带。"""
+
+    @server._catch_api_error
+    async def flaky() -> str:
+        raise CoolapkError("HTTP 503", 503, kind="transient", retryable=True)
+
+    @server._catch_api_error
+    async def expired() -> str:
+        raise CoolapkError("登录态已失效", 403, kind="auth_expired")
+
+    ok = json.loads(asyncio.run(flaky()))
+    assert ok["retryable"] is True
+    assert ok["error_type"] == "transient"
+
+    bad = json.loads(asyncio.run(expired()))
+    assert "retryable" not in bad
+    assert bad["error_type"] == "auth_expired"

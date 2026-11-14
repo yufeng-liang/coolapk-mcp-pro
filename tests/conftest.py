@@ -34,3 +34,17 @@ def isolated_config(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CONFIG_DIR", config_dir)
     monkeypatch.setattr(config, "CONFIG_FILE", config_file)
     return config_file
+
+
+@pytest.fixture(autouse=True)
+def isolated_uid_index(tmp_path, monkeypatch):
+    """隔离 uid 索引文件：CoolapkClient.INDEX_FILE 指向 tmp_path
+
+    _index_feeds 在列表响应后会写 ~/.coolapk-mcp/uid_index.json（本轮改成延迟 +
+    线程卸载写盘，测试结束时可能仍有在途任务），不隔离会污染开发者本机真实索引。
+    """
+    from coolapk_mcp.client import CoolapkClient
+
+    index_file = tmp_path / "uid_index.json"
+    monkeypatch.setattr(CoolapkClient, "INDEX_FILE", index_file)
+    return index_file

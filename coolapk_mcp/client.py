@@ -1,12 +1,14 @@
 """HTTP 客户端 + API 封装 — 合并网络层和业务端点"""
 
 import asyncio
+import email.utils
 import hashlib
 import json
 import os
 import re
 import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -36,7 +38,11 @@ class CoolapkError(Exception):
           transient(5xx/429等可重试) http(其他HTTP错误) parse(响应解析失败)
           auth_expired(登录态失效) config(本地配置/资源缺失，如缺 libauth blob)
 
-    retry_after: 仅 captcha 类有实际意义——端点冷却剩余秒数，None 表示未知/不适用
+    retry_after: 仅 captcha / risk / rate_limit 类有实际意义——建议等待秒数，
+                 None 表示未知/不适用
+    retryable: 客户端是否可以「原样重试」。network/transient/rate_limit 为 True，
+               http/auth_expired/api/captcha/risk/parse/config 为 False——上层据此
+               决定是提示用户稍后重试，还是引导重登/换设备。
     """
 
     def __init__(
@@ -45,12 +51,118 @@ class CoolapkError(Exception):
         error_code: int = -1,
         kind: str = "api",
         retry_after: float | None = None,
+        retryable: bool = False,
     ):
         self.message = message
         self.error_code = error_code
         self.kind = kind
         self.retry_after = retry_after
+        self.retryable = retryable
         super().__init__(message)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """布尔开关：1/true/yes/on 为真，0/false/no/off 为假，其余回默认"""
+    raw = (os.environ.get(name) or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+# 403 响应体里出现这些词，说明是风控/频率类拦截而非登录失效。
+# 这类情况把 kind 归成 risk：重置登录态（清 client）解决不了问题，
+# 反倒会让上层误判成「需要用户重新登录」。
+_RISK_HINTS = (
+    "频繁", "风控", "验证", "稍后", "限制", "拦截", "禁止",
+    "captcha", "forbidden", "rate limit", "too many", "blocked",
+)
+
+
+def _retry_after_seconds(resp: "httpx.Response") -> float | None:
+    """解析 Retry-After 头（秒数或 HTTP-date），拿不到返回 None"""
+    raw = (resp.headers.get("retry-after") or "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+# 只读端点的「形态特征」：末段以这些词收尾的一律视为读端点
+# （detail/list/info/space 等）。严格模式下用它做正向白名单，
+# 反向命中写动词的一律拒绝，宁可让用户显式关掉严格模式。
+_READ_SUFFIXES = (
+    "list", "detail", "index", "info", "space", "profile", "explore",
+    "recommend", "suggest", "search", "hot", "latest", "refresh", "init",
+    "share", "count", "meta", "timeline", "history", "rank", "feeds",
+    "comments", "replys", "board", "boards", "tag", "tags", "status",
+    "checklogininfo", "requestvalidate", "notification", "notice", "feed",
+)
+
+
+# 少数只读端点的路径就是「模块名」本身（/v6/search、/v6/main/init 的近亲），
+# 没有子段可判形态，单独放行
+_READ_MODULES = ("search", "main", "board", "notification")
+
+
+def _looks_read_only(path_part: str) -> bool:
+    """按末段形态判断是否是只读端点（严格模式的正向白名单）
+
+    只看末段：/v6/feed/detail 的 detail 命中，/v6/feed/like 的 like 不命中；
+    /v6/user/123 这类以纯数字结尾的也放行（酷安没有数字结尾的写端点）。
+    """
+    segs = [seg.lower() for seg in path_part.strip("/").split("/") if seg]
+    if len(segs) < 2 or segs[0] != "v6":
+        return False
+    tail = segs[1:]
+    if len(tail) == 1:
+        return tail[0] in _READ_MODULES
+    last = tail[-1]
+    if last.isdigit():
+        return True
+    return any(last.endswith(suffix) for suffix in _READ_SUFFIXES)
+
+
+def _response_hint(resp: "httpx.Response", limit: int = 200) -> str:
+    """从错误响应里抠一句可读的话：JSON 取 message/error/msg，纯文本原样截断
+
+    HTML 错误页（网关、CDN）没有信息量，返回空串，避免把整页标签塞进错误文案。
+    """
+    try:
+        text = (resp.text or "").strip()
+    except Exception:  # 解码失败（编码损坏 / 已被消费）都不该影响错误分类
+        return ""
+    if not text:
+        return ""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return "" if text.startswith("<") else text[:limit]
+    if isinstance(data, dict):
+        for key in ("message", "error", "msg"):
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()[:limit]
+    return ""
 
 
 def _extract_request_hash(html: str) -> str:
@@ -99,6 +211,13 @@ class CoolapkClient:
     # feed_id → 作者uid 索引，持久化到 ~/.coolapk-mcp/uid_index.json
     INDEX_FILE = Path.home() / ".coolapk-mcp" / "uid_index.json"
     INDEX_MAX = 2000
+    # X-App-Token 短 TTL 复用窗口（秒）：0 表示每次请求都重算（排障用）
+    TOKEN_CACHE_TTL = _env_float("COOLAPK_TOKEN_TTL", 60.0)
+    # uid 索引落盘的合并窗口（秒）：窗口内的新 id 累积成一次写
+    INDEX_SAVE_DELAY = _env_float("COOLAPK_INDEX_SAVE_DELAY", 1.0)
+    # get_url 严格模式：默认关（保留「未覆盖只读接口」的逃生舱），
+    # 打开后除黑名单外还要求末段形态像只读端点，未知新写端点也会被挡住
+    GET_URL_STRICT = _env_flag("COOLAPK_GET_URL_STRICT", False)
 
     def __init__(self, config: AppConfig | None = None):
         self.config = config or AppConfig.load()
@@ -113,6 +232,10 @@ class CoolapkClient:
         self._inflight: dict[str, asyncio.Future] = {}
         self._blocked: dict[str, float] = {}
         self._uid_index: dict[int, int] = {}
+        self._token_value: str = ""
+        self._token_at: float = 0.0
+        self._index_dirty = False
+        self._index_flush_task: asyncio.Task | None = None
         self._load_uid_index()
 
     # ---- feed_id → uid 索引（详情回落的关键） ----
@@ -159,17 +282,50 @@ class CoolapkClient:
             except (TypeError, ValueError):
                 continue
         if changed:
+            self._mark_index_dirty()
+
+    def _mark_index_dirty(self) -> None:
+        """标记索引脏并安排一次延迟落盘，避免在事件循环里同步写盘
+
+        原先每来一个新 feed_id 就把整份索引（最多 2000 条）写一次盘，
+        高频翻页时等于每页一次磁盘 I/O 且全程占住事件循环。改为 1s 合并窗口，
+        写盘本身再用 to_thread 卸载；进程退出前由 close() 兜底落盘。
+        """
+        self._index_dirty = True
+        if self._index_flush_task is not None and not self._index_flush_task.done():
+            return
+        try:
+            self._index_flush_task = asyncio.get_running_loop().create_task(
+                self._flush_index_later()
+            )
+        except RuntimeError:
+            # 没有运行中的事件循环（同步调试路径）：退回立即写，保证不丢数据
+            self._index_dirty = False
             self._save_uid_index()
 
-    def _build_headers(self) -> dict[str, str]:
-        """组装请求头，每次请求重新生成 X-App-Token（v3 算法）
-
-        token 依赖 libauth blob（auth_blob.bin 或从酷安 APK 现场提取）：
-        get_blob 缺文件时抛 RuntimeError，读盘失败抛 OSError。这里统一包成
-        kind="config"，避免裸异常从 _request 逃出、上层无法按 error_type 分类。
-        """
+    async def _flush_index_later(self) -> None:
         try:
-            token, _ = generate_token_v3(self.config.device_code)
+            await asyncio.sleep(self.INDEX_SAVE_DELAY)
+        except asyncio.CancelledError:
+            raise
+        if not self._index_dirty:
+            return
+        self._index_dirty = False
+        await asyncio.to_thread(self._save_uid_index)
+
+    async def _app_token(self) -> str:
+        """取 X-App-Token：短 TTL 复用 + 线程卸载
+
+        一次 v3 生成是 bcrypt cost=10 的纯 CPU 运算（约 60ms），原先每个请求
+        都在事件循环里同步算一遍，既浪费算力又把并发全堵死。token 只校验
+        设备/版本一致性，短窗口内复用完全安全（默认 60s，可关）。
+        """
+        ttl = self.TOKEN_CACHE_TTL
+        now = time.monotonic()
+        if ttl > 0 and self._token_value and now - self._token_at < ttl:
+            return self._token_value
+        try:
+            token, _ = await asyncio.to_thread(generate_token_v3, self.config.device_code)
         except (RuntimeError, OSError) as exc:
             raise CoolapkError(
                 f"无法生成 X-App-Token（{type(exc).__name__}: {exc}）"
@@ -177,6 +333,14 @@ class CoolapkClient:
                 f"或把酷安 APK 放到 {APK_CACHE_FILE}（下次生成 token 时自动提取 blob）",
                 kind="config",
             ) from exc
+        if ttl > 0:
+            self._token_value = token
+            self._token_at = now
+        return token
+
+    async def _build_headers(self) -> dict[str, str]:
+        """组装请求头（X-App-Token 由 _app_token 缓存与线程卸载）"""
+        token = await self._app_token()
         return {
             "X-Sdk-Int": "35",
             "X-Sdk-Locale": "zh-CN",
@@ -310,14 +474,16 @@ class CoolapkClient:
         last_err: CoolapkError | None = None
         last_status: int | None = None
         for attempt in range(throttle.MAX_RETRIES + 1):
-            await self._limiter.acquire()
+            # 限速桶：默认 global 模式下参数被忽略（行为与历史版本一致）；
+            # COOLAPK_RATE_LIMIT_MODE=bucket 时按资源段各自计时
+            await self._limiter.acquire(throttle.bucket_for(base))
             # 二次缓存检查：并发调用都过了首查，但先到的那个已经在限速窗口内
             # 打完请求并写好了缓存；这里命中就直接返回，不重复打服务器
             if cache_key is not None:
                 cached = self._cache.get(cache_key)
                 if cached is not None:
                     return cached
-            headers = self._build_headers()
+            headers = await self._build_headers()
             cookie = self._get_cookie_header()
             if cookie:
                 headers["Cookie"] = cookie
@@ -331,26 +497,60 @@ class CoolapkClient:
                 break
             except httpx.TimeoutException:
                 last_status = None
-                err = CoolapkError("请求超时", kind="network")
+                err = CoolapkError("请求超时", kind="network", retryable=True)
             except httpx.ConnectError:
                 last_status = None
-                err = CoolapkError("无法连接服务器", kind="network")
+                err = CoolapkError("无法连接服务器", kind="network", retryable=True)
             except httpx.HTTPStatusError as e:
                 code = e.response.status_code
                 last_status = code
+                retry_after = _retry_after_seconds(e.response)
                 if code == 403:
-                    # 403 通常是登录态失效（captchaRequired / 会话无效）
+                    hint = _response_hint(e.response)
+                    if hint and any(w in hint.lower() for w in _RISK_HINTS):
+                        # 风控/频率类 403：登录态可能完好，清 client 重登解决不了问题，
+                        # 归成 risk 让上层提示「稍后重试」，别把用户赶去重新登录
+                        raise CoolapkError(
+                            f"请求被风控拦截（{hint}）",
+                            error_code=403,
+                            kind="risk",
+                            retry_after=retry_after if retry_after is not None else 120.0,
+                        )
+                    # 其余 403 仍是登录态失效（captchaRequired / 会话无效）
                     raise CoolapkError(AUTH_EXPIRED_MESSAGE, error_code=403, kind="auth_expired")
-                kind = "transient" if (code >= 500 or code == 429) else "http"
-                err = CoolapkError(f"HTTP {code}", kind=kind)
+                if code == 429:
+                    # 服务端明确限流：退避上限都追不上 Retry-After 时，重试只会
+                    # 加深封禁，直接把这轮交回调用方（retryable=True 但要求久等）
+                    err = CoolapkError(
+                        "请求过于频繁（服务端限流）",
+                        error_code=429,
+                        kind="rate_limit",
+                        retry_after=retry_after,
+                        retryable=True,
+                    )
+                    if retry_after is not None and retry_after > throttle.MAX_BACKOFF:
+                        raise err
+                else:
+                    kind = "transient" if code >= 500 else "http"
+                    err = CoolapkError(
+                        f"HTTP {code}",
+                        error_code=code,
+                        kind=kind,
+                        retry_after=retry_after,
+                        retryable=code >= 500,
+                    )
             except (httpx.HTTPError, httpx.InvalidURL) as e:
                 # 兜底：ReadError/RemoteProtocolError/ProxyError 等散装 httpx 异常
                 # （以及不属于 HTTPError 家族的 InvalidURL）统一归入 network 走重试，
                 # 文案带异常类名，便于区分「连接被重置」还是「URL 非法」。
                 # asyncio.CancelledError 继承 BaseException，不会被这层接住。
                 last_status = None
-                err = CoolapkError(f"请求异常({type(e).__name__}): {e}", kind="network")
-            if err is not None and err.kind not in ("network", "transient"):
+                err = CoolapkError(
+                    f"请求异常({type(e).__name__}): {e}", kind="network", retryable=True
+                )
+            if err is not None and not err.retryable:
+                # 不可重试（http/risk）/可直接上报（auth_expired）的错误立即抛出，
+                # 不再白白消耗退避配额
                 raise err
             last_err = err
             if attempt < throttle.MAX_RETRIES:
@@ -365,6 +565,8 @@ class CoolapkClient:
                 f"{last_err.message}（重试 {throttle.MAX_RETRIES} 次后仍失败）",
                 error_code=last_status if last_status is not None else -1,
                 kind=last_err.kind,
+                retry_after=last_err.retry_after,
+                retryable=last_err.retryable,
             )
         if resp is None:
             raise CoolapkError("请求失败", kind="network")
@@ -565,6 +767,16 @@ class CoolapkClient:
                     f"拒绝写操作端点: {path}",
                     error_code=403, kind="api",
                 )
+        # 严格模式：黑名单之上再加正向白名单（末段形态像只读端点才放行）。
+        # 默认关闭，因为 get_url 的定位是「上表未覆盖只读接口」的逃生舱；
+        # 需要「未知新写端点也进不来」的场景再打开。
+        if cls.GET_URL_STRICT and not _looks_read_only(path_part):
+            raise CoolapkError(
+                f"严格模式拒绝非常规只读形态的路径: {path}"
+                f"（仅放行 detail/list/info/space 等只读末段；"
+                f"如需透传请设 COOLAPK_GET_URL_STRICT=0）",
+                error_code=403, kind="api",
+            )
         return path
 
     async def get_url(self, path: str) -> Any:
@@ -1494,6 +1706,13 @@ class CoolapkClient:
         return result
 
     async def close(self):
+        # 退出前把待落盘的 uid 索引刷掉：合并窗口里的脏数据不能丢
+        task = self._index_flush_task
+        if task is not None and not task.done():
+            task.cancel()
+        if self._index_dirty:
+            self._index_dirty = False
+            self._save_uid_index()
         await self._client.aclose()
 
     async def __aenter__(self):

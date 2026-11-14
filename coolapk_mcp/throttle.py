@@ -32,6 +32,11 @@ try:
 except (OverflowError, ValueError):
     MAX_RETRIES = 2
 CACHE_ENABLED = os.environ.get("COOLAPK_NO_CACHE", "") not in ("1", "true", "True")
+# 限速模式：global = 全局串行（默认，最保守，行为与历史版本一致）；
+# bucket = 按端点资源分桶各自计时，不同端点互不阻塞，配合并发可缩短一次工具调用的总耗时
+RATE_LIMIT_MODE = (os.environ.get("COOLAPK_RATE_LIMIT_MODE") or "global").strip().lower()
+# 单次退避等待上限（秒）：重试次数配置得很大时，2**attempt 会膨胀到上百秒，钉住上限
+MAX_BACKOFF = max(0.0, _env_float("COOLAPK_MAX_BACKOFF", 30.0))
 
 # 各端点缓存时长（秒）：内容越稳定 TTL 越长
 _TTL_BY_PREFIX: list[tuple[str, float]] = [
@@ -53,20 +58,50 @@ def ttl_for(path: str) -> float:
     return _DEFAULT_TTL
 
 
-class RateLimiter:
-    """全局串行限速：无论并发多少调用，相邻请求间隔不小于 min_interval"""
+def bucket_for(path: str) -> str:
+    """取 /v6/<资源>/... 的资源段作为限速桶名，取不到时归入 default
 
-    def __init__(self, min_interval: float = MIN_INTERVAL):
+    只按第一段资源分桶：feed / user / topic / search 各自计时，
+    同一资源下的不同子端点共享一个桶，避免并发时把同一资源打成并发。
+    """
+    parts = [p for p in path.split("?", 1)[0].strip("/").split("/") if p]
+    if len(parts) >= 2 and parts[0] == "v6":
+        return parts[1]
+    return "default"
+
+
+class RateLimiter:
+    """限速器：默认全局串行；bucket 模式下按桶各自计时
+
+    - global（默认）：无论并发多少调用，任意两次请求间隔不小于 min_interval，
+      行为与历史版本完全一致，最保守。
+    - bucket：每个桶独立计时，跨桶可并行；桶内仍严格串行。
+      代价是瞬时并发数上升（最多等于桶数），仅在明确要压延迟时开启。
+    """
+
+    def __init__(self, min_interval: float = MIN_INTERVAL, mode: str | None = None):
         self.min_interval = max(0.0, min_interval)
+        self.mode = (mode or RATE_LIMIT_MODE)
         self._lock = asyncio.Lock()
         self._last = 0.0
+        self._bucket_locks: dict[str, asyncio.Lock] = {}
+        self._bucket_last: dict[str, float] = {}
 
-    async def acquire(self) -> None:
-        async with self._lock:
-            wait = self._last + self.min_interval - time.monotonic()
+    async def acquire(self, bucket: str = "") -> None:
+        if self.mode != "bucket":
+            async with self._lock:
+                wait = self._last + self.min_interval - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                self._last = time.monotonic()
+            return
+        key = bucket or "default"
+        lock = self._bucket_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            wait = self._bucket_last.get(key, 0.0) + self.min_interval - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(wait)
-            self._last = time.monotonic()
+            self._bucket_last[key] = time.monotonic()
 
 
 class TTLCache:
@@ -95,6 +130,8 @@ class TTLCache:
 
 
 async def backoff_sleep(attempt: int) -> None:
-    """指数退避 + 抖动：0.8s, 1.6s, ..."""
+    """指数退避 + 抖动：0.8s, 1.6s, ...，单次不超过 MAX_BACKOFF"""
     delay = 0.8 * (2 ** attempt) + random.uniform(0, 0.4)
+    if MAX_BACKOFF:
+        delay = min(delay, MAX_BACKOFF)
     await asyncio.sleep(delay)

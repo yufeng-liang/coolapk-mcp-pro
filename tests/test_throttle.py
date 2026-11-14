@@ -149,6 +149,68 @@ async def test_backoff_sleep_grows_exponentially(fake_sleep, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_backoff_sleep_respects_max_backoff(fake_sleep, monkeypatch):
+    """重试次数配置很大时，单次退避也要被 COOLAPK_MAX_BACKOFF 钉住"""
+    monkeypatch.setattr(throttle.random, "uniform", lambda a, b: 0.0)
+    monkeypatch.setattr(throttle, "MAX_BACKOFF", 3.0)
+
+    for attempt in range(6):
+        await throttle.backoff_sleep(attempt)
+
+    assert fake_sleep == [0.8, 1.6, 3.0, 3.0, 3.0, 3.0]
+
+
+# ------------------------------------------------------- 限速分桶（bucket 模式）
+
+
+class TestBucketFor:
+    def test_resource_segment(self):
+        """取 /v6/<资源>/... 的资源段作为桶名"""
+        assert throttle.bucket_for("/v6/feed/detail?id=1") == "feed"
+        assert throttle.bucket_for("/v6/user/space") == "user"
+        assert throttle.bucket_for("/v6/search?type=feed&q=x") == "search"
+
+    def test_fallback_to_default(self):
+        """非 /v6/资源/... 形态一律归入 default 桶"""
+        assert throttle.bucket_for("") == "default"
+        assert throttle.bucket_for("/v6") == "default"
+        assert throttle.bucket_for("/health") == "default"
+
+
+@pytest.mark.asyncio
+async def test_bucket_mode_does_not_block_across_buckets():
+    """bucket 模式：不同桶各自计时，跨桶不互相等待"""
+    limiter = throttle.RateLimiter(min_interval=0.05, mode="bucket")
+
+    start = time.perf_counter()
+    await asyncio.gather(limiter.acquire("feed"), limiter.acquire("user"))
+
+    assert time.perf_counter() - start < 0.045
+
+
+@pytest.mark.asyncio
+async def test_bucket_mode_serializes_same_bucket():
+    """bucket 模式：同一个桶内仍然严格串行"""
+    limiter = throttle.RateLimiter(min_interval=0.05, mode="bucket")
+
+    start = time.perf_counter()
+    await asyncio.gather(limiter.acquire("feed"), limiter.acquire("feed"))
+
+    assert time.perf_counter() - start >= 0.045
+
+
+@pytest.mark.asyncio
+async def test_global_mode_ignores_bucket_argument():
+    """默认 global 模式：即使带桶名也全局串行（与历史行为一致）"""
+    limiter = throttle.RateLimiter(min_interval=0.05, mode="global")
+
+    start = time.perf_counter()
+    await asyncio.gather(limiter.acquire("feed"), limiter.acquire("user"))
+
+    assert time.perf_counter() - start >= 0.045
+
+
+@pytest.mark.asyncio
 async def test_backoff_sleep_jitter_within_bounds(fake_sleep):
     """真实抖动落在 [base, base+0.4) 区间内，且严格随 attempt 增长"""
     for attempt in range(3):

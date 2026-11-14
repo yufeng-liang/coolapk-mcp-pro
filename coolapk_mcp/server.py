@@ -301,12 +301,18 @@ def _prepare_feeds(
 
 
 def _error_json(
-    message: str, error_type: str, code: int = -1, retry_after: float | None = None
+    message: str,
+    error_type: str,
+    code: int = -1,
+    retry_after: float | None = None,
+    retryable: bool = False,
 ) -> str:
-    """统一的工具错误输出结构：error / error_type / code（可选 retry_after）。
+    """统一的工具错误输出结构：error / error_type / code（可选 retry_after、retryable）。
 
-    retry_after 只在风控冷却类错误（CoolapkError.retry_after 非 None）时出现：
-    单位秒、保留一位小数，agent 可据此决定等多久再重试，其余字段保持不变。
+    retry_after 只在有明确建议等待时间时出现（风控冷却、服务端 Retry-After）：
+    单位秒、保留一位小数。retryable 仅在 True 时出现，告诉 agent「原样重试是否有
+    意义」——network/transient/rate_limit 为真，auth_expired/risk/api 为假。
+    两个键都只在有值时才输出，避免给简单错误塞一堆 null。
     """
     payload: dict[str, Any] = {
         "error": message,
@@ -315,6 +321,8 @@ def _error_json(
     }
     if retry_after is not None:
         payload["retry_after"] = round(float(retry_after), 1)
+    if retryable:
+        payload["retryable"] = True
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -336,7 +344,9 @@ def _catch_api_error(fn):
                 # 下次调用重建并重新读 config——桌面端重登后直接重试即可生效
                 logger.info("检测到登录态失效，关闭并丢弃旧 client")
                 await _reset_client()
-            return _error_json(e.message, e.kind, e.error_code, e.retry_after)
+            return _error_json(
+                e.message, e.kind, e.error_code, e.retry_after, e.retryable
+            )
         except (asyncio.TimeoutError, httpx.HTTPError) as exc:
             logger.warning("工具 %s 网络异常：%s", getattr(fn, "__name__", "?"), exc)
             return _error_json(
@@ -459,25 +469,46 @@ async def coolapk_feed_detail(
     merged: list[dict] = []
     if focus in ("smart", "author", "hot"):
         budget = Budget(max_requests=FOCUS_MAX_PAGES * 2 + 2, deadline=25.0)
-        author_res: Any = None
-        hot_res: Any = None
+        # 两路评论并发发起：global 限速模式下仍会被限速器串行化（行为与串行等价），
+        # 只有 COOLAPK_RATE_LIMIT_MODE=bucket 时才真正并行压延迟。
+        # Budget.take() 是同步自增，共享同一个 Budget 不需要额外加锁。
+        jobs: list[tuple[str, Any]] = []
+        if focus in ("smart", "author"):
+            jobs.append(
+                (
+                    "author",
+                    client.get_author_replies_paged(
+                        feed_id, max_pages=FOCUS_MAX_PAGES, budget=budget
+                    ),
+                )
+            )
+        if focus in ("smart", "hot"):
+            jobs.append(
+                (
+                    "hot",
+                    client.get_popular_replies_paged(
+                        feed_id, max_pages=FOCUS_MAX_PAGES, budget=budget
+                    ),
+                )
+            )
+        outcomes = await asyncio.gather(*(job for _, job in jobs), return_exceptions=True)
         error_note = ""
         budget_hit = False
-        try:
-            if focus in ("smart", "author"):
-                author_res = await client.get_author_replies_paged(
-                    feed_id, max_pages=FOCUS_MAX_PAGES, budget=budget
-                )
-            if focus in ("smart", "hot"):
-                hot_res = await client.get_popular_replies_paged(
-                    feed_id, max_pages=FOCUS_MAX_PAGES, budget=budget
-                )
-        except BudgetExceeded:
-            # 预算耗尽：已拿到的来源照常展示，没取的部分按截断处理
-            budget_hit = True
-            error_note = "请求预算耗尽，已返回部分评论"
-        except CoolapkError:
-            error_note = "评论聚焦拉取失败，已回落默认列表"
+        fetched: dict[str, Any] = {}
+        for (name, _), res in zip(jobs, outcomes):
+            if isinstance(res, BudgetExceeded):
+                # 预算耗尽：已拿到的来源照常展示，没取的部分按截断处理
+                budget_hit = True
+                error_note = "请求预算耗尽，已返回部分评论"
+            elif isinstance(res, CoolapkError):
+                error_note = "评论聚焦拉取失败，已回落默认列表"
+            elif isinstance(res, BaseException):
+                # 非预期异常照旧向上抛，由 _catch_api_error 统一兜底
+                raise res
+            else:
+                fetched[name] = res
+        author_res = fetched.get("author")
+        hot_res = fetched.get("hot")
 
         author_list: list[dict] = list(author_res or [])
         hot_list: list[dict] = list(hot_res or [])
@@ -927,6 +958,8 @@ async def coolapk_get_url(path: str) -> str:
     （点赞/回复/关注/发帖/私信等）一律 403 拒绝。响应保留原始
     结构（键名为酷安原始 camelCase），仅剔除 cookie/token 等敏感字段。
     适合获取列表页未覆盖的数据（应用详情、板块、二级评论等）。
+    设 COOLAPK_GET_URL_STRICT=1 时额外要求末段形态像只读端点
+    （detail/list/info/space 等），未知写端点会被提前挡住。
 
     Args:
         path: 接口路径或完整 URL，如 /v6/apk/detail?id=com.tencent.mm
