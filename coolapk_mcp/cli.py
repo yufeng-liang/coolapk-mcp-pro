@@ -7,7 +7,7 @@ import sys
 import tempfile
 from functools import wraps
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import click
 
@@ -343,14 +343,22 @@ async def topic(tag, feeds, page):
 @click.argument("ntype", default="checkCount",
                 type=click.Choice(["checkCount", "atMeMeFeed", "atComment", "comment", "feedLike", "contactsFollow", "message"]))
 @click.option("--page", default=1, type=int)
+@click.option("--with-count", "with_count", is_flag=True, help="附带给未读数（多一次请求；checkCount 本身即未读数）")
 @async_command
-async def notify(ntype, page):
-    """查看通知"""
+async def notify(ntype, page, with_count):
+    """查看通知（默认只输出列表本体，--with-count 时包成 {items, counts}）"""
     async with CoolapkClient() as client:
         if ntype == "checkCount":
-            data = await client.get_notification_count()
-        else:
-            data = await client.get_notifications(ntype, page)
+            _output(await client.get_notification_count())
+            return
+        data = await client.get_notifications(ntype, page)
+        if with_count:
+            try:
+                counts = await client.get_notification_count()
+            except CoolapkError as exc:
+                counts = {"error": exc.message}
+            _output({"items": data, "counts": counts})
+            return
     _output(data)
 
 
@@ -362,6 +370,9 @@ async def notify(ntype, page):
 @async_command
 async def app_detail(package_name):
     """应用详情（按包名，如 com.coolapk.market）"""
+    # 与服务端同口径：空包名直接给可读错误，不发请求（服务端只会回「未知的查询参数」）
+    if not package_name.strip():
+        _output_error(CoolapkError("package_name 不能为空", error_code=-1, kind="api"))
     async with CoolapkClient() as client:
         raw = await client.get_app_detail(package_name)
     if isinstance(raw, list) and raw:
@@ -372,10 +383,16 @@ async def app_detail(package_name):
 @cli.command("author")
 @click.argument("uid", type=int)
 @click.option("--top", default=10, type=int, help="附带评分最高的 N 条动态（0=不带，上限 50）")
+@click.option("--pages", default=2, type=int, help="抓取页数（1-5）；作者的高分动态常在第 2/3 页")
 @async_command
-async def author(uid, top):
-    """作者画像：等级/粉丝/专长推断 + 高分动态"""
+async def author(uid, top, pages):
+    """作者画像：等级/粉丝/专长推断 + 高分动态
+
+    与 MCP 工具 coolapk_author_digest 同口径：多页抓取并按 post_score 排序，
+    返回 pages/fetched/truncated/next_page 元数据，避免把「最新一页」当「全部」。
+    """
     limit = max(0, min(top, 50))
+    wanted = max(1, min(pages, 5))
     async with CoolapkClient() as client:
         raw = await client.get_user_space(uid)
         if isinstance(raw, list) and raw:
@@ -383,21 +400,23 @@ async def author(uid, top):
         profile = UserModel.from_api(raw) if isinstance(raw, dict) else None
         data = profile.model_dump(mode="json", exclude_defaults=True) if profile else {}
         posts: list[dict] = []
-        if data and limit:
-            feeds = await client.get_user_feeds(uid, 1)
-            for item in _parse_feeds(feeds):
+        meta: dict = {}
+        if data:
+            budget = Budget(max_requests=wanted + 2, deadline=20.0)
+            result = await client.get_user_feeds_pages(uid, pages=wanted, budget=budget)
+            for item in _parse_feeds(list(result)):
                 entry = item.model_dump(mode="json", exclude_defaults=True)
-                entry["post_score"] = scoring.post_score(
-                    item.like_num, item.reply_num, item.forward_num
-                )
+                # annotate_post 同时补 post_score 与 discussion_ratio，字段与服务端一致
+                scoring.annotate_post(entry)
                 posts.append(entry)
             posts.sort(key=lambda p: p["post_score"], reverse=True)
-            # 专长推断看正文关键词，取前 5 条足够（不做全量抓取，CLI 要快）
-            data["posts_texts"] = [str(p.get("content") or "")[:600] for p in posts[:5]]
-    if not data:
-        _output(None)
-    data.update(scoring.summarize_author(data))
-    if posts:
+            meta = {**result.meta(), "pages": wanted, "fetched": len(posts)}
+        if not data:
+            _output(None)
+        # 专长推断看正文关键词，取前 5 条足够；与 --top 无关，--top 0 也要留着
+        data["posts_texts"] = [str(p.get("content") or "")[:600] for p in posts[:5]]
+        data.update(scoring.summarize_author(data))
+        data.update(meta)
         data["top_posts"] = posts[:limit]
     _output(data)
 
@@ -431,9 +450,25 @@ async def get_url(path):
     _output(apply_tool_whitelist("get_url", data))
 
 
+@cli.command("image")
+@click.argument("url")
+@click.option("-o", "--output", "output_path", default="", help="保存路径（默认写到当前目录，文件名取自 URL）")
+@async_command
+async def image(url, output_path):
+    """下载酷安图片到本地（MCP 侧对应 coolapk_read_image）"""
+    async with CoolapkClient() as client:
+        data, fmt = await client.download_image(url)
+    default_name = urlsplit(url).path.rsplit("/", 1)[-1] or f"coolapk-image.{fmt}"
+    target = Path(output_path).expanduser() if output_path else Path.cwd() / default_name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    _output({"saved": str(target), "bytes": len(data), "format": fmt})
+
+
 @cli.command("image-link")
 @click.argument("urls", nargs=-1, required=True)
-@click.option("--ttl", "ttl_minutes", default=120, type=int, help="有效期分钟（1-10080）")
+@click.option("--ttl", "ttl_minutes", default=120, type=int,
+              help="有效期分钟（1-10080，超出自动夹取；非数字直接报错，服务端则回落默认 120）")
 @async_command
 async def image_link(urls, ttl_minutes):
     """把酷安图片转成 /img 签名外链（需 COOLAPK_PUBLIC_BASE）"""
@@ -637,6 +672,8 @@ async def login(web, cookie, status, adb, sms, phone, captcha, code, sessid, val
             "username": config.username,
             "source": config.source,
             "login_mode": config.login_mode,
+            # 与 MCP 工具 coolapk_login_status 同口径
+            "device_code": bool(config.device_code),
             "sessid_ok": has_valid_sessid(config.desktop_cookie) if config.desktop_cookie else None,
         })
         return

@@ -738,6 +738,127 @@ def probe_rh3():
     check("rh3 定义行不误命中/空串安全", _extract_request_hash(html) == "" and _extract_request_hash("") == "")
 
 
+def probe_dg1():
+    """D 组外链：签名复算 / 去重 / 逗号 URL / 空 base / ttl 夹取"""
+    from coolapk_mcp import img_link as _il
+    base = "https://mcp.example.com"
+    raw = "https://image.coolapk.com/a.jpg?ids=1,2"
+    payload = _il.build_image_links(raw + " " + raw, base + "/", "s3cret", 7, now=1000.0)
+    link = payload["items"][0]["link"]
+    params = httpx.URL(link).params
+    empty = _il.build_image_links(raw, "  ", "s")
+    check(
+        "dg1 外链签名/去重/逗号 URL/空 base/ttl 夹取",
+        payload["count"] == 1
+        and payload["ttl_minutes"] == 7
+        and link.startswith(base + "/img?")
+        and params["u"] == raw
+        and params["sig"] == _il.sign_image(raw, "s3cret", 1000 + 7 * 60)
+        and empty["count"] == 0
+        and "public_base" in empty["error"]
+        and _il.clamp_ttl(float("inf")) == _il.DEFAULT_TTL_MINUTES
+        and _il.clamp_ttl(True) == _il.DEFAULT_TTL_MINUTES,
+        link,
+    )
+
+
+def probe_dg2():
+    """D 组指标：调用数 / 重试 / 错误归类 / 延迟"""
+    from coolapk_mcp import throttle as _throttle
+    sent = []
+
+    def handler(request):
+        sent.append(str(request.url))
+        if len(sent) == 1:
+            return httpx.Response(200, json={"data": {"ok": 1}})
+        return httpx.Response(500, json={"message": "boom"})
+
+    orig_sleep = _throttle.backoff_sleep
+
+    async def no_sleep(attempt, floor=0.0):
+        return None
+
+    _throttle.backoff_sleep = no_sleep
+    client = make_client()
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def run():
+        try:
+            await client.get("/v6/feed/detail?id=1")
+            with contextlib.suppress(CoolapkError):
+                await client.get("/v6/feed/detail?id=2")
+            return client.metrics()
+        finally:
+            await client.close()
+
+    try:
+        metrics = asyncio.run(run())
+    finally:
+        _throttle.backoff_sleep = orig_sleep
+    check(
+        "dg2 指标记录调用/重试/错误分类/延迟",
+        metrics["calls"] == 2
+        and metrics["errors"].get("transient") == 1
+        and metrics["retries"] >= 1
+        and metrics["latency_ms"]["max"] >= metrics["latency_ms"]["avg"] > 0,
+        json.dumps(metrics, ensure_ascii=False),
+    )
+
+
+def probe_dg3():
+    """D 组日志：单行 JSON、非法级别回落、第三方级别压到 WARNING"""
+    from coolapk_mcp import logging_utils as _log
+    record = logging.LogRecord("probe", logging.ERROR, __file__, 1, "msg\u2028x", (), None)
+    line = _log.JsonFormatter().format(record)
+    root = logging.getLogger()
+    saved_handlers, saved_level = list(root.handlers), root.level
+    noisy = logging.getLogger("httpx")
+    saved_noisy = noisy.level
+    os.environ["COOLAPK_LOG_JSON"] = "1"
+    os.environ["COOLAPK_LOG_LEVEL"] = "verbose"
+    try:
+        _log.setup_logging()
+        fallback_ok = root.level == logging.INFO
+        installed = any(getattr(h, "_coolapk_json", False) for h in root.handlers)
+        noisy_ok = noisy.level == logging.WARNING
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+        noisy.setLevel(saved_noisy)
+        os.environ.pop("COOLAPK_LOG_JSON", None)
+        os.environ.pop("COOLAPK_LOG_LEVEL", None)
+    check(
+        "dg3 JSON 单行 + 非法级别回落 INFO + 第三方压 WARNING",
+        "\u2028" not in line and len(line.splitlines()) == 1 and fallback_ok and installed and noisy_ok,
+        line[:120],
+    )
+
+
+def probe_dg4():
+    """D 组 /status：配置损坏时降级而不是抛错"""
+    class _Stub:
+        def cache_stats(self):
+            return {"entries": 0, "bytes": 0}
+
+        def metrics(self):
+            return {"requests": 0}
+
+    descriptor = _srvmod.AppConfig.__dict__["load"]
+
+    def boom(cls):
+        raise OSError("config.json 损坏")
+
+    _srvmod.AppConfig.load = classmethod(boom)
+    try:
+        payload = asyncio.run(_srvmod._status_payload(_Stub()))
+    finally:
+        _srvmod.AppConfig.load = descriptor
+    check(
+        "dg4 配置损坏仍返回 ok + login.mode=unknown",
+        payload["status"] == "ok" and payload["login"]["mode"] == "unknown",
+        json.dumps(payload, ensure_ascii=False)[:160],
+    )
+
 def main():
     probe_b1()
     probe_b2()
@@ -765,6 +886,11 @@ def main():
     probe_rh1()
     probe_rh2()
     probe_rh3()
+    # D 组（工程化收尾）能力用例
+    probe_dg1()
+    probe_dg2()
+    probe_dg3()
+    probe_dg4()
     print(f"\n==== 回归结果: {len(PASS)} PASS / {len(FAIL)} FAIL ====")
     if FAIL:
         print("失败项:")

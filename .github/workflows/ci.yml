@@ -1,13 +1,20 @@
 name: CI
 
-# push 与 PR 都触发；matrix 覆盖声明的最低版本 3.10、常用的 3.12 与本地实测的 3.14
+# push 与 PR 都触发；matrix 覆盖声明的最低版本 3.10、常用的 3.12 与本地实测的 3.14。
+# push 排除 v* tag：发版由 release.yml 负责，别为同一个 tag 再跑一遍五作业 matrix（含 docker build）
 on:
   push:
+    tags-ignore: ["v*"]
   pull_request:
+
+# 最小权限：CI 只需要读代码
+permissions:
+  contents: read
 
 # 同一分支的旧运行直接取消：push 风暴时别占满 runner 还发一堆过期通知
 concurrency:
-  group: ci-${{ github.ref }}
+  # push 的 ref 是 refs/heads/x，PR 的是 refs/pull/N/merge：不统一到 head_ref 会出现同分支两份并发
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -17,7 +24,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12", "3.14"]
+        # 3.11 不是凑数：starlette 1.8+ 要求 >=3.11，只有 3.12/3.14 腿会掩盖 3.10 的旧依赖组合
+        python-version: ["3.10", "3.11", "3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
 
@@ -40,7 +48,7 @@ jobs:
 
       - name: Pytest 单元测试 + 覆盖率门槛
         # pyproject 的 addopts 已带 -q，这里再传 -q 会叠成 -qq 把通过数一起吞掉。
-        # 门槛 60%：当前基线 67%，留出波动空间，但挡住“新增整块代码零测试”。
+        # 门槛 60%：当前基线 68%，留出波动空间，但挡住“新增整块代码零测试”。
         run: pytest -q -o addopts="" -rs --cov=coolapk_mcp --cov-report=term-missing:skip-covered --cov-fail-under=60
 
       - name: CLI 冒烟（入口点装配是否完好）
@@ -74,8 +82,9 @@ jobs:
       - name: Mypy
         run: mypy
 
-      - name: Pytest
-        run: pytest -q -o addopts="" -rs
+      - name: Pytest + 覆盖率门槛
+        # 与 Linux 腿同一门槛：补测在哪个平台掉下去都要拦住
+        run: pytest -q -o addopts="" -rs --cov=coolapk_mcp --cov-fail-under=60
 
       - name: CLI 冒烟
         run: coolapk --help | Out-Null
@@ -86,6 +95,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+
+      # Dockerfile 用了 --mount=type=cache，必须先有 BuildKit builder
+      - uses: docker/setup-buildx-action@v3
 
       - name: 构建镜像
         run: docker build -t coolapk-mcp:ci .

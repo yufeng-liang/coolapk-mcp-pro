@@ -17,7 +17,8 @@ WORKDIR /app
 # 用一个只含 __init__ 的空壳包把依赖装好，随后真正的源码 COPY 会覆盖它。
 COPY pyproject.toml README.md LICENSE NOTICE.md ./
 COPY coolapk_mcp/__init__.py ./coolapk_mcp/__init__.py
-RUN --mount=type=cache,target=/root/.cache/pip pip install --no-cache-dir .
+# 缓存要挂在 pip 真正用的目录（HOME 已切到 /home/coolapk），且不能同时带 --no-cache-dir
+RUN --mount=type=cache,target=/home/${APP_USER}/.cache/pip pip install .
 
 # 真正源码（改动这一层不会让依赖重装）
 COPY coolapk_mcp/ ./coolapk_mcp/

@@ -619,6 +619,13 @@ class CoolapkClient:
             errors = self._metrics["errors"]
             errors[exc.kind] = errors.get(exc.kind, 0) + 1
             raise
+        except Exception as exc:
+            # 非 CoolapkError（解析失败、断言、第三方库异常）同样要留痕，
+            # 否则 /status 会显示「零错误」而实际调用一直在炸
+            key = f"internal:{type(exc).__name__}"
+            errors = self._metrics["errors"]
+            errors[key] = errors.get(key, 0) + 1
+            raise
         finally:
             elapsed_ms = (time.monotonic() - started) * 1000
             self._metrics["latency_ms_total"] += elapsed_ms
@@ -659,7 +666,6 @@ class CoolapkClient:
             if cached is not None:
                 self._metrics["cache_hits"] += 1
                 return cached
-            self._metrics["cache_misses"] += 1
 
         # ---- 单飞：同 key 已有在途请求时搭车，不再单独发一次 ----
         # 注意单飞不以 CACHE_ENABLED 为条件：关缓存只该关掉读写，不该让并发合并失效
@@ -668,6 +674,10 @@ class CoolapkClient:
             # shield：等待方被取消时不连带取消真正在发请求的那一路
             self._metrics["shared"] += 1
             return await asyncio.shield(inflight)
+
+        # 只有真要自己打上游才算一次未命中：搭车者复用同一结果，不算缓存没命中
+        if throttle.CACHE_ENABLED:
+            self._metrics["cache_misses"] += 1
 
         inflight = asyncio.get_running_loop().create_future()
         self._inflight[cache_key] = inflight
@@ -1794,6 +1804,8 @@ class CoolapkClient:
             headers["Sec-Fetch-Mode"] = "navigate"
             headers["Sec-Fetch-User"] = "?1"
             headers["Sec-Fetch-Dest"] = "document"
+        # 登录链路不走 _request：单独记一次，保证 /status 的累计请求与真实上游一致
+        self._metrics["requests"] += 1
         # 不跟随重定向，让调用方处理 302
         return await self._client.request(method, url, headers=headers, data=data, follow_redirects=False)
 

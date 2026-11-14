@@ -1,6 +1,6 @@
 # 更新日志
 
-## 未发布
+## 0.7.0（2026-11-14）
 
 ### 新增
 
@@ -12,7 +12,7 @@
 - 新增 `COOLAPK_ALLOWED_HOSTS` / `COOLAPK_ALLOWED_ORIGINS`：配置后开启 FastMCP 的 DNS rebinding 防护并只放行列出的 Host/Origin；不设仍保持关闭，兼容「公网 IP:端口」直连部署。
 - streamable-http 新增 `/status` 端点（与 `/mcp` 同一 Bearer 鉴权）：返回版本、运行时长、登录态、限速参数、缓存命中、按 `error_type` 分类的请求/重试指标与调用延迟（`calls` / `latency_ms.total|max|avg`），便于外部监控抓取；`/health` 保持极简不碰磁盘。
 - CLI 补齐 5 个与服务端对齐的命令：`app-detail`（应用详情）、`author`（画像 + 专长推断 + 高分动态）、`suggest`（联想词）、`get-url`（只读透传，输出前剔除敏感键）、`image-link`（`/img` 签名外链，需 `COOLAPK_PUBLIC_BASE`）。
-- 新增 `COOLAPK_LOG_JSON` / `COOLAPK_LOG_LEVEL`：开启后日志输出 JSON Lines 到 stderr（`ts`/`level`/`logger`/`msg`），容器与采集器可直接按行解析，stdio 模式不污染协议帧。
+- 新增 `COOLAPK_LOG_JSON` / `COOLAPK_LOG_LEVEL`：开启后日志输出 JSON Lines 到 stderr（`ts`/`level`/`logger`/`msg`，异常时多一个 `exc` 只留最后一行），容器与采集器可直接按行解析，stdio 模式不污染协议帧。
 - 新增 `.github/workflows/release.yml`：推送 `vX.Y.Z` tag 时校验 tag 与 `pyproject` / `__version__` 一致，构建 sdist/wheel 并附加到 GitHub Release（不推 PyPI）。
 
 ### 变更
@@ -30,6 +30,9 @@
 - 图片外链签名收敛为单一实现（`coolapk_mcp/img_link.py`）：`/img` 端点、`coolapk_image_link` 工具与 CLI `image-link` 共用同一份域名白名单、TTL 夹取与 HMAC 拼接，避免三处各写一遍后的静默 403。
 - CI 增 Windows 腿（Python 3.12，覆盖 icacls/路径分支）与 Docker 腿（镜像构建 + 非 root 容器内 CLI 冒烟），Linux 覆盖率改为 `--cov-fail-under=60` 门槛，挡住「新增整块代码零测试」。
 - /status 的 `requests` 增加 `calls` 与 `latency_ms`：延迟按逻辑调用统计（含缓存命中与单飞搭车），排障时能直接看出是慢在限速还是上游。
+- /status 取 client 或指标失败时降级为 `{"status":"degraded",…}`（HTTP 仍 200）：此前配置损坏会让探针拿到 500，与「进程挂了」无法区分。
+- 指标覆盖面补齐：非 `CoolapkError` 的意外异常记为 `internal:<异常类名>`（此前一律零记录），SMS/验证码登录链路的请求也计入 `requests`（此前恒为 0，与真实上游流量不符）；单飞搭车者不再被算成「缓存未命中」，命中率回归真实。
+- 结构化日志细节：`httpx`/`mcp`/`uvicorn` 固定压到 `WARNING`（它们的 INFO 会把带 token/sessid 的完整请求 URL 写进日志流）；U+2028/U+2029/U+0085 转义保证「一条一行」；只替换自己上次装的 handler，宿主（pytest、外层 uvicorn）已装的 handler 不再被丢弃。
 
 ### 修复
 

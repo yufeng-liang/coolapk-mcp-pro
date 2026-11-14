@@ -166,7 +166,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `COOLAPK_IMG_THUMBNAIL` | `1` | 图片缩略优先开关（默认开）：`coolapk_read_image` 与 `/img` 中转对带尺寸后缀的图先取酷安服务端缩略 `.m.jpg`（长边约 1080px，仍在多模态模型视觉窗口内，大图省约 70~80% 流量），上游非 200 自动回落原图；设 `0` 关闭 |
 | `COOLAPK_IMG_SECRET` | 未设 | `/img` 中转与 `coolapk_image_link` 的 HMAC 签名密钥。不设时随机生成并持久化到 `~/.coolapk-mcp/img_secret`（POSIX 权限 600）；**不复用** `COOLAPK_HTTP_TOKEN`，也不再有硬编码默认值 |
 | `COOLAPK_PUBLIC_BASE` | 未设 | 远程 HTTP 模式下的对外访问前缀（如 `https://mcp.example.com`）。设置后 `coolapk_image_link` 才能生成图片外链，`/img` 中转也随之生效 |
-| `COOLAPK_LOG_JSON` | 未设 | 设为 `1` 时日志改为 JSON Lines 输出到 stderr（`ts`/`level`/`logger`/`msg`，异常只留最后一行），供容器与采集器按行解析；stdio 下 stdout 让给协议帧，日志一律走 stderr |
+| `COOLAPK_LOG_JSON` | 未设 | 设为 `1` 时日志改为 JSON Lines 输出到 stderr（`ts`/`level`/`logger`/`msg`，异常时多一个 `exc` 只留最后一行），供容器与采集器按行解析；stdio 下 stdout 让给协议帧，日志一律走 stderr；`httpx`/`mcp`/`uvicorn` 固定压到 `WARNING`，避免带凭据的请求 URL 落进日志 |
 | `COOLAPK_LOG_LEVEL` | `INFO` | 仅在开启 `COOLAPK_LOG_JSON` 时生效的根日志级别（`DEBUG`/`INFO`/`WARNING`…） |
 
 数据文件（自动生成，勿提交仓库）：`~/.coolapk-mcp/config.json`（设备码与登录态）、`~/.coolapk-mcp/uid_index.json`（feed_id → 作者 uid 索引，供详情回落）。
@@ -235,7 +235,7 @@ export COOLAPK_HTTP_TOKEN=<上一步生成的随机串>
 
 启动后先自检：`curl http://127.0.0.1:8000/health` 返回 `{"status":"ok"}` 即说明服务已就绪（该端点免鉴权，仅供探活）；MCP 端点在 `/mcp`，一律要求 Bearer Token。
 
-需要看运行状况时用 `/status`（同样要求 Bearer Token）：一次返回 `version`、`uptime_s`、`login`（是否登录/uid/来源）、`rate_limit`（模式与间隔）、`cache`（条数/字节/命中/淘汰）与 `requests`（累计请求、重试、缓存命中、单飞搭车、按 `error_type` 的错误分布）。`/health` 保持极简——容器探针不该触发任何磁盘或网络动作。
+需要看运行状况时用 `/status`（同样要求 Bearer Token）：一次返回 `version`、`uptime_s`、`login`（是否登录/uid/来源）、`rate_limit`（模式与间隔）、`cache`（条数/字节/命中/淘汰）、`requests`（累计请求、重试、缓存命中/未命中、单飞搭车、`calls` 与 `latency_ms.total|max|avg`、按 `error_type` 的错误分布，非 `CoolapkError` 记为 `internal:<异常类名>`）与 `image`（中转大小上限）。配置损坏或客户端初始化失败时返回 `{"status":"degraded","version":…,"error":…}`（HTTP 仍 200），探针据此区分「活着但坏了」与「进程没了」。`/health` 保持极简——容器探针不该触发任何磁盘或网络动作。
 
 ```bash
 curl -H "Authorization: Bearer $COOLAPK_HTTP_TOKEN" http://127.0.0.1:8000/status
@@ -429,12 +429,12 @@ python -m pip install -e ".[dev]"     # 或 pip install -e . -r requirements-dev
 ruff check .                          # 静态检查
 mypy                                  # 类型检查（配置在 pyproject [tool.mypy]）
 pytest -q                             # 单元测试
-pytest -q --cov=coolapk_mcp --cov-fail-under=60   # 带覆盖率门槛（当前基线 67%，CI 同款）
+pytest -q --cov=coolapk_mcp --cov-fail-under=60   # 带覆盖率门槛（当前基线 68%，CI 同款）
 ```
 
 - 测试覆盖模型解析、白名单裁剪、限速/分桶/退避、缓存键与单飞、预算截断、HTTP 图片中转、配置与板块映射等；`pytest -q` 应全绿。
 - `tests/manual/regression_probe.py` 是零真实网络的离线回归探针（99 项断言），不进 CI，改协议/解析逻辑后可手动跑一遍做冒烟。
-- 覆盖率当前基线约 67%：`server.py` 80%、`client.py` 58%，`cli.py`（50%）与 `browser_login.py`（47%）仍在低位，属于优先补测区。
+- 覆盖率当前基线约 68%：`server.py` 80%、`client.py` 59%，`cli.py`（55%）与 `browser_login.py`（47%）仍在低位，属于优先补测区。
 - 测试不依赖本机登录态：`conftest.py` 默认把 `generate_token_v3` 打桩成假 token，并把 `~/.coolapk-mcp` 下所有导入期路径常量重定向到临时目录，跑测试不会碰真实 `config.json` / `img_secret` / `auth_blob`。
 - CI（`.github/workflows/ci.yml`）三条腿：Linux 上 Python 3.10 / 3.12 / 3.14 跑 ruff + mypy + pytest（覆盖率门槛 60%）+ `coolapk --help` + compileall；Windows 上 Python 3.12 跑同一套（覆盖权限与路径分支）；另有 Docker 腿做镜像构建与容器内 CLI 冒烟。
 - 结构化日志：设 `COOLAPK_LOG_JSON=1` 后日志变成一行一条 JSON（stderr），字段 `ts`/`level`/`logger`/`msg`，异常只保留最后一行；容器采集直接按行解析。

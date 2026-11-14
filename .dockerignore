@@ -19,11 +19,8 @@ skills/
 .ruff_cache/
 .mypy_cache/
 
-# 本地验收 / 冒烟脚本
-accept_task4.py
-wpf_smoke.runtimeconfig.json
-
-# 本地临时目录（仓库里历史 tmp 目录很多，别让构建上下文膨胀）
+# 本地临时脚本与目录（仓库里历史 tmp 文件/目录很多，别让构建上下文膨胀）
+tmp_*.py
 tmp*/
 .tmp*/
 coolapk-login-*/

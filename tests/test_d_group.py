@@ -1,6 +1,7 @@
 """D 组收尾：图片外链单一实现、结构化日志、延迟指标与 CLI 新命令"""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -14,6 +15,7 @@ from coolapk_mcp import cli as cli_mod
 from coolapk_mcp import img_link
 from coolapk_mcp import logging_utils
 from coolapk_mcp import server as server_mod
+from coolapk_mcp.budget import FetchResult
 from coolapk_mcp.client import CoolapkClient
 from coolapk_mcp.config import AppConfig
 
@@ -64,6 +66,38 @@ class _FakeClient:
             {"id": 12, "entityType": "feed", "message": "日常", "likenum": 5, "replynum": 1},
         ]
 
+    async def get_user_feeds_pages(self, uid: int, pages: int = 1, budget=None):
+        """author 命令走多页接口，带分页元数据"""
+        self.calls.append(("user_feeds_pages", uid, pages))
+        return FetchResult(
+            [
+                {
+                    "id": 11,
+                    "entityType": "feed",
+                    "message": "Magisk 模块推荐",
+                    "likenum": 100,
+                    "replynum": 10,
+                    "forwardnum": 1,
+                },
+                {"id": 12, "entityType": "feed", "message": "日常", "likenum": 5, "replynum": 1},
+            ],
+            truncated=True,
+            next_page=3,
+            requests=2,
+        )
+
+    async def get_notifications(self, ntype: str, page: int = 1):
+        self.calls.append(("notifications", ntype, page))
+        return [{"id": 1, "dateline": 1700000000}]
+
+    async def get_notification_count(self):
+        self.calls.append(("notification_count",))
+        return {"message": 2}
+
+    async def download_image(self, url: str):
+        self.calls.append(("download_image", url))
+        return b"IMG-BYTES", "png"
+
     async def get_topic_suggest(self, keyword: str):
         self.calls.append(("suggest", keyword))
         return [{"title": "搜索用户：酷安"}, {"title": "Magisk 模块"}, {"title": ""}]
@@ -104,6 +138,81 @@ def test_cli_author_scores_and_infers_expertise(fake_client: _FakeClient) -> Non
     assert payload["expertise"]  # bio 命中「刷机/模块」
     assert payload["top_posts"][0]["id"] == 11  # 100 赞胜过 5 赞
     assert payload["top_posts"][0]["post_score"] > payload["top_posts"][1]["post_score"]
+    # 与服务端同口径：走多页接口 + discussion_ratio + 分页元数据
+    assert fake_client.calls[1] == ("user_feeds_pages", 123, 2)
+    assert payload["top_posts"][0]["discussion_ratio"] == 0.1
+    assert (payload["pages"], payload["fetched"]) == (2, 2)
+    assert payload["truncated"] is True
+    assert payload["next_page"] == 3
+
+
+def test_cli_author_pages_option_reaches_client(fake_client: _FakeClient) -> None:
+    code, out = _run(["author", "123", "--pages", "3", "--top", "1"])
+
+    assert code == 0
+    assert fake_client.calls[1] == ("user_feeds_pages", 123, 3)
+    assert json.loads(out)["pages"] == 3
+
+
+def test_cli_author_keeps_posts_texts_when_top_zero(fake_client: _FakeClient) -> None:
+    """--top 0 只该砍 top_posts，专长推断用的正文不能被一起砍掉"""
+    code, out = _run(["author", "123", "--top", "0"])
+
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["top_posts"] == []
+    assert payload["posts_texts"] == ["Magisk 模块推荐", "日常"]
+    assert payload["expertise"]
+
+
+def test_cli_app_detail_rejects_blank_package(fake_client: _FakeClient) -> None:
+    """空包名不该发请求，要和服务端一样给出可读错误"""
+    code, out = _run(["app-detail", "   "])
+
+    assert code == 1
+    payload = json.loads(out)
+    assert payload["error"] == "package_name 不能为空"
+    assert payload["error_type"] == "api"
+    assert fake_client.calls == []
+
+
+def test_cli_notify_with_count(fake_client: _FakeClient) -> None:
+    code, out = _run(["notify", "message", "--with-count"])
+
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["items"][0]["id"] == 1
+    assert payload["counts"] == {"message": 2}
+    assert ("notification_count",) in fake_client.calls
+
+
+def test_cli_notify_default_shape_unchanged(fake_client: _FakeClient) -> None:
+    """不加 --with-count 时保持旧输出（裸列表），避免破坏既有调用方"""
+    code, out = _run(["notify", "message"])
+
+    assert code == 0
+    assert json.loads(out) == [{"id": 1, "dateline": 1700000000}]
+    assert ("notification_count",) not in fake_client.calls
+
+
+def test_cli_image_saves_bytes(fake_client: _FakeClient, tmp_path) -> None:
+    target = tmp_path / "out" / "pic.png"
+    code, out = _run(["image", "https://image.coolapk.com/a/b.png", "-o", str(target)])
+
+    assert code == 0
+    assert target.read_bytes() == b"IMG-BYTES"
+    payload = json.loads(out)
+    assert payload["bytes"] == 9
+    assert payload["format"] == "png"
+
+
+def test_cli_login_status_reports_device_code() -> None:
+    code, out = _run(["login", "--status"])
+
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["device_code"] in (True, False)
+    assert "sessid_ok" in payload
 
 
 def test_cli_suggest_drops_prefix_cards(fake_client: _FakeClient) -> None:
@@ -221,12 +330,21 @@ def test_setup_logging_installs_json_handler(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("COOLAPK_LOG_JSON", "1")
     root = logging.getLogger()
     saved_handlers, saved_level = list(root.handlers), root.level
+    foreign = logging.NullHandler()  # 模拟宿主（pytest/uvicorn）已装的 handler
     try:
+        root.handlers[:] = [foreign]
         logging_utils.setup_logging("debug")
 
         assert root.level == logging.DEBUG
-        assert len(root.handlers) == 1
-        assert isinstance(root.handlers[0].formatter, logging_utils.JsonFormatter)
+        # 只替换自己上次装的那个：宿主 handler 必须留着
+        assert foreign in root.handlers
+        ours = [h for h in root.handlers if isinstance(h.formatter, logging_utils.JsonFormatter)]
+        assert len(ours) == 1
+
+        # 幂等：再调一次不会叠出第二个 JSON handler
+        logging_utils.setup_logging("debug")
+        again = [h for h in root.handlers if isinstance(h.formatter, logging_utils.JsonFormatter)]
+        assert len(again) == 1
     finally:
         root.handlers[:] = saved_handlers
         root.setLevel(saved_level)
@@ -235,12 +353,24 @@ def test_setup_logging_installs_json_handler(monkeypatch: pytest.MonkeyPatch) ->
 # ---- 延迟指标 ----
 
 
+_STALE_CLIENTS: list = []  # 异步用例里排队关闭的旧 client，留引用防 GC
+
+
 def _client_with(handler) -> CoolapkClient:
     cfg = AppConfig()
     cfg.uid = "123"
     cfg.token = "tok"
     client = CoolapkClient(cfg)
+    stale = client._client
     client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    # __init__ 建出来的 client 已没人引用：立刻关掉，别把连接池句柄留到进程结束。
+    # 异步用例本身已在事件循环里（asyncio.run 会拒绝嵌套），改成排个任务并留引用
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(stale.aclose())
+    else:
+        _STALE_CLIENTS.append(running.create_task(stale.aclose()))
     return client
 
 

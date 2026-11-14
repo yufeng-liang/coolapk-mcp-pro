@@ -104,7 +104,8 @@ def _resolve_img_secret(token: str) -> str:
             "重启后此前生成的所有 /img 链接都会失效；"
             "容器部署请确认挂载目录属主与容器 uid 一致（见 README）",
             IMG_SECRET_FILE,
-            exc_info=exc,
+            # 默认不打整段 Traceback（stderr 会刷屏）；排查时用 COOLAPK_LOG_LEVEL=DEBUG
+            exc_info=exc if logger.isEnabledFor(logging.DEBUG) else None,
         )
     return secret
 
@@ -1444,8 +1445,15 @@ def _build_http_app():
         """/status：一次拿到版本、登录态、限速、缓存与请求指标（与 MCP 同鉴权）"""
         if not _auth_ok(_request.scope):
             return _unauthorized()
-        client = await _get_client()
-        return JSONResponse(await _status_payload(client))
+        try:
+            client = await _get_client()
+            return JSONResponse(await _status_payload(client))
+        except Exception as exc:
+            # 探针不该因为配置损坏或客户端初始化失败拿 500：
+            # 200 + degraded 才能区分「进程活着但坏了」与「进程没了」
+            return JSONResponse(
+                {"status": "degraded", "version": __version__, "error": type(exc).__name__}
+            )
 
     def _bearer_endpoint(inner_app):
         """Bearer Token 校验包裹 MCP 端点：/health 免鉴权，MCP 一律校验。"""

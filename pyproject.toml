@@ -3,7 +3,7 @@ name = "coolapk-mcp-pro"
 version = "0.7.0"
 description = "酷安社区 MCP Server — AI 原生搜索工具"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "yufeng-liang" }]
 keywords = ["coolapk", "mcp", "model-context-protocol", "coolapk-api", "ai-agent"]
 classifiers = [
@@ -59,11 +59,12 @@ Issues = "https://github.com/yufeng-liang/coolapk-mcp-pro/issues"
 Changelog = "https://github.com/yufeng-liang/coolapk-mcp-pro/blob/main/CHANGELOG.md"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77,<81"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-# sdist/wheel 里带上 MIT 许可证正文（PEP 639 之前仍由该字段声明文件）
+# sdist/wheel 里带上 MIT 许可证正文与 NOTICE（PEP 639 的 license-files；
+# 对应上面的 SPDX 字符串 license = "MIT"，需要 setuptools>=77）
 # NOTICE.md 也要进产物：MIT 归属声明与第三方来源说明都在里面
 license-files = ["LICENSE", "NOTICE.md"]
 

@@ -35,7 +35,17 @@ jobs:
           init = pathlib.Path("coolapk_mcp/__init__.py").read_text(encoding="utf-8")
           match = re.search(r'__version__\s*=\s*"([^"]+)"', init)
           pkg_version = match.group(1) if match else ""
-          tag = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          # 预发布 tag（v0.7.0-rc1）不属于本流水线：显式拒绝，别让它以「版本不一致」的面目出现
+          if not re.fullmatch(r"\d+\.\d+\.\d+", tag):
+              raise SystemExit(
+                  f"tag 必须是 vX.Y.Z 形态：{os.environ['GITHUB_REF_NAME']}"
+              )
+          # CHANGELOG 顶部段必须已经是本次版本：人是最薄的一环，机器也要拦一道
+          changelog = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          head = "\n".join(changelog.splitlines()[:6])
+          if f"## {version}" not in head:
+              raise SystemExit(f"CHANGELOG.md 顶部段不是 {version}：{head[:80]}")
           if not (version == pkg_version == tag):
               raise SystemExit(
                   f"版本不一致：tag={tag} pyproject={version} __version__={pkg_version}"
