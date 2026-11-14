@@ -1,10 +1,12 @@
 name: CI
 
 # push 与 PR 都触发；matrix 覆盖声明的最低版本 3.10、常用的 3.12 与本地实测的 3.14。
-# push 排除 v* tag：发版由 release.yml 负责，别为同一个 tag 再跑一遍五作业 matrix（含 docker build）
+# 只写 tags/tags-ignore 时 GitHub 认定该工作流「只对 tag 生效」，push 到分支一次都不会跑
+# （实测推送 main 后 actions/runs 里 CI 为 0 次）；所以这里用 branches: ["**"] 明确挂分支推送，
+# tag 推送自然不会命中分支过滤器，发版交给 release.yml。
 on:
   push:
-    tags-ignore: ["v*"]
+    branches: ["**"]
   pull_request:
 
 # 最小权限：CI 只需要读代码
