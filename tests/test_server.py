@@ -81,6 +81,10 @@ class _FakeReadClient:
     async def get_home_feeds(self, page: int = 1):
         return self._home
 
+    async def get_main_feeds(self, page: int = 1):
+        # 首页默认 tab 是 recommend（真推荐流 /v6/main/indexV8）
+        return self._home
+
     async def get_hot_feeds(self, page: int = 1):
         return self._home
 
@@ -123,6 +127,9 @@ def test_home_returns_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
     assert payload["page"] == 2
     assert payload["fetched"] == 1
     assert payload["feeds"][0]["id"] == 1
+    # 分页信号：1 条 < PAGE_SIZE(10) → 到底了，next_page 必须为空，否则调用方会一直翻
+    assert payload["has_more"] is False
+    assert payload["next_page"] is None
 
 
 def test_topic_detail_failure_degrades(monkeypatch: pytest.MonkeyPatch) -> None:

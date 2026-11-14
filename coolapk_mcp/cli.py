@@ -16,6 +16,7 @@ from coolapk_mcp.boards import BOARD_URLS
 from coolapk_mcp.budget import Budget, BudgetExceeded
 from coolapk_mcp.client import CoolapkClient, CoolapkError
 from coolapk_mcp.config import AppConfig, has_valid_sessid, parse_cookie_str
+from coolapk_mcp.linkparse import parse_feed_id
 from coolapk_mcp.logging_utils import setup_logging
 from coolapk_mcp.models import (
     _format_time,
@@ -27,6 +28,7 @@ from coolapk_mcp.models import (
     TopicModel,
     UserModel,
     apply_tool_whitelist,
+    cap_replies,
 )
 
 
@@ -101,18 +103,21 @@ def cli():
 
 
 @cli.command("home")
-@click.option("--tab", type=click.Choice(["recommend", "hot", "latest"]), default="recommend")
+@click.option("--tab", type=click.Choice(["recommend", "follow", "hot", "latest"]),
+              default="recommend")
 @click.option("--page", default=1, type=int)
 @async_command
 async def home(tab, page):
-    """首页动态"""
+    """首页动态（recommend 走算法推荐，follow 只看已关注的人）"""
     async with CoolapkClient() as client:
-        if tab == "hot":
+        if tab == "follow":
+            raw = await client.get_home_feeds(page)
+        elif tab == "hot":
             raw = await client.get_hot_feeds(page)
         elif tab == "latest":
             raw = await client.get_latest_feeds(page)
         else:
-            raw = await client.get_home_feeds(page)
+            raw = await client.get_main_feeds(page)
     _output(_parse_feeds(raw))
 
 
@@ -169,7 +174,7 @@ async def secondhand(brand, page):
 
 
 @cli.command("feed")
-@click.argument("feed_id", type=int)
+@click.argument("feed_id", type=str)
 @click.option("--replies/--no-replies", default=True)
 @click.option("--reply-page", default=1, type=int)
 @click.option("--feed-type", default="feed",
@@ -189,9 +194,21 @@ async def secondhand(brand, page):
 @async_command
 async def feed(feed_id, replies, reply_page, feed_type, author_uid, all_replies,
                comment_keyword, comments_focus, with_history, expand_sub_replies):
-    """动态详情（详情接口被验证码拦截时自动从作者动态列表回落）"""
+    """动态详情（详情接口被验证码拦截时自动从作者动态列表回落）
+
+    FEED_ID 可以是纯数字，也可以直接粘酷安分享链接/整段分享文案。
+    """
     from coolapk_mcp.focus import collect_focus
 
+    resolved_id = parse_feed_id(feed_id)
+    if resolved_id is None:
+        _output_error(
+            CoolapkError(
+                "无法从 FEED_ID 解析出帖子 ID：传数字，或粘贴酷安分享链接/分享文案",
+                kind="api",
+            )
+        )
+    feed_id = resolved_id
     focus = comments_focus
     if focus == "all":
         all_replies = True
@@ -248,7 +265,8 @@ async def feed(feed_id, replies, reply_page, feed_type, author_uid, all_replies,
                 if subs:
                     detail.replies[i].sub_replies = [ReplyModel.from_api(sr) for sr in subs]
                     detail.sub_replies_expanded = (detail.sub_replies_expanded or 0) + len(subs)
-    data = _dump(detail)
+    # 与服务端同口径：回复条数上限，超出的部分用 replies_omitted 标出来
+    data = _dump(cap_replies(detail))
     if comment_keyword:
         from coolapk_mcp import postfilter
         data = postfilter.filter_comments(data, comment_keyword)

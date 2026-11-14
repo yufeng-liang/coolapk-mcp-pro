@@ -8,9 +8,12 @@
   C1 _load_desktop_login 非法 JSON 结构不崩   D3 MAX_RETRIES 钳位
   E2 AUTH_EXPIRED_MESSAGE 命令可执行性（静态检查）
   S1 scoring 质量分/作者分级/专长推断    S2 作者白名单与 user_feeds 包装结构
+  ui1-ui6 用户可感知改进：首页分栏语义、列表分页信号、搜索空结果解释、
+          长文本上限、多图读取、分享链接解析
 """
 import asyncio
 import contextlib
+import importlib
 import json
 import logging
 import os
@@ -859,6 +862,351 @@ def probe_dg4():
         json.dumps(payload, ensure_ascii=False)[:160],
     )
 
+# ---- 用户可感知改进（第二批）：六项 ----
+
+_UI_FEED = {
+    "entityType": "feed",
+    "message": "正文内容",
+    "username": "作者",
+    "dateline": 1700000000,
+    "likenum": 3,
+}
+
+
+def _ui_feeds(count: int) -> list:
+    return [dict(_UI_FEED, id=index + 1) for index in range(count)]
+
+
+def _ui_use(fake):
+    """把 server._get_client 换成返回 fake 的协程，返回原函数供恢复。"""
+    original = _srvmod._get_client
+
+    async def _fake():
+        return fake
+
+    _srvmod._get_client = _fake
+    return original
+
+
+class _UiHomeClient:
+    def __init__(self, count: int) -> None:
+        self.count = count
+        self.calls = []
+
+    async def get_main_feeds(self, page: int = 1):
+        self.calls.append(("main", page))
+        return _ui_feeds(self.count)
+
+    async def get_home_feeds(self, page: int = 1):
+        self.calls.append(("home", page))
+        return _ui_feeds(self.count)
+
+    async def get_hot_feeds(self, page: int = 1):
+        self.calls.append(("hot", page))
+        return _ui_feeds(self.count)
+
+    async def get_latest_feeds(self, page: int = 1):
+        self.calls.append(("latest", page))
+        return _ui_feeds(self.count)
+
+
+def probe_ui1():
+    """首页分栏语义：recommend 走真推荐流、follow 独立、未知归属与回显 + 分页信号"""
+    size = CoolapkClient.PAGE_SIZE
+    expected = {
+        "follow": ("home", "follow"),
+        "关注": ("home", "follow"),
+        "dynamic": ("home", "follow"),
+        "hot": ("hot", "hot"),
+        "latest": ("latest", "latest"),
+    }
+    bad = []
+    for tab in ("recommend", "", "不存在的分栏", "follow", "关注", "dynamic", "hot", "latest"):
+        source, shown = expected.get(tab, ("main", "recommend"))
+        fake = _UiHomeClient(size)
+        original = _ui_use(fake)
+        try:
+            payload = json.loads(asyncio.run(_srvmod.coolapk_home(tab, 2)))
+        finally:
+            _srvmod._get_client = original
+        if not (
+            fake.calls == [(source, 2)]
+            and payload["tab"] == shown
+            and payload["page"] == 2
+            and payload["fetched"] == size
+            and payload["has_more"] is True
+            and payload["next_page"] == 3
+        ):
+            bad.append((tab, fake.calls, payload.get("tab"), payload.get("next_page")))
+    check("ui1 首页分栏路由/回显/分页信号（8 组）", not bad, str(bad))
+
+    fake = _UiHomeClient(size - 1)
+    original = _ui_use(fake)
+    try:
+        short = json.loads(asyncio.run(_srvmod.coolapk_home("hot", 3)))
+    finally:
+        _srvmod._get_client = original
+    check(
+        "ui1b 未填满一页即末页（has_more=False / next_page=None）",
+        short["has_more"] is False and short["next_page"] is None,
+        json.dumps(short, ensure_ascii=False)[:140],
+    )
+
+
+class _UiBoardClient:
+    def __init__(self, count: int) -> None:
+        self.count = count
+        self.calls = []
+
+    async def get_board_feeds(self, board_id: str, page: int = 1):
+        self.calls.append((board_id, page))
+        return _ui_feeds(self.count)
+
+
+class _UiNotifyClient:
+    def __init__(self, count: int) -> None:
+        self.count = count
+
+    async def get_notifications(self, ntype: str, page: int = 1):
+        return [{"id": index, "message": "回复", "dateline": 1700000000} for index in range(self.count)]
+
+
+def probe_ui2():
+    """列表类工具统一分页信号：board（含中文板块名）与 notify"""
+    size = CoolapkClient.PAGE_SIZE
+    board_id = next((bid for bid, (title, _u) in _srvmod.BOARD_URLS.items() if title == "数码"), None)
+    fake = _UiBoardClient(size)
+    original = _ui_use(fake)
+    try:
+        board = json.loads(asyncio.run(_srvmod.coolapk_board("数码", 1)))
+    finally:
+        _srvmod._get_client = original
+    check(
+        "ui2 板块工具分页信号 + 中文板块名",
+        board_id is not None
+        and board["board"] == board_id
+        and board["has_more"] is True
+        and board["next_page"] == 2
+        and fake.calls == [(board_id, 1)],
+        json.dumps(board, ensure_ascii=False)[:140],
+    )
+
+    fake2 = _UiNotifyClient(size)
+    original2 = _ui_use(fake2)
+    try:
+        notify = json.loads(asyncio.run(_srvmod.coolapk_notify("message", 1)))
+    finally:
+        _srvmod._get_client = original2
+    check(
+        "ui2b 通知工具分页信号",
+        notify.get("has_more") is True and notify.get("next_page") == 2,
+        json.dumps(notify, ensure_ascii=False)[:140],
+    )
+
+
+class _UiSearchClient:
+    def __init__(self, items: list) -> None:
+        self.items = items
+
+    async def search(self, keyword, search_type="feed", page=1, sort="hot"):
+        return self.items
+
+
+def _ui_search_items(matched: int, unmatched: int) -> list:
+    items = [dict(_UI_FEED, id=index + 1, message="Magisk 刷机教程") for index in range(matched)]
+    items += [dict(_UI_FEED, id=100 + index, message="无关内容") for index in range(unmatched)]
+    return items
+
+
+def probe_ui3():
+    """搜索空结果必须解释原因：被过滤 / 只剩卡片 / 真没有；有结果时不得带 hint"""
+    fake = _UiSearchClient(_ui_search_items(2, 0))
+    original = _ui_use(fake)
+    try:
+        payload = json.loads(asyncio.run(_srvmod.coolapk_search("Magisk", "feed", 1)))
+    finally:
+        _srvmod._get_client = original
+    no_hint = "hint" not in payload
+
+    fake2 = _UiSearchClient(_ui_search_items(0, 30))
+    original2 = _ui_use(fake2)
+    try:
+        filtered = json.loads(asyncio.run(_srvmod.coolapk_search("Magisk", "feed", 1)))
+    finally:
+        _srvmod._get_client = original2
+
+    fake3 = _UiSearchClient([])
+    original3 = _ui_use(fake3)
+    try:
+        empty = json.loads(asyncio.run(_srvmod.coolapk_search("冷门词", "feed", 1)))
+    finally:
+        _srvmod._get_client = original3
+
+    check(
+        "ui3 搜索空结果三分支解释 + 有结果不带 hint",
+        no_hint
+        and filtered["results"] == []
+        and filtered["counts"]["keyword_filtered"] == 30
+        and "strict=false" in filtered["hint"]
+        and "没有搜到" in empty["hint"],
+        json.dumps(filtered, ensure_ascii=False)[:160],
+    )
+
+
+class _UiDetailClient:
+    def __init__(self) -> None:
+        self.seen = []
+
+    async def get_feed_detail_smart(self, feed_id, **kwargs):
+        self.seen.append(feed_id)
+        return {"data": {"id": feed_id, "message": "正文", "replynum": 0}, "replies": None, "source": "api"}
+
+
+def probe_ui4():
+    """分享链接解析：数字/链接/?id=/feedId=/整段文案，多 ID 与无 ID 必须拒绝"""
+    from coolapk_mcp.linkparse import parse_feed_id
+
+    cases = [
+        (123, 123),
+        ("123456", 123456),
+        ("https://www.coolapk.com/feed/1234567", 1234567),
+        ("看看这个 https://www.coolapk.com/feed/7654321 挺好", 7654321),
+        ("https://www.coolapk.com/m/feed/detail?id=8899", 8899),
+        ("https://www.coolapk.com/feed/detail?feedId=4242", 4242),
+        ("#在酷安# 分享自酷安 https://www.coolapk.com/feed/31337?shareFrom=1", 31337),
+        (None, None),
+        (True, None),
+        ("没有数字", None),
+        ("看这两条 1234567 和 7654321", None),
+    ]
+    bad = [(value, parse_feed_id(value), want) for value, want in cases if parse_feed_id(value) != want]
+
+    fake = _UiDetailClient()
+    original = _ui_use(fake)
+    try:
+        detail = json.loads(asyncio.run(_srvmod.coolapk_feed_detail("https://www.coolapk.com/feed/1234567890")))
+        rejected = json.loads(asyncio.run(_srvmod.coolapk_feed_detail("看这两条 1234567 和 7654321")))
+    finally:
+        _srvmod._get_client = original
+    check(
+        "ui4 分享链接解析（11 组）+ 工具接受链接、拒绝歧义文本",
+        not bad
+        and fake.seen == [1234567890]
+        and isinstance(detail, dict)
+        and "error" not in detail
+        and "无法从 feed_id 解析" in str(rejected.get("error", "")),
+        f"bad={bad} seen={fake.seen} detail={str(detail)[:80]} rejected={rejected}",
+    )
+
+
+class _UiImageClient:
+    def __init__(self) -> None:
+        self.seen = []
+
+    async def download_image(self, url: str):
+        self.seen.append(url)
+        return b"\x89PNG-fake", "png"
+
+
+def probe_ui5():
+    """多图读取：一次多张、非法域名先拦不下后续、超 9 张与空输入报错、非结构化返回"""
+    fake = _UiImageClient()
+    original = _ui_use(fake)
+    try:
+        batch = asyncio.run(
+            _srvmod.coolapk_read_image("https://image.coolapk.com/a.png, https://image.coolapk.com/b.jpg")
+        )
+        foreign = json.loads(
+            asyncio.run(
+                _srvmod.coolapk_read_image("https://evil.example.com/a.png https://image.coolapk.com/b.png")
+            )
+        )
+        too_many = json.loads(
+            asyncio.run(
+                _srvmod.coolapk_read_image(" ".join(f"https://image.coolapk.com/{i}.png" for i in range(10)))
+            )
+        )
+        blank = json.loads(asyncio.run(_srvmod.coolapk_read_image("   ")))
+    finally:
+        _srvmod._get_client = original
+    check(
+        "ui5 多图读取/域名先校验/上限/空输入",
+        len(batch) == 2
+        and fake.seen == ["https://image.coolapk.com/a.png", "https://image.coolapk.com/b.jpg"]
+        and foreign["code"] == 403
+        and "最多 9 张" in too_many["error"]
+        and "不能为空" in blank["error"],
+        f"batch={len(batch)} seen={fake.seen} foreign={foreign}",
+    )
+
+    tool = _mcp_inst._tool_manager.get_tool("coolapk_read_image")
+    fake2 = _UiImageClient()
+    original2 = _ui_use(fake2)
+    try:
+        result = asyncio.run(
+            _mcp_inst.call_tool(
+                "coolapk_read_image",
+                {"url": "https://image.coolapk.com/a.png, https://image.coolapk.com/b.jpg"},
+            )
+        )
+    finally:
+        _srvmod._get_client = original2
+    content = result[0] if isinstance(result, tuple) else result
+    check(
+        "ui5b 工具 schema 非结构化（output_schema=None）且返回两块 ImageContent",
+        getattr(tool, "output_schema", "missing") is None
+        and [type(item).__name__ for item in content] == ["ImageContent", "ImageContent"],
+        f"schema={getattr(tool, 'output_schema', 'missing')} content={[type(i).__name__ for i in content]}",
+    )
+
+
+def probe_ui6():
+    """长文本上限：正文/评论截断标 content_truncated，回复条数上限标 replies_omitted，可关闭"""
+    from coolapk_mcp import models as _models
+    from coolapk_mcp.models import FeedDetail, FeedModel, ReplyModel, cap_replies
+
+    long_feed = FeedModel.from_api(dict(_UI_FEED, message="长" * 5000))
+    short_feed = FeedModel.from_api(dict(_UI_FEED, message="短正文"))
+    long_reply = ReplyModel.from_api({"id": 9, "message": "评" * 3000, "dateline": 1700000000})
+    detail = FeedDetail.from_api(
+        {"id": 1, "message": "正文"},
+        [{"id": index + 1, "message": f"评论{index}"} for index in range(100)],
+    )
+    capped = cap_replies(detail)
+    check(
+        "ui6 正文/评论截断标 content_truncated + 回复条数标 replies_omitted",
+        long_feed.content_truncated is True
+        and len(long_feed.content) <= _models.FEED_CONTENT_MAX_CHARS + 1
+        and long_feed.content.endswith("…")
+        and short_feed.content_truncated is False
+        and short_feed.content == "短正文"
+        and long_reply.content_truncated is True
+        and len(capped.replies) == _models.REPLY_MAX_ITEMS
+        and capped.replies_omitted == 100 - _models.REPLY_MAX_ITEMS
+        and capped.replies_truncated is True,
+        f"feed={len(long_feed.content)} reply={len(long_reply.content)} omitted={capped.replies_omitted}",
+    )
+
+    before = (_models.FEED_CONTENT_MAX_CHARS, _models.REPLY_CONTENT_MAX_CHARS, _models.REPLY_MAX_ITEMS)
+    os.environ["COOLAPK_FEED_CONTENT_MAX"] = "7"
+    os.environ["COOLAPK_REPLY_CONTENT_MAX"] = "bad"
+    os.environ["COOLAPK_REPLY_MAX_ITEMS"] = "0"
+    try:
+        importlib.reload(_models)
+        reloaded = (_models.FEED_CONTENT_MAX_CHARS, _models.REPLY_CONTENT_MAX_CHARS, _models.REPLY_MAX_ITEMS)
+    finally:
+        for key in ("COOLAPK_FEED_CONTENT_MAX", "COOLAPK_REPLY_CONTENT_MAX", "COOLAPK_REPLY_MAX_ITEMS"):
+            os.environ.pop(key, None)
+        importlib.reload(_models)
+    check(
+        "ui6b 三项上限可由环境变量配置（非法值回落默认、0 表示不限制）",
+        reloaded == (7, 800, 0) and _models._truncate("abc", 0) == ("abc", False)
+        and _models._truncate("abcdef", 3) == ("abc…", True)
+        and (_models.FEED_CONTENT_MAX_CHARS, _models.REPLY_CONTENT_MAX_CHARS, _models.REPLY_MAX_ITEMS) == before,
+        f"reloaded={reloaded} restored={before}",
+    )
+
+
 def main():
     probe_b1()
     probe_b2()
@@ -891,6 +1239,13 @@ def main():
     probe_dg2()
     probe_dg3()
     probe_dg4()
+    # 用户可感知改进（第二批）能力用例
+    probe_ui1()
+    probe_ui2()
+    probe_ui3()
+    probe_ui4()
+    probe_ui5()
+    probe_ui6()
     print(f"\n==== 回归结果: {len(PASS)} PASS / {len(FAIL)} FAIL ====")
     if FAIL:
         print("失败项:")

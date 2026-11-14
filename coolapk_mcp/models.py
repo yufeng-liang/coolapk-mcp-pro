@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from html import unescape
@@ -83,11 +84,40 @@ def _ensure_string(v: Any) -> str:
     return str(v) if not isinstance(v, str) else v
 
 
+def _env_int(name: str, default: int) -> int:
+    """读整数环境变量：非法值回落默认（与 client._env_int 同口径）。"""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+# 单条正文的输出上限（字符）。酷安长文可上万字，一次工具调用把几万字塞进模型
+# 上下文既贵又会挤掉后续对话，而「被截断」如果不标出来，调用方会拿半截正文当
+# 全文分析。超限时截断并置 content_truncated=True，需要全文走 share_url。
+FEED_CONTENT_MAX_CHARS = _env_int("COOLAPK_FEED_CONTENT_MAX", 2000)
+REPLY_CONTENT_MAX_CHARS = _env_int("COOLAPK_REPLY_CONTENT_MAX", 800)
+# 单次输出的回复条数上限（all_replies 最多翻 30 页，一页 10 条即 300 条）。
+REPLY_MAX_ITEMS = _env_int("COOLAPK_REPLY_MAX_ITEMS", 60)
+
+
+def _truncate(text: str, limit: int) -> tuple[str, bool]:
+    """按字符数截断，返回 (文本, 是否截断)；limit<=0 表示不限制。"""
+    if limit <= 0 or len(text) <= limit:
+        return text, False
+    return text[:limit].rstrip() + "…", True
+
+
 class FeedModel(BaseModel):
     id: int = 0
     title: str = ""
     message: str = Field(exclude=True, default="")  # HTML，仅内部用
     content: str = ""  # 纯文本，由 model_validator 从 message 生成
+    # 正文超过 FEED_CONTENT_MAX_CHARS 被截断（全文见 share_url / coolapk_get_url）
+    content_truncated: bool = False
     feed_type: str = Field(alias="feedType", default="feed")
     tag: str = ""  # 话题标签（话题动态等列表条目会带，普通动态为空、exclude_defaults 不输出）
     username: str = ""
@@ -121,6 +151,9 @@ class FeedModel(BaseModel):
     def _generate_content(self) -> FeedModel:
         if not self.content and self.message:
             self.content = _strip_html(self.message)
+        self.content, self.content_truncated = _truncate(
+            self.content, FEED_CONTENT_MAX_CHARS
+        )
         return self
 
     @field_validator("dateline", mode="before")
@@ -174,6 +207,8 @@ class FeedDetail(FeedModel):
     replies_truncated: bool = False
     # 全量评论续抓页码（未截断时为 None）
     replies_next_page: int | None = None
+    # 因超过 REPLY_MAX_ITEMS 而未输出的回复条数（0 表示全部输出）
+    replies_omitted: int = 0
     # 分享链接（带 s= 分享码，浏览器打开可看全文与图片，免服务器图片流量）
     share_url: str = ""
 
@@ -213,10 +248,29 @@ class FeedDetail(FeedModel):
         )
 
 
+def cap_replies(detail: FeedDetail, limit: int | None = None) -> FeedDetail:
+    """按 REPLY_MAX_ITEMS 限制输出的回复条数，并标记被省略的条数。
+
+    为什么不是「截断就报错」：all_replies 一条帖子能翻 300 条，全塞进上下文会把
+    后续对话挤掉，而只输出一部分却不说，调用方会把「前 60 条」当成全部评论。
+    因此保留前 N 条 + replies_omitted 计数 + replies_truncated=True，让「还有
+    多少没看」是可读的事实。
+    """
+    max_items = REPLY_MAX_ITEMS if limit is None else limit
+    if max_items <= 0 or len(detail.replies) <= max_items:
+        return detail
+    detail.replies_omitted = len(detail.replies) - max_items
+    detail.replies = detail.replies[:max_items]
+    detail.replies_truncated = True
+    return detail
+
+
 class ReplyModel(BaseModel):
     id: int = 0
     message: str = Field(exclude=True, default="")
     content: str = ""
+    # 回复正文超过 REPLY_CONTENT_MAX_CHARS 被截断（回复一般不长，阈值更低）
+    content_truncated: bool = False
     username: str = ""
     uid: int = 0
     like_num: int = Field(alias="likenum", default=0)
@@ -239,6 +293,9 @@ class ReplyModel(BaseModel):
     def _generate_content(self) -> ReplyModel:
         if not self.content and self.message:
             self.content = _strip_html(self.message)
+        self.content, self.content_truncated = _truncate(
+            self.content, REPLY_CONTENT_MAX_CHARS
+        )
         return self
 
     @model_validator(mode="after")
@@ -398,14 +455,14 @@ class AppModel(BaseModel):
 
 # 动态/评论共用的核心字段：正文、作者、互动数、时间、图片、id
 _FEED_FIELDS = (
-    "id", "title", "content", "tag", "feed_type", "username", "uid",
+    "id", "title", "content", "content_truncated", "tag", "feed_type", "username", "uid",
     "user_level", "like_num", "reply_num", "forward_num", "read_num",
     "dateline", "device", "ip_location", "images",
     # 质量派生字段（scoring 模块计算，服务端补进条目）
     "post_score", "discussion_ratio",
 )
 _REPLY_FIELDS = (
-    "id", "content", "username", "uid", "like_num", "dateline",
+    "id", "content", "content_truncated", "username", "uid", "like_num", "dateline",
     "is_author", "images", "reply_count", "reply_to", "sub_replies",
     "comment_match", "links",
 )
@@ -423,7 +480,7 @@ _TOOL_FIELDS: dict[str, tuple[str, ...]] = {
                     "fetch_source", "comment_search", "comments_focus",
                     "edit_history", "sub_replies_expanded",
                     "sub_replies_truncated", "replies_truncated",
-                    "replies_next_page"),
+                    "replies_next_page", "replies_omitted"),
     "user_profile": ("uid", "username", "bio", "level", "fans_num", "follow_num",
                      "feed_num", "verify_title", "reg_date", "city", "gender"),
     "user_feeds": _FEED_FIELDS,
@@ -466,12 +523,12 @@ _USER_FEEDS_META = (
     "truncated", "next_page",
 )
 # home 包装结构的元字段（feeds 单独按动态白名单裁剪）
-_HOME_META = ("tab", "page", "fetched")
+_HOME_META = ("tab", "page", "fetched", "has_more", "next_page")
 # 板块 / 二手包装的元字段
-_BOARD_META = ("board", "page", "fetched")
-_SECONDHAND_META = ("brand", "page", "fetched")
+_BOARD_META = ("board", "page", "fetched", "has_more", "next_page")
+_SECONDHAND_META = ("brand", "page", "fetched", "has_more", "next_page")
 # 通知包装的元字段（items 单独按通知白名单裁剪）
-_NOTIFY_META = ("ntype", "page", "fetched", "counts")
+_NOTIFY_META = ("ntype", "page", "fetched", "counts", "has_more", "next_page")
 
 
 def _apply_whitelist(obj: Any, fields: tuple[str, ...]) -> Any:

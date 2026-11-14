@@ -14,6 +14,10 @@
 - CLI 补齐 5 个与服务端对齐的命令：`app-detail`（应用详情）、`author`（画像 + 专长推断 + 高分动态）、`suggest`（联想词）、`get-url`（只读透传，输出前剔除敏感键）、`image-link`（`/img` 签名外链，需 `COOLAPK_PUBLIC_BASE`）。
 - 新增 `COOLAPK_LOG_JSON` / `COOLAPK_LOG_LEVEL`：开启后日志输出 JSON Lines 到 stderr（`ts`/`level`/`logger`/`msg`，异常时多一个 `exc` 只留最后一行），容器与采集器可直接按行解析，stdio 模式不污染协议帧。
 - 新增 `.github/workflows/release.yml`：推送 `vX.Y.Z` tag 时校验 tag 与 `pyproject` / `__version__` 一致，构建 sdist/wheel 并附加到 GitHub Release（不推 PyPI）。
+- `coolapk_read_image` 支持一次多张图片（逗号/空格/换行分隔，最多 9 张）：九宫格帖此前要调 9 次，现在一次看全；任一张下载失败会指明是第几张，不再静默返回「这帖只有这么多图」。
+- `coolapk_feed_detail` 的 `feed_id` 与 CLI `coolapk feed` 现在接受酷安分享链接或整段分享文案（含 `?id=` / `feedId=` 形态），自动解析出帖子 ID；解析不出时明确报错，不再把整段文本当 ID 发给接口。
+- 列表类工具（`coolapk_search` / `coolapk_home` / `coolapk_board` / `coolapk_secondhand` / `coolapk_notify`）统一返回 `has_more` 与 `next_page`，续抓口径与 `coolapk_feed_detail` / `coolapk_user_feeds` 对齐：此前只能盲猜 `page+1`，翻过头拿到空列表也判断不出「到底了」。
+- `coolapk_search` 结果为空时新增 `hint`，区分「被关键词严格过滤」（给出被滤条数并建议 `strict=false` 或换词）、「只剩卡片/广告位」与「酷安确实没有」。
 
 ### 变更
 
@@ -23,6 +27,7 @@
 - `coolapk_topic` 详情与动态拆分降级：话题详情接口被风控时仍返回动态列表，并在 `topic_error` / `feeds_error` 标注原因；此前任一路失败即整次失败。
 - `coolapk_get_url` 严格模式改为默认开启（`COOLAPK_GET_URL_STRICT=1`）：除写端点黑名单外，还要求末段形态像只读端点（`detail`/`list`/`info`/`space`/`search`…）或以纯数字 id 结尾，未来新增的写端点也会被挡住；确需透传非常规只读路径时设 `COOLAPK_GET_URL_STRICT=0`。
 - `COOLAPK_ALLOW_ANONYMOUS=1` 现在真正生效：此前它只解除 HTTP 启动拦截，客户端仍会在本地预检里把未登录请求判成 `auth_expired`（匿名只读实际不可用）；现在未登录时按匿名发请求、不带 `X-App-Token`/Cookie。
+- `coolapk_home` 的 `tab` 语义修正：`recommend` 改为真推荐流（`/v6/main/indexV8`），关注流独立成 `follow`（同时接受 `dynamic` / `关注`）。此前 `recommend` 实际请求的是 `V9_HOME_TAB_FOLLOW`（关注流），关注少的人会拿到几条甚至空列表，看起来像工具坏了。
 - streamable-http 鉴权默认收紧：绑定回环地址且未设 `COOLAPK_HTTP_TOKEN` 时同样拒绝启动（此前只有非回环才拒绝，而 README 推荐的反代拓扑恰好落在回环上，等于公网可达却零鉴权）。确需无鉴权的内网联调必须显式设 `COOLAPK_ALLOW_ANONYMOUS=1`。
 
 ### 优化
@@ -32,6 +37,7 @@
 - /status 的 `requests` 增加 `calls` 与 `latency_ms`：延迟按逻辑调用统计（含缓存命中与单飞搭车），排障时能直接看出是慢在限速还是上游。
 - /status 取 client 或指标失败时降级为 `{"status":"degraded",…}`（HTTP 仍 200）：此前配置损坏会让探针拿到 500，与「进程挂了」无法区分。
 - 指标覆盖面补齐：非 `CoolapkError` 的意外异常记为 `internal:<异常类名>`（此前一律零记录），SMS/验证码登录链路的请求也计入 `requests`（此前恒为 0，与真实上游流量不符）；单飞搭车者不再被算成「缓存未命中」，命中率回归真实。
+- 长文本不再无上限地塞进上下文：正文超 `COOLAPK_FEED_CONTENT_MAX`（默认 2000 字）、单条评论超 `COOLAPK_REPLY_CONTENT_MAX`（默认 800 字）截断并标 `content_truncated`；单次回复条数超 `COOLAPK_REPLY_MAX_ITEMS`（默认 60）时保留前 N 条并标 `replies_omitted`（`all_replies` 一条帖能翻 300 条）；三项设 `0` 均可关闭限制。
 - 结构化日志细节：`httpx`/`mcp`/`uvicorn` 固定压到 `WARNING`（它们的 INFO 会把带 token/sessid 的完整请求 URL 写进日志流）；U+2028/U+2029/U+0085 转义保证「一条一行」；只替换自己上次装的 handler，宿主（pytest、外层 uvicorn）已装的 handler 不再被丢弃。
 
 ### 修复

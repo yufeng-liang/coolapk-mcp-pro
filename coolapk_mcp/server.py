@@ -45,10 +45,12 @@ from coolapk_mcp.models import (
     _format_time,
     _strip_html as _strip_html_keep_links,
     apply_tool_whitelist,
+    cap_replies,
 )
 from coolapk_mcp.config import CONFIG_DIR, AppConfig, restrict_to_owner
 # 图片中转的域名白名单与签名拼装只有一份实现（CLI image-link 也用这份）
-from coolapk_mcp.img_link import IMAGE_HOSTS, build_image_links
+from coolapk_mcp.img_link import IMAGE_HOSTS, build_image_links, split_urls
+from coolapk_mcp.linkparse import parse_feed_id
 from coolapk_mcp.logging_utils import setup_logging
 IMAGE_UA = (
     "Dalvik/2.1.0 (Linux; U; Android 16; 23113RKC6C Build/AQ3A.250226.002) "
@@ -452,6 +454,54 @@ def _parse_feed_list(raw: Any) -> list[FeedModel]:
     return [FeedModel.from_api(f) for f in raw if isinstance(f, dict)]
 
 
+# 一次最多返回的图片张数：九宫格是酷安常见形态，再多就是批量搬运了
+class ImageBatch(list[Image]):
+    """多图返回值的注解占位（不是真的容器类型）。
+
+    FastMCP 见到 `list[Image]` 会尝试用 pydantic 建结构化返回 schema，而 mcp 的
+    Image 不是可建模类型，导入期直接抛 PydanticSchemaGenerationError。这个类自带
+    零类型注解，FastMCP 判定「无法建模」，于是走非结构化分支，运行时再由
+    _convert_to_content 把每个 Image 转成一块 ImageContent —— 正好是多张图片结果。
+    """
+
+
+_MAX_IMAGES = 9
+
+
+def _paging_meta(page: int, filled: int, size: int | None = None) -> dict[str, Any]:
+    """列表工具的分页提示：has_more + next_page。
+
+    为什么要它：此前列表工具只回 page/fetched，调用方只能盲猜 page+1，翻过头
+    拿到空列表也判断不出「到底了」；而 feed_detail/author_digest 早就有
+    truncated/next_page，两套口径让 agent 无法用同一套逻辑决定要不要继续翻。
+
+    判定口径是「本页是否填满」：酷安末页通常不满一页，填满即认为可能还有下一页
+    （多翻一页最多拿到空列表，不会漏数据）。filled 用原始条数而不是过滤后的
+    条数，否则「过滤后剩 3 条、后面还有」会被误判成末页。
+    """
+    size = max(1, int(CoolapkClient.PAGE_SIZE if size is None else size))
+    has_more = filled >= size
+    return {"has_more": has_more, "next_page": page + 1 if has_more else None}
+
+
+def _search_empty_hint(meta: dict, keyword: str) -> str:
+    """空搜索结果的解释：区分「酷安没有」「被过滤掉」「只剩广告位」三种原因。"""
+    raw_count = int(meta.get("raw_count") or 0)
+    filtered = int(meta.get("keyword_filtered") or 0)
+    if filtered:
+        return (
+            f"酷安返回 {raw_count} 条，其中 {filtered} 条因关键词严格匹配被过滤；"
+            f"可设 strict=false 查看原始结果，或把「{keyword}」拆成更短的词、"
+            f"先用 coolapk_suggest 查规范用词"
+        )
+    if raw_count:
+        return (
+            f"酷安返回 {raw_count} 条但没有可用帖子（多为卡片/广告位）；"
+            f"可设 strict=false 重试，或换个更通用的关键词"
+        )
+    return f"酷安没有搜到「{keyword}」：可用 coolapk_suggest 查联想词，或换更通用的说法"
+
+
 def _normalize_keyword_mode(value: str) -> str:
     """keyword_mode 只认 any/all，其余（含大小写、空格）一律回落 any。
 
@@ -585,6 +635,7 @@ async def coolapk_search(
             强烈建议保持默认 hot：酷安默认排序混入大量低互动点评，
             实测 hot 直接返回高赞干货帖；结果带 like_num/reply_num 可再筛选
     """
+    page = max(1, int(page or 1))
     client = await _get_client()
     data = await client.search(keyword, type, page, sort=sort)
     if not isinstance(data, list):
@@ -596,13 +647,25 @@ async def coolapk_search(
     results = postfilter.convert_search_items(kept)
     # results 已是 dump 后的 dict 列表，直接按条目类型分发白名单
     results = apply_tool_whitelist("search", results)
-    return json.dumps({"counts": meta, "results": results}, ensure_ascii=False)
+    payload: dict[str, Any] = {
+        "page": page,
+        # 用原始条数判断下一页：结果被 strict 过滤后变少，按结果数判断会把
+        # 「过滤后只剩 3 条、后面还有 30 条」误判成末页
+        **_paging_meta(page, int(meta.get("raw_count") or 0)),
+        "counts": meta,
+        "results": results,
+    }
+    if not results:
+        # 空结果必须解释原因：被关键词全滤掉时若只说「没搜到」，用户会以为
+        # 酷安社区没有这个内容，而实际是几十条被 strict 判掉了
+        payload["hint"] = _search_empty_hint(meta, keyword)
+    return json.dumps(payload, ensure_ascii=False)
 
 
 @mcp.tool()
 @_catch_api_error
 async def coolapk_feed_detail(
-    feed_id: int,
+    feed_id: str | int,
     with_replies: bool = True,
     reply_page: int = 1,
     all_replies: bool = False,
@@ -618,7 +681,8 @@ async def coolapk_feed_detail(
     高赞反馈」，获取方式与答疑多在楼主回复里（每个来源最多翻 5 页）。
 
     Args:
-        feed_id: 帖子ID
+        feed_id: 帖子 ID，也可直接粘贴酷安分享链接或整段分享文案
+            （如 https://www.coolapk.com/feed/1234567890），自动解析出 ID
         with_replies: 是否包含回复列表，默认是
         reply_page: 回复页码（all_replies / comment_keyword / comments_focus 非 default 时忽略）
         all_replies: 拉全部一级评论（自动翻页，含内联楼中楼），适合完整舆情/评论分析
@@ -638,6 +702,15 @@ async def coolapk_feed_detail(
         focus_page: 焦点评论起始页（消费上一次的 focus_meta.next_page 用；
             只在 comments_focus 为 smart/author/hot 时生效）
     """
+    # 用户贴过来的通常是分享链接/整段文案，让模型自己抠数字既多一步又容易抠错
+    resolved_id = parse_feed_id(feed_id)
+    if resolved_id is None:
+        return _error_json(
+            "无法从 feed_id 解析出帖子 ID：可直接传数字，或粘贴酷安分享链接/整段"
+            "分享文案（如 https://www.coolapk.com/feed/1234567890）",
+            "api",
+        )
+    feed_id = resolved_id
     client = await _get_client()
     focus = (comments_focus or "default").strip().lower()
     if focus not in ("default", "smart", "author", "hot", "all"):
@@ -742,6 +815,10 @@ async def coolapk_feed_detail(
         if sub_truncated:
             # 有父评论的楼中楼撞到页数上限没取全，上层据此决定是否继续深挖
             detail.sub_replies_truncated = True
+
+    # 回复条数上限：all_replies 一条帖子能翻 300 条，整份塞进上下文会把后续
+    # 对话挤掉。保留前 N 条并标出省略条数（replies_omitted），比静默少给要诚实
+    detail = cap_replies(detail)
 
     if comment_keyword:
         dumped = detail.model_dump(mode="json", exclude_defaults=True)
@@ -934,30 +1011,42 @@ async def coolapk_author_digest(
 @mcp.tool()
 @_catch_api_error
 async def coolapk_home(tab: str = "recommend", page: int = 1) -> str:
-    """获取酷安首页动态。
+    """获取酷安首页动态（推荐 / 关注 / 热门 / 最新）。
 
-    返回 {"tab", "page", "fetched", "feeds"}：tab 回显实际分栏（未知取值按
-    recommend 处理），feeds 为动态列表。旧版本返回裸列表，调用方按 dict 解析。
+    返回 {"tab", "page", "fetched", "has_more", "next_page", "feeds"}：tab 回显
+    实际分栏（未知取值按 recommend 处理），feeds 为动态列表。
 
     Args:
-        tab: 类型，可选 recommend(推荐) hot(热门) latest(最新)
-        page: 页码
+        tab: recommend(推荐，/v6/main/indexV8 算法推荐) follow(关注，只看已关注
+            的人) hot(热门) latest(最新)
+        page: 页码，默认 1
     """
     client = await _get_client()
-    # tab 归一：未知取值按 recommend 处理，并在返回里回显真实分栏（此前直接
-    # 返回裸列表，agent 无从判断拿到的是哪一栏、也没有分页信息）
     tab = (tab or "").strip().lower()
-    if tab == "hot":
+    page = max(1, int(page or 1))
+    # 语义修正：此前 recommend 走 V9_HOME_TAB_FOLLOW（关注流），关注少的人会
+    # 拿到几条甚至空列表，看起来像工具坏了；真推荐是 main/indexV8。关注流保留
+    # 为独立的 follow 分栏，两个语义不再混用一个名字。
+    if tab in ("follow", "dynamic", "关注"):
+        tab = "follow"
+        data = await client.get_home_feeds(page)
+    elif tab == "hot":
         data = await client.get_hot_feeds(page)
     elif tab == "latest":
         data = await client.get_latest_feeds(page)
     else:
         tab = "recommend"
-        data = await client.get_home_feeds(page)
+        data = await client.get_main_feeds(page)
     if isinstance(data, list):
         feeds = _parse_feed_list(data)
         return _json(
-            {"tab": tab, "page": page, "fetched": len(feeds), "feeds": feeds},
+            {
+                "tab": tab,
+                "page": page,
+                "fetched": len(feeds),
+                "feeds": feeds,
+                **_paging_meta(page, len(feeds)),
+            },
             whitelist="home",
         )
     return _json(data)
@@ -1021,7 +1110,13 @@ async def coolapk_board(board: str, page: int = 1) -> str:
     if isinstance(raw, list):
         feeds = _parse_feed_list(raw)
         return _json(
-            {"board": board_id, "page": page, "fetched": len(feeds), "feeds": feeds},
+            {
+                "board": board_id,
+                "page": page,
+                "fetched": len(feeds),
+                "feeds": feeds,
+                **_paging_meta(page, len(feeds)),
+            },
             whitelist="board",
         )
     return _json(raw)
@@ -1044,7 +1139,13 @@ async def coolapk_secondhand(brand: int = 0, page: int = 1) -> str:
     if isinstance(raw, list):
         feeds = _parse_feed_list(raw)
         return _json(
-            {"brand": brand_id or None, "page": page, "fetched": len(feeds), "feeds": feeds},
+            {
+                "brand": brand_id or None,
+                "page": page,
+                "fetched": len(feeds),
+                "feeds": feeds,
+                **_paging_meta(page, len(feeds)),
+            },
             whitelist="secondhand",
         )
     return _json(raw)
@@ -1162,6 +1263,7 @@ async def coolapk_notify(ntype: str = "message", page: int = 1, with_count: bool
         "page": page,
         "fetched": len(items),
         "items": items,
+        **_paging_meta(page, len(items)),
     }
     if with_count:
         try:
@@ -1222,19 +1324,51 @@ async def coolapk_login_status() -> str:
 
 @mcp.tool()
 @_catch_api_error
-async def coolapk_read_image(url: str) -> Image:
-    """下载酷安 CDN 图片并作为图片返回（用于查看动态配图、头像等）。
+async def coolapk_read_image(url: str) -> ImageBatch:
+    """下载酷安 CDN 图片并作为图片返回（支持一次多张，九宫格帖一次看全）。
 
     仅允许酷安图片域名：image.coolapk.com / avatar.coolapk.com /
     static.coolapk.com。失败时返回结构化错误，可改用 coolapk_get_url
     获取接口数据，或直接向用户呈现 URL。
 
     Args:
-        url: 图片完整 URL（http 自动升级 https）
+        url: 一个或多个图片 URL，用逗号、空格或换行分隔，最多 9 张
+            （http 自动升级 https）
     """
+    urls = split_urls(url)
+    if not urls:
+        raise CoolapkError("url 不能为空", kind="api")
+    if len(urls) > _MAX_IMAGES:
+        raise CoolapkError(
+            f"一次最多 {_MAX_IMAGES} 张图（收到 {len(urls)} 张）：请分批调用", kind="api"
+        )
+    # 先把域名/协议一次性校验完再下载：第 5 张才发现域名不对，前 4 张的网络
+    # 请求就白发了；这里与 client.download_image 用同一份域名白名单
+    for item in urls:
+        parts = urlsplit(item.strip())
+        if parts.scheme not in ("http", "https") or (
+            parts.hostname or ""
+        ).lower() not in IMAGE_HOSTS:
+            raise CoolapkError(
+                f"图片域名不在白名单: {item}（仅允许 {'/'.join(sorted(IMAGE_HOSTS))}）",
+                error_code=403,
+                kind="api",
+            )
     client = await _get_client()
-    data, fmt = await client.download_image(url)
-    return Image(data=data, format=fmt)
+    images: list[Image] = []
+    for index, item in enumerate(urls, 1):
+        try:
+            data, fmt = await client.download_image(item)
+        except CoolapkError as exc:
+            # 部分失败整体报错并指明是第几张：只返回成功的那几张，调用方会以为
+            # 帖子本来就只有这么多图（与真实情况无法区分）
+            raise CoolapkError(
+                f"第 {index}/{len(urls)} 张下载失败（{item}）：{exc.message}",
+                error_code=exc.error_code,
+                kind=exc.kind,
+            ) from exc
+        images.append(Image(data=data, format=fmt))
+    return ImageBatch(images)
 
 
 @mcp.tool()
