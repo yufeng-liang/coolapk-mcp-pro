@@ -8,11 +8,36 @@
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from urllib.parse import unquote
 
 CONFIG_DIR = Path.home() / ".coolapk-mcp"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+def restrict_to_owner(path: Path, mode: int = 0o600) -> None:
+    """把含凭据的文件收紧到仅当前用户可读写。
+
+    POSIX 用 chmod（0600）；Windows 的 os.chmod 只能改只读位，必须走 icacls：
+    先 /inheritance:r 去掉继承来的 ACE，再只授权当前用户完全控制。
+    任何失败都只忽略——权限收紧不该让登录态保存或启动失败。
+    """
+    try:
+        if os.name == "posix":
+            os.chmod(path, mode)
+            return
+        user = os.environ.get("USERNAME") or os.environ.get("USER")
+        if not user:
+            return
+        subprocess.run(
+            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 # 酷安桌面端登录数据目录（Windows %APPDATA%）
 DESKTOP_CONFIG_DIR = (
@@ -224,6 +249,12 @@ class AppConfig:
     def save(self) -> None:
         """原子写：先落临时文件再 replace，防止并发/中断产生半截 JSON"""
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if os.name == "posix":
+            # 目录也收成 0700：config.json 本身 0600 了，但目录可列会暴露文件名与备份
+            try:
+                os.chmod(CONFIG_DIR, 0o700)
+            except OSError:
+                pass
         payload = json.dumps(
             {
                 "device_code": self.device_code,
@@ -246,10 +277,6 @@ class AppConfig:
         else:
             tmp.write_text(payload, encoding="utf-8")
         os.replace(tmp, CONFIG_FILE)
-        # POSIX：配置里有 uid/token/完整 Cookie，收紧成仅本人可读写；
-        # Windows 没有该权限位（os.chmod 只能改只读位），失败一律忽略
-        if os.name == "posix":
-            try:
-                os.chmod(CONFIG_FILE, 0o600)
-            except OSError:
-                pass
+        # 配置里有 uid/token/完整 Cookie：POSIX 收成 0600、Windows 用 icacls
+        # 去掉继承 ACE 只留当前用户（os.chmod 在 Windows 只能改只读位，形同无效）
+        restrict_to_owner(CONFIG_FILE)

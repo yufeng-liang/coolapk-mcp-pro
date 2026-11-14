@@ -373,6 +373,17 @@ class CoolapkClient:
         self._token_fut: asyncio.Future | None = None
         self._index_dirty = False
         self._index_flush_task: asyncio.Task | None = None
+        # 匿名只读：COOLAPK_ALLOW_ANONYMOUS=1 且未登录时，不再本地预检拦截、
+        # 也不发 X-App-Token / Cookie（token 需要登录态 blob，匿名场景拿不到）
+        self.allow_anonymous = os.environ.get("COOLAPK_ALLOW_ANONYMOUS", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        # 运行指标：只统计不落盘，供 streamable-http 的 /status 观测
+        self._started_at = time.monotonic()
+        self._metrics: dict[str, Any] = {
+            "requests": 0, "retries": 0, "cache_hits": 0, "cache_misses": 0,
+            "shared": 0, "errors": {},
+        }
         self._load_uid_index()
 
     # ---- feed_id → uid 索引（详情回落的关键） ----
@@ -518,8 +529,7 @@ class CoolapkClient:
 
     async def _build_headers(self) -> dict[str, str]:
         """组装请求头（X-App-Token 由 _app_token 缓存与线程卸载）"""
-        token = await self._app_token()
-        return {
+        headers = {
             "X-Sdk-Int": "35",
             "X-Sdk-Locale": "zh-CN",
             "X-App-Mode": "universal",
@@ -532,13 +542,16 @@ class CoolapkClient:
             "X-App-Supported": str(DEFAULT_VERSION_CODE),
             "X-Dark-Mode": "0",
             "X-Requested-With": "XMLHttpRequest",
-            "X-App-Token": token,
             "User-Agent": (
                 "Dalvik/2.1.0 (Linux; U; Android 16; 23113RKC6C Build/AQ3A.250226.002) "
                 "(#Build; Redmi; 23113RKC6C; AQ3A.250226.002; HyperOS_3.0; 3.0.1.0) "
                 f"+CoolMarket/{DEFAULT_APP_VERSION}-{DEFAULT_VERSION_CODE}-universal"
             ),
         }
+        if not (self.allow_anonymous and not self.config.is_logged_in):
+            # 匿名只读时不带 X-App-Token：生成它需要登录态 auth blob，匿名场景本来就没有
+            headers["X-App-Token"] = await self._app_token()
+        return headers
 
     def _get_cookie_header(self) -> str | None:
         """返回 Cookie 字符串。直接拼字符串避免 httpx cookies 参数对中文 username 的编码问题。
@@ -561,6 +574,9 @@ class CoolapkClient:
         SESSID），不算失效。
         """
         if not self.config.is_logged_in:
+            # 匿名只读模式下未登录不算错误：酷安的只读接口多数允许匿名访问
+            if getattr(self, "allow_anonymous", False):
+                return
             raise CoolapkError(AUTH_EXPIRED_MESSAGE, kind="auth_expired")
         cookie = self.config.desktop_cookie
         if cookie and not has_valid_sessid(cookie) and "sessid=" in cookie.lower():
@@ -592,6 +608,15 @@ class CoolapkClient:
         return f"{self.config.uid}:{token8}:{self.config.device_code}:{path}?{norm}"
 
     async def _request(self, method: str, path: str, **kwargs) -> Any:
+        """统一入口：按错误 kind 记账后原样抛出（指标只给 /status 看，不影响语义）"""
+        try:
+            return await self._request_inner(method, path, **kwargs)
+        except CoolapkError as exc:
+            errors = self._metrics["errors"]
+            errors[exc.kind] = errors.get(exc.kind, 0) + 1
+            raise
+
+    async def _request_inner(self, method: str, path: str, **kwargs) -> Any:
         """统一请求方法：本地登录预检 → GET 缓存 → 单飞合并 → 限速/重试 → 错误分类
 
         单飞（single-flight）只覆盖 cache_key 非 None 的 GET：同 key 已有在途
@@ -623,13 +648,16 @@ class CoolapkClient:
         if throttle.CACHE_ENABLED:
             cached = self._cache.get(cache_key)
             if cached is not None:
+                self._metrics["cache_hits"] += 1
                 return cached
+            self._metrics["cache_misses"] += 1
 
         # ---- 单飞：同 key 已有在途请求时搭车，不再单独发一次 ----
         # 注意单飞不以 CACHE_ENABLED 为条件：关缓存只该关掉读写，不该让并发合并失效
         inflight = self._inflight.get(cache_key)
         if inflight is not None:
             # shield：等待方被取消时不连带取消真正在发请求的那一路
+            self._metrics["shared"] += 1
             return await asyncio.shield(inflight)
 
         inflight = asyncio.get_running_loop().create_future()
@@ -673,6 +701,9 @@ class CoolapkClient:
         last_err: CoolapkError | None = None
         last_status: int | None = None
         for attempt in range(throttle.MAX_RETRIES + 1):
+            self._metrics["requests"] += 1
+            if attempt:
+                self._metrics["retries"] += 1
             # 限速桶：默认 global 模式下参数被忽略（行为与历史版本一致）；
             # COOLAPK_RATE_LIMIT_MODE=bucket 时按资源段各自计时
             await self._limiter.acquire(throttle.bucket_for(base))
@@ -1940,6 +1971,25 @@ class CoolapkClient:
                         cookies[name] = val
         result["_cookies"] = cookies
         return result
+
+    def cache_stats(self) -> dict:
+        """缓存统计（供 /status）：条数、字节、命中率、淘汰次数"""
+        stats = self._cache.stats()
+        stats["enabled"] = bool(throttle.CACHE_ENABLED)
+        return stats
+
+    def metrics(self) -> dict:
+        """请求统计（供 /status）：累计请求/重试/缓存/单飞搭车与按 kind 的错误分布"""
+        return {
+            "uptime_s": round(time.monotonic() - self._started_at, 1),
+            "requests": self._metrics["requests"],
+            "retries": self._metrics["retries"],
+            "cache_hits": self._metrics["cache_hits"],
+            "cache_misses": self._metrics["cache_misses"],
+            "shared": self._metrics["shared"],
+            "inflight": len(self._inflight),
+            "errors": dict(self._metrics["errors"]),
+        }
 
     async def close(self):
         # 退出前把待落盘的 uid 索引刷掉：合并窗口里的脏数据不能丢。

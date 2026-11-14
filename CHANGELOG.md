@@ -9,6 +9,8 @@
 - 新增 `error_type=rate_limit`：HTTP 429 单独归类并解析服务端 `Retry-After`；建议等待时间超过退避上限（`COOLAPK_MAX_BACKOFF`，默认 30 秒）时不再重试，直接交回调用方，避免加重封禁；未超过时重试前的等待取「退避曲线」与 `Retry-After` 的较大值，不再只按本地曲线白撞一次限流窗口。
 - 新增 4 个工具，补齐此前只能靠 `coolapk_get_url` 手拼路径的能力：`coolapk_board`（21 个板块，支持板块 id / 中文名）、`coolapk_secondhand`（二手市场，可按品牌过滤）、`coolapk_app_detail`（应用详情）、`coolapk_notify`（@/评论/点赞/关注/私信，可选未读数）；工具总数 13 → 17。`coolapk_board` 的 `board` 参数同时接受板块 id、中文名与 page_name；`coolapk_notify` 条目的 `dateline` 与其它工具同口径（ISO8601+08:00）。
 - `coolapk_user_feeds` / `coolapk_author_digest` 新增 `keyword_mode=any|all`：`all` 要求关键词全部命中，用于精确圈定同一主题，避免「解锁」这类泛词把整页都召回。
+- 新增 `COOLAPK_ALLOWED_HOSTS` / `COOLAPK_ALLOWED_ORIGINS`：配置后开启 FastMCP 的 DNS rebinding 防护并只放行列出的 Host/Origin；不设仍保持关闭，兼容「公网 IP:端口」直连部署。
+- streamable-http 新增 `/status` 端点（与 `/mcp` 同一 Bearer 鉴权）：返回版本、运行时长、登录态、限速参数、缓存命中与按 `error_type` 分类的请求/重试指标，便于外部监控抓取；`/health` 保持极简不碰磁盘。
 
 ### 变更
 
@@ -17,6 +19,7 @@
 - `coolapk_feed_detail` / `coolapk_user_feeds` / `coolapk_author_digest` 新增 `truncated` / `next_page`（及 `sub_replies_truncated`）：撞到页数或请求预算上限时明确告知「还有没取的」，此前只能靠条数猜。
 - `coolapk_topic` 详情与动态拆分降级：话题详情接口被风控时仍返回动态列表，并在 `topic_error` / `feeds_error` 标注原因；此前任一路失败即整次失败。
 - `coolapk_get_url` 严格模式改为默认开启（`COOLAPK_GET_URL_STRICT=1`）：除写端点黑名单外，还要求末段形态像只读端点（`detail`/`list`/`info`/`space`/`search`…）或以纯数字 id 结尾，未来新增的写端点也会被挡住；确需透传非常规只读路径时设 `COOLAPK_GET_URL_STRICT=0`。
+- `COOLAPK_ALLOW_ANONYMOUS=1` 现在真正生效：此前它只解除 HTTP 启动拦截，客户端仍会在本地预检里把未登录请求判成 `auth_expired`（匿名只读实际不可用）；现在未登录时按匿名发请求、不带 `X-App-Token`/Cookie。
 - streamable-http 鉴权默认收紧：绑定回环地址且未设 `COOLAPK_HTTP_TOKEN` 时同样拒绝启动（此前只有非回环才拒绝，而 README 推荐的反代拓扑恰好落在回环上，等于公网可达却零鉴权）。确需无鉴权的内网联调必须显式设 `COOLAPK_ALLOW_ANONYMOUS=1`。
 
 ### 修复
@@ -32,6 +35,8 @@
 - 登录态刷新不再关掉并发在用的 client：旧实例进 retired 列表、延迟到服务退出统一关闭；已取到旧实例的请求拿到可重试的 `network` 错误，而不是 `internal`。
 - 浏览器登录端口竞态：`_free_port()` 释放到浏览器真正绑定之间被抢时，换端口自动重试一次（症状是进程活着但调试口不通），仍失败才报 `timeout`。
 - `coolapk login --adb` 失败不再静默返回：输出异常类型与三条排查提示（adb 是否在 PATH、手机是否授权 USB 调试、酷安是否已登录且 root）。
+- Windows 凭据文件不再继承目录 ACL：`config.json` 与 `img_secret` 写入后调用 `icacls /inheritance:r /grant:r <当前用户>:F`，只保留当前用户可读写（此前 Windows 分支完全没做权限收紧，同机其他账户可读 token 与完整 Cookie）。
+- 弱 `COOLAPK_HTTP_TOKEN` 启动时给警告：少于 16 位、含首尾空白或等于示例值 `coolapk-mcp-dev` 都会在日志里点名（不阻止启动）。这类问题此前只会表现成「客户端莫名 401」。
 
 ### 优化
 
@@ -48,10 +53,16 @@
 - `uid_index.json` 改为合并写盘（`COOLAPK_INDEX_SAVE_DELAY`，默认 1 秒）并线程卸载：此前每来一个新 feed_id 就把整份索引（最多 2000 条）同步写一次盘，翻页时等于每页一次阻塞 I/O；退出前由 `close()` 兜底刷盘。
 - 限速器支持分桶（`COOLAPK_RATE_LIMIT_MODE=bucket`）：按 `/v6/<资源>` 分桶各自计时，跨桶可并行、桶内仍严格串行；默认 `global` 与历史行为完全一致。
 - `coolapk_feed_detail` 的 `comments_focus` 两路评论（楼主 / 热门）改为并发发起：默认全局限速下与串行等价，开启 `bucket` 模式后才真正并行缩短耗时。
+- `comments_focus` 活跃时不再预拉一页默认回复（那一页会被聚焦结果整份替换，纯属多排一次限速窗口）；两路都为空时才回拉一页兜底并标 `fallback=default_replies`。
+- `coolapk_author_digest` 的动态列表与作者资料改为并发请求（互不依赖），资料页失败只降级为 `author_error`，不再连带失败。
+- GET 缓存增加字节上限（`COOLAPK_CACHE_MAX_BYTES`，默认 8 MB）与命中/淘汰统计：此前只按 256 条限制，几十条长评论列表就能占几十 MB。
 - 退避等待增加上限（`COOLAPK_MAX_BACKOFF`，默认 30 秒）：此前 `COOLAPK_MAX_RETRIES` 配到 8 时单次等待可超过 100 秒。
 - 限速等待抽出可替换出口（`throttle._sleep`），对应测试不再靠墙钟断言，慢 runner 上不会假红。
 - `X-App-Token` 生成加单飞：并发首请求只跑一次 bcrypt，其余等同一个 future；异常面放宽到 `Exception` 并统一归 `config` 附带修复路径（此前只有 `RuntimeError`/`OSError` 被兜，`ValueError` 会穿成 `internal`）。
 - `device_code` 纳入客户端指纹与缓存键：换机/重装后设备码变了会重建 client，不再一直用旧设备码签 token。
+- `/img` 的 `HEAD` 请求不再下载整图：此前探活也会把最多 15MB 正文读完再丢弃，现在上游同样用 `HEAD`，只回状态与类型。
+- 凭据目录权限：POSIX 下 `~/.coolapk-mcp` 收紧为 `0700`；`img_secret` 改为先按 `0600` 建文件再写入，消除 `write_text` 沿用 umask 的短暂 `0644` 窗口。
+- DNS rebinding 防护可按需开启（`COOLAPK_ALLOWED_HOSTS` / `COOLAPK_ALLOWED_ORIGINS`）：不设仍保持关闭以兼容公网 IP 直连，设置后只放行列出的 Host。
 - `/img` 增加并发信号量与 `X-Content-Type-Options: nosniff`；`Cache-Control` 的 max-age 跟随签名剩余有效期（此前固定 86400，可能把图片缓存到签名过期之后），仅接受四种位图类型，svg 等回落到 jpeg；显式非标端口直接 403。
 - Bearer 比较改为字节级，重复 `Authorization` 头直接拒绝（反代与进程可能各自取到不同值）；图片签名密钥与 Bearer token 彻底分离（`img_secret` 不再复用 `COOLAPK_HTTP_TOKEN`）。
 - 测试体系收口：新增 `/img` 与 Bearer 端点 19 例、CLI 6 例、浏览器登录 5 例；`conftest.py` 默认打桩 `X-App-Token` 并把所有导入期路径常量重定向到临时目录，整套测试不再依赖本机登录态与 `~/.coolapk-mcp`。

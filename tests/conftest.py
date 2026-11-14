@@ -64,10 +64,17 @@ CONFIG_DIR 也带不动它们。此前靠各用例自行 patch，漏一处就会
     # 用独立子目录：isolated_config 会占 tmp_path/.coolapk-mcp
     home = tmp_path / "import-time-home" / ".coolapk-mcp"
     home.mkdir(parents=True)
+    # 配置本身也要隔离：_get_client()/status 会 AppConfig.load()，
+    # 缺 device_code 时它还会落盘，不隔离就写进开发者真实 ~/.coolapk-mcp
+    monkeypatch.setattr(config, "CONFIG_DIR", home)
+    monkeypatch.setattr(config, "CONFIG_FILE", home / "config.json")
     monkeypatch.setattr(server, "IMG_SECRET_FILE", home / "img_secret")
     monkeypatch.setattr(libauth, "BLOB_CACHE_FILE", home / "auth_blob.bin")
     monkeypatch.setattr(libauth, "APK_CACHE_FILE", home / "coolapk.apk")
+    # DESKTOP_ACCOUNTS_FILE 是 DESKTOP_CONFIG_DIR 的派生常量，导入时已固化，
+    # 只改目录不带它 —— 否则 status/登录态会读到开发者真实桌面登录
     monkeypatch.setattr(config, "DESKTOP_CONFIG_DIR", tmp_path / "desktop")
+    monkeypatch.setattr(config, "DESKTOP_ACCOUNTS_FILE", tmp_path / "desktop" / "accounts.json")
     return home
 
 @pytest.fixture(autouse=True)

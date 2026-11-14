@@ -141,6 +141,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `COOLAPK_GET_URL_STRICT` | `1` | `coolapk_get_url` 严格模式（默认开启）：在写端点黑名单之上再加正向白名单，只放行末段形态像只读端点的路径（`detail`/`list`/`info`/`space`/`search`…）或以纯数字 id 结尾的路径，未知的新写端点也进不来。设为 `0` 才回到黑名单模式，保留「透传任意只读路径」的逃生舱 |
 | `COOLAPK_PAGE_SIZE` | `10` | 分页接口的「短页即末页」判定阈值：某页返回条数小于该值即认为到底。接口页大小改版时调这个，不用改代码 |
 | `COOLAPK_NO_CACHE` | 未设 | 设为 `1` 禁用 GET 缓存（调试用） |
+| `COOLAPK_CACHE_MAX_BYTES` | `8388608` | GET 缓存总字节上限（默认 8 MB）：除条数上限外再按体积淘汰，避免几条超长评论列表把常驻内存顶高 |
 | `COOLAPK_MAX_REPLY_PAGES` | `30` | `all_replies` 全量评论翻页上限（1-100，大帖防刷屏防风控） |
 | `COOLAPK_BROWSER` | 未设 | 指定浏览器可执行文件路径（`coolapk login --web` 用）；不设则自动查找 Chrome / Edge |
 | `COOLAPK_CDP_PORT` | 未设 | 连接已在运行的浏览器调试端口（需该浏览器带 `--remote-debugging-port` 启动）；设置后 `--web` 不再自己拉起浏览器 |
@@ -214,6 +215,12 @@ export COOLAPK_HTTP_TOKEN=<上一步生成的随机串>
 
 启动后先自检：`curl http://127.0.0.1:8000/health` 返回 `{"status":"ok"}` 即说明服务已就绪（该端点免鉴权，仅供探活）；MCP 端点在 `/mcp`，一律要求 Bearer Token。
 
+需要看运行状况时用 `/status`（同样要求 Bearer Token）：一次返回 `version`、`uptime_s`、`login`（是否登录/uid/来源）、`rate_limit`（模式与间隔）、`cache`（条数/字节/命中/淘汰）与 `requests`（累计请求、重试、缓存命中、单飞搭车、按 `error_type` 的错误分布）。`/health` 保持极简——容器探针不该触发任何磁盘或网络动作。
+
+```bash
+curl -H "Authorization: Bearer $COOLAPK_HTTP_TOKEN" http://127.0.0.1:8000/status
+```
+
 ### 环境变量（远程形态）
 
 | 变量 | 默认 | 说明 |
@@ -222,7 +229,9 @@ export COOLAPK_HTTP_TOKEN=<上一步生成的随机串>
 | `COOLAPK_HTTP_HOST` | `127.0.0.1` | HTTP 监听地址。**无论绑哪个地址**，未设 `COOLAPK_HTTP_TOKEN` 都会拒绝启动（见下方「安全」） |
 | `COOLAPK_HTTP_PORT` | `8000` | HTTP 监听端口 |
 | `COOLAPK_HTTP_TOKEN` | 空 | Bearer Token。客户端请求须带 `Authorization: Bearer <token>`；校验失败返回 401 |
-| `COOLAPK_ALLOW_ANONYMOUS` | 空 | 仅在**内网联调**时设为 `1`：允许无 token 启动（回环地址也一样）。生产不要开——开了等于 `/mcp` 完全无鉴权，叠加已关闭的 DNS rebinding 防护，本机任意网页都能打进来 |
+| `COOLAPK_ALLOW_ANONYMOUS` | 空 | 设 `1` 允许无 token 启动（回环地址也一样），并让客户端在未登录时按匿名只读发请求（不本地预检拦截、不带 `X-App-Token`/Cookie）。生产不要开——开了等于 `/mcp` 完全无鉴权，叠加默认关闭的 DNS rebinding 防护，本机任意网页都能打进来 |
+| `COOLAPK_ALLOWED_HOSTS` | 空 | 逗号分隔的 Host 白名单。设置后开启 FastMCP 的 DNS rebinding 防护并只放行列出的 Host（每项形如 `127.0.0.1:8000` 或 `mcp.example.com`）；不设则保持关闭以兼容「公网 IP:端口」直连 |
+| `COOLAPK_ALLOWED_ORIGINS` | 空 | 逗号分隔的 `Origin` 白名单，仅在上面的 Host 白名单启用时生效；不设等价于允许任意来源（非浏览器客户端通常不带 `Origin`） |
 
 > **uvicorn workers 必须为 1**：服务内部以单进程方式启动 uvicorn（`uvicorn.Config(...)` 未设 `workers` 参数）。请勿自行用 `--workers N` 多进程拉起——全局限速（`COOLAPK_MIN_INTERVAL`）、GET 缓存与验证码负缓存都是**进程内状态**，多进程互不共享：限速被 worker 数稀释、缓存命中率下降、验证码冷却互不感知，风控风险成倍上升。需要扩容时按「一台服务器一个实例」拆分部署，不要在同一实例上开多进程。
 
@@ -230,7 +239,9 @@ export COOLAPK_HTTP_TOKEN=<上一步生成的随机串>
 
 - **强制 Bearer Token**：未设 `COOLAPK_HTTP_TOKEN` 时服务直接拒绝启动——**回环地址也不例外**。旧版只对非回环拒绝，而「127.0.0.1 + 反代」正是本文推荐的拓扑，等于公网可达却零鉴权。确实要做无鉴权的内网联调，显式设 `COOLAPK_ALLOW_ANONYMOUS=1`。token 用随机长串（生成命令见快速启动），不要用可猜的短串。
 - **必须走 TLS**：Bearer Token 是明文凭据，裸 HTTP 公网传输会被中间人截获。请勿把 `8000` 端口直接暴露公网，务必套一层 TLS 反向代理（Nginx 或 Caddy 示例如下），并在防火墙 / 云安全组里关闭直连端口。
-- **Host 校验（DNS rebinding 防护）已关闭**：FastMCP 自带的 DNS rebinding 防护按 Host 头白名单拦截请求，远程部署常态的「公网 IP 直连」会被其误判 421 拒绝，因此本服务显式关闭了该层（`enable_dns_rebinding_protection=False`）。此取舍以 Bearer Token 鉴权强制生效为前提——公网部署务必配置 `COOLAPK_HTTP_TOKEN` 并走 TLS 反代。
+- **Host 校验（DNS rebinding 防护）默认关闭，可按需开启**：FastMCP 自带的 DNS rebinding 防护按 Host 头白名单拦截请求，远程部署常态的「公网 IP 直连」会被其误判 421 拒绝，因此默认关闭（`enable_dns_rebinding_protection=False`）。配置 `COOLAPK_ALLOWED_HOSTS` 后自动开启并只放行列出的 Host——公网部署推荐这样做，配合 Bearer Token 与 TLS 反代形成两层防护。
+- **凭据文件权限**：`config.json` 存有 uid、token 与完整 Cookie，`img_secret` 是 `/img` 的签名密钥。POSIX 下目录收紧为 `0700`、文件 `0600`（先按 0600 建文件再写，不存在 umask 造成的 `0644` 窗口）；Windows 下没有权限位概念，改用 `icacls` 去掉继承 ACE、只保留当前用户。收紧失败只记日志，不影响运行。
+- **弱 token 启动自检**：`COOLAPK_HTTP_TOKEN` 少于 16 位、含首尾空白、或仍是示例值 `coolapk-mcp-dev` 时，启动日志会给出警告（不阻止启动）。这类配置错误本身不报错，只会表现成「客户端莫名 401」。
 - Nginx 反代示例（假设已有 `your-domain` 的证书配置）：
 
 ```nginx
@@ -403,7 +414,7 @@ pytest -q --cov=coolapk_mcp           # 带覆盖率（只打印不设门槛，�
 
 - 测试覆盖模型解析、白名单裁剪、限速/分桶/退避、缓存键与单飞、预算截断、HTTP 图片中转、配置与板块映射等；`pytest -q` 应全绿。
 - `tests/manual/regression_probe.py` 是零真实网络的离线回归探针（99 项断言），不进 CI，改协议/解析逻辑后可手动跑一遍做冒烟。
-- 覆盖率当前基线约 56%：`client.py` 55%、`server.py` 77%，`cli.py` 与 `browser_login.py` 仍在低位，属于优先补测区。
+- 覆盖率当前基线约 66%：`server.py` 80%、`client.py` 58%，`cli.py`（40%）与 `browser_login.py`（47%）仍在低位，属于优先补测区。
 - 测试不依赖本机登录态：`conftest.py` 默认把 `generate_token_v3` 打桩成假 token，并把 `~/.coolapk-mcp` 下所有导入期路径常量重定向到临时目录，跑测试不会碰真实 `config.json` / `img_secret` / `auth_blob`。
 - CI（`.github/workflows/ci.yml`）在 Python 3.10 / 3.12 / 3.14 上执行 ruff + mypy + pytest（带覆盖率）+ `coolapk --help` + compileall。
 

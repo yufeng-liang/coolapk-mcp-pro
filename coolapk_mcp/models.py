@@ -433,8 +433,8 @@ _TOOL_FIELDS: dict[str, tuple[str, ...]] = {
                "author_tier", "author_tier_label", "is_expert",
                "fans_per_feed", "expertise"),
     # 作者领域聚合：作者画像 + 过滤后的高赞帖列表
-    "author_digest": ("uid", "username", "author", "keyword", "keyword_mode", "pages",
-                      "fetched", "matched", "truncated", "next_page", "posts"),
+    "author_digest": ("uid", "username", "author", "author_error", "keyword", "keyword_mode",
+                      "pages", "fetched", "matched", "truncated", "next_page", "posts"),
 
     "home": _FEED_FIELDS,
     "topic": ("id", "title", "tag", "follow_num", "comment_num", "description"),

@@ -107,7 +107,7 @@ def test_img_forbidden_host_rejected_even_with_valid_signature(monkeypatch: pyte
     app, _calls = _build_app(monkeypatch)
     fetched: list[str] = []
 
-    async def fake_fetch(client, target, headers):
+    async def fake_fetch(client, target, headers, method="GET"):
         fetched.append(target)
         return 200, b"x", "image/jpeg", None, 0
 
@@ -139,7 +139,7 @@ def test_img_thumb_missing_falls_back_to_original(monkeypatch: pytest.MonkeyPatc
     url = "https://image.coolapk.com/a@1000w.jpg"
     seen: list[str] = []
 
-    async def fake_fetch(client, target, headers):
+    async def fake_fetch(client, target, headers, method="GET"):
         seen.append(target)
         if target.endswith(".m.jpg"):
             return 404, b"", "", None, 0
@@ -162,7 +162,7 @@ def test_img_sets_nosniff_and_bounded_cache(monkeypatch: pytest.MonkeyPatch) -> 
     url = "https://image.coolapk.com/a.jpg"
     exp = int(time.time()) + 120
 
-    async def fake_fetch(client, target, headers):
+    async def fake_fetch(client, target, headers, method="GET"):
         return 200, b"x", "image/svg+xml", None, 0
 
     monkeypatch.setattr(server, "_fetch_upstream_image", fake_fetch)
@@ -180,7 +180,7 @@ def test_img_sets_nosniff_and_bounded_cache(monkeypatch: pytest.MonkeyPatch) -> 
 def test_img_oversize_propagates_413(monkeypatch: pytest.MonkeyPatch) -> None:
     app, _calls = _build_app(monkeypatch)
 
-    async def fake_fetch(client, target, headers):
+    async def fake_fetch(client, target, headers, method="GET"):
         return 0, b"", "", {"error": "image_too_large", "detail": "超过上限"}, 413
 
     monkeypatch.setattr(server, "_fetch_upstream_image", fake_fetch)
@@ -193,7 +193,7 @@ def test_img_oversize_propagates_413(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_img_upstream_failure_is_502(monkeypatch: pytest.MonkeyPatch) -> None:
     app, _calls = _build_app(monkeypatch)
 
-    async def fake_fetch(client, target, headers):
+    async def fake_fetch(client, target, headers, method="GET"):
         return 500, b"", "", None, 0
 
     monkeypatch.setattr(server, "_fetch_upstream_image", fake_fetch)

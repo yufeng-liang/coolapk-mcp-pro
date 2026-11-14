@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import random
 import time
@@ -37,6 +38,8 @@ CACHE_ENABLED = os.environ.get("COOLAPK_NO_CACHE", "") not in ("1", "true", "Tru
 RATE_LIMIT_MODE = (os.environ.get("COOLAPK_RATE_LIMIT_MODE") or "global").strip().lower()
 # 单次退避等待上限（秒）：重试次数配置得很大时，2**attempt 会膨胀到上百秒，钉住上限
 MAX_BACKOFF = max(0.0, _env_float("COOLAPK_MAX_BACKOFF", 30.0))
+# 缓存体积上限（字节）：只按条数限流时，几条超长评论列表就能把常驻内存顶到几十 MB
+CACHE_MAX_BYTES = int(_env_float("COOLAPK_CACHE_MAX_BYTES", 8 * 1024 * 1024))
 
 # 各端点缓存时长（秒）：内容越稳定 TTL 越长
 _TTL_BY_PREFIX: list[tuple[str, float]] = [
@@ -109,29 +112,71 @@ class RateLimiter:
             self._bucket_last[key] = time.monotonic()
 
 
-class TTLCache:
-    """LRU + TTL 缓存，只存 GET 的成功响应"""
+def _sizeof(value: object) -> int:
+    """估算缓存条目的字节数（按 JSON 序列化长度），失败按 0 处理不阻塞缓存"""
+    try:
+        return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+    except (TypeError, ValueError):
+        return 0
 
-    def __init__(self, maxsize: int = 256):
+
+class TTLCache:
+    """LRU + TTL 缓存，只存 GET 的成功响应
+
+    双重上限：条数（maxsize）与总字节（max_bytes）。只按条数算的话，
+    一次 all_replies 翻 30 页的评论树就有几百 KB，几十条就能顶到几十 MB；
+    超限时按 LRU 顺序淘汰，并累计 evictions 便于观测缓存是否过小。
+    """
+
+    def __init__(self, maxsize: int = 256, max_bytes: int | None = None):
         self.maxsize = maxsize
-        self._store: OrderedDict[str, tuple[float, object]] = OrderedDict()
+        self.max_bytes = CACHE_MAX_BYTES if max_bytes is None else max(0, max_bytes)
+        self._store: OrderedDict[str, tuple[float, object, int]] = OrderedDict()
+        self._bytes = 0
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
 
     def get(self, key: str) -> object | None:
         hit = self._store.get(key)
         if hit is None:
+            self.misses += 1
             return None
-        expires, value = hit
+        expires, value, size = hit
         if time.monotonic() > expires:
             del self._store[key]
+            self._bytes -= size
+            self.misses += 1
             return None
         self._store.move_to_end(key)
+        self.hits += 1
         return value
 
     def put(self, key: str, value: object, ttl: float) -> None:
-        self._store[key] = (time.monotonic() + ttl, value)
-        self._store.move_to_end(key)
-        while len(self._store) > self.maxsize:
-            self._store.popitem(last=False)
+        size = _sizeof(value)
+        old = self._store.pop(key, None)
+        if old is not None:
+            self._bytes -= old[2]
+        self._store[key] = (time.monotonic() + ttl, value, size)
+        self._bytes += size
+        while self._store and (
+            len(self._store) > self.maxsize
+            or (self.max_bytes and self._bytes > self.max_bytes and len(self._store) > 1)
+        ):
+            _, (_, _, dropped) = self._store.popitem(last=False)
+            self._bytes -= dropped
+            self.evictions += 1
+
+    def stats(self) -> dict:
+        return {
+            "entries": len(self._store),
+            "bytes": self._bytes,
+            "max_entries": self.maxsize,
+            "max_bytes": self.max_bytes,
+            "hits": self.hits,
+            "misses": self.misses,
+            "evictions": self.evictions,
+        }
 
 
 async def backoff_sleep(attempt: int, floor: float = 0.0) -> None:

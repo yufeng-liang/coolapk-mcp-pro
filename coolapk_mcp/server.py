@@ -19,6 +19,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.transport_security import TransportSecuritySettings
 
+from coolapk_mcp import __version__, throttle
 from coolapk_mcp import postfilter
 from coolapk_mcp import scoring
 
@@ -45,7 +46,7 @@ from coolapk_mcp.models import (
     _strip_html as _strip_html_keep_links,
     apply_tool_whitelist,
 )
-from coolapk_mcp.config import CONFIG_DIR, AppConfig
+from coolapk_mcp.config import CONFIG_DIR, AppConfig, restrict_to_owner
 
 # 图片中转只允许这些酷安域名，避免被当成任意 URL 的开放代理
 IMAGE_HOSTS = frozenset({"image.coolapk.com", "avatar.coolapk.com", "static.coolapk.com"})
@@ -89,9 +90,14 @@ def _resolve_img_secret(token: str) -> str:
     secret = secrets.token_urlsafe(32)
     try:
         IMG_SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
-        IMG_SECRET_FILE.write_text(secret, encoding="utf-8")
         if os.name == "posix":
-            IMG_SECRET_FILE.chmod(0o600)
+            # 先按 0600 建文件再写，避免 write_text 沿用 umask 出现短暂 0644 窗口
+            fd = os.open(IMG_SECRET_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(secret)
+        else:
+            IMG_SECRET_FILE.write_text(secret, encoding="utf-8")
+        restrict_to_owner(IMG_SECRET_FILE)
     except OSError as exc:
         logger.warning(
             "无法持久化 /img 签名密钥（%s）：本次运行使用临时密钥，"
@@ -124,12 +130,57 @@ async def _server_lifespan(_server: Any):
         await aclose_image_client()
 
 
+def _warn_token_weakness(token: str) -> None:
+    """启动自检：弱 token 不阻止启动（会打断既有部署），但必须显式提醒。
+
+    这些配置错误不会报错，只会表现成「客户端莫名 401」，没有日志提示极难定位。
+    """
+    if not token:
+        return
+    if token != token.strip():
+        logger.warning("COOLAPK_HTTP_TOKEN 含首尾空白：部分客户端会带成不可见字符，导致 401")
+    if len(token) < 16:
+        logger.warning(
+            "COOLAPK_HTTP_TOKEN 仅 %d 位，建议至少 32 位随机串"
+            '（python -c "import secrets;print(secrets.token_urlsafe(32))"）',
+            len(token),
+        )
+    if token == "coolapk-mcp-dev":
+        logger.warning("COOLAPK_HTTP_TOKEN 仍是示例值 coolapk-mcp-dev，公网部署请立即更换")
+
+
+def _transport_security_settings() -> TransportSecuritySettings:
+    """DNS rebinding 防护按需开启。
+
+    默认关闭是为了兼容「Host: 公网IP:端口」的直连部署（FastMCP 默认的 Host
+    白名单会把这类合法请求判成 421）。配置 COOLAPK_ALLOWED_HOSTS 后开启防护，
+    只放行列出的 Host（每项形如 127.0.0.1:8000 或 mcp.example.com）。
+    """
+    hosts = [
+        item.strip()
+        for item in os.environ.get("COOLAPK_ALLOWED_HOSTS", "").split(",")
+        if item.strip()
+    ]
+    origins = [
+        item.strip()
+        for item in os.environ.get("COOLAPK_ALLOWED_ORIGINS", "").split(",")
+        if item.strip()
+    ]
+    if not hosts:
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=hosts,
+        allowed_origins=origins or ["*"],
+    )
+
+
 mcp = FastMCP(
     "coolapk",
     # 显式关闭 DNS rebinding 保护：FastMCP 在 host 为 127.0.0.1 时会自动开启，
     # 该校验按 Host 头白名单拦截，「Host: <公网IP>:端口」的合法直连（远程部署常态）
     # 会被误判 421；Bearer 鉴权已由 _build_http_app 强制，防护足够
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    transport_security=_transport_security_settings(),
     # stdio 模式的关闭钩子：进程退出时关闭全局 client（HTTP 模式用 Starlette lifespan）
     lifespan=_server_lifespan,
     instructions=(
@@ -306,7 +357,7 @@ def _thumb_variant(url: str) -> str | None:
 
 
 async def _fetch_upstream_image(
-    client: httpx.AsyncClient, target: str, headers: dict[str, str]
+    client: httpx.AsyncClient, target: str, headers: dict[str, str], method: str = "GET"
 ) -> tuple[int, bytes, str, dict | None, int]:
     """带大小上限地拉取上游图片。
 
@@ -316,7 +367,7 @@ async def _fetch_upstream_image(
     安全点：上游可用 30x 把我们引到任意地址（SSRF）。因此不交给 httpx 自动跟随
     （那是「先连上内网地址、再看 host 决定要不要把结果给出去」——连接已经发出去了，
     等于送出盲 SSRF/端口探测原语），改为手工最多跟 3 跳，每一跳发请求前先验 host
-    与端口。
+    与端口。method="HEAD" 时只取状态与 content-type，不读正文（探活不该触发整图下载）。
     """
     current = target
     for _hop in range(4):
@@ -342,7 +393,7 @@ async def _fetch_upstream_image(
                 403,
             )
         async with client.stream(
-            "GET", current, headers=headers, follow_redirects=False
+            method, current, headers=headers, follow_redirects=False
         ) as resp:
             if resp.status_code in (301, 302, 303, 307, 308):
                 location = resp.headers.get("location") or ""
@@ -351,6 +402,9 @@ async def _fetch_upstream_image(
                 # 下一跳统一在循环顶部校验，不在这里「边跳边信」
                 current = str(httpx.URL(current).join(location))
                 continue
+            if method == "HEAD":
+                # HEAD 只要状态码与类型：大图探活时不该把 15MB 正文读进来再丢掉
+                return resp.status_code, b"", resp.headers.get("content-type", ""), None, 0
             return await _read_image_body(resp)
     return (
         0,
@@ -592,9 +646,14 @@ async def coolapk_feed_detail(
     if focus == "all":
         all_replies = True
 
+    focus_active = focus in ("smart", "author", "hot")
+    want_replies = with_replies or bool(comment_keyword)
     smart = await client.get_feed_detail_smart(
         feed_id,
-        with_replies=with_replies or bool(comment_keyword) or focus in ("smart", "author", "hot"),
+        # focus 活跃时先不预拉默认回复：collect_focus 会整份替换 replies，
+        # 预拉的那一页在下游没人看，却要多排一次 1.2s 限速窗口；
+        # 真取不到时在下面回拉一页兜底，语义不变而常规路径少一次请求。
+        with_replies=want_replies and not focus_active,
         reply_page=reply_page,
         all_replies=all_replies or bool(comment_keyword),
     )
@@ -614,7 +673,7 @@ async def coolapk_feed_detail(
     # ---- 评论聚焦模式：单独拉楼主评论 / 热门评论替换默认列表 ----
     # 翻页、去重、预算与截断判定都在 focus.collect_focus 里（与 CLI 共用一份实现）
     focus_meta: dict | None = None
-    if focus in ("smart", "author", "hot"):
+    if focus_active:
         merged, focus_meta = await collect_focus(
             client, feed_id, focus, start_page=max(1, int(focus_page or 1))
         )
@@ -622,6 +681,15 @@ async def coolapk_feed_detail(
             focus_meta["total_replynum"] = smart["data"].get("replynum") or 0
         if merged:
             detail.replies = [ReplyModel.from_api(r) for r in merged]
+        elif want_replies:
+            # 聚焦两路都失败或为空：回拉一页默认回复，别让调用方拿到空评论区
+            try:
+                fallback = await client.get_feed_replies(feed_id, reply_page)
+            except CoolapkError:
+                fallback = None
+            if fallback:
+                detail.replies = [ReplyModel.from_api(r) for r in fallback]
+                focus_meta = {**(focus_meta or {}), "fallback": "default_replies"}
     if focus_meta is not None:
         detail.comments_focus = focus_meta
 
@@ -807,12 +875,25 @@ async def coolapk_author_digest(
     wanted = max(1, min(int(pages or 1), 5))
     # 与 coolapk_user_feeds 同一预算口径：页数上限 + 2 次余量
     budget = Budget(max_requests=wanted + 2, deadline=20.0)
-    raw = await client.get_user_feeds_pages(uid, pages=wanted, budget=budget)
+    # 动态列表与作者资料互不依赖：并发发出，省掉一次 1.2s 限速等待
+    results = await asyncio.gather(
+        client.get_user_feeds_pages(uid, pages=wanted, budget=budget),
+        client.get_user_space(uid),
+        return_exceptions=True,
+    )
+    raw: Any = results[0]
+    space: Any = results[1]
+    if isinstance(raw, BaseException):
+        raise raw
+    author_error: str | None = None
+    if isinstance(space, BaseException):
+        # 资料页失败不该拖垮帖子列表，降级为提示
+        author_error = f"{type(space).__name__}: {space}"[:200]
+        space = {}
     mode = _normalize_keyword_mode(keyword_mode)
     posts, total = _prepare_feeds(raw, keyword, "hot", mode)
     limit = max(1, min(int(top or 10), 50))
     posts = posts[:limit]
-    space = await client.get_user_space(uid)
     if isinstance(space, list) and space:
         space = space[0]
     author: dict = {}
@@ -833,6 +914,7 @@ async def coolapk_author_digest(
             "uid": uid,
             "username": author.get("username"),
             "author": author,
+            **(({"author_error": author_error}) if author_error else {}),
             "keyword": keyword or None,
             "keyword_mode": mode,
             "pages": wanted,
@@ -1254,6 +1336,42 @@ def _warn_login_state() -> None:
         )
 
 
+_PROCESS_STARTED = time.monotonic()
+
+
+async def _status_payload(client: CoolapkClient) -> dict:
+    """运行状态快照：版本、运行时长、登录态、限速参数、缓存与请求指标
+
+    与 /health 分工：/health 只回 ok 给容器探针（不碰磁盘、不建 client），
+    /status 才做完整体检，供人看与外部监控抓取。
+    """
+    try:
+        cfg = AppConfig.load()
+        login = {
+            "logged_in": cfg.is_logged_in,
+            "uid": cfg.uid or None,
+            "mode": cfg.login_mode,
+        }
+    except Exception as exc:  # 配置损坏不该让状态接口 500
+        logger.warning("读取登录态失败：%s", exc)
+        login = {"logged_in": False, "uid": None, "mode": "unknown"}
+    return {
+        "status": "ok",
+        "version": __version__,
+        "uptime_s": round(time.monotonic() - _PROCESS_STARTED, 1),
+        "login": login,
+        "rate_limit": {
+            "mode": throttle.RATE_LIMIT_MODE,
+            "min_interval_s": throttle.MIN_INTERVAL,
+            "max_retries": throttle.MAX_RETRIES,
+            "max_backoff_s": throttle.MAX_BACKOFF,
+        },
+        "cache": client.cache_stats(),
+        "requests": client.metrics(),
+        "image": {"max_bytes": MAX_IMAGE_BYTES},
+    }
+
+
 def _build_http_app():
     """构造带 Bearer Token 鉴权的 streamable-http ASGI 应用。"""
     import ipaddress
@@ -1273,6 +1391,7 @@ def _build_http_app():
             "请设置为 1-65535 的整数。"
         ) from None
     token = os.environ.get("COOLAPK_HTTP_TOKEN", "")
+    _warn_token_weakness(token)
 
     # 非回环地址必须显式配 token，防止登录态裸奔公网。
     # 先按字面 IP 解析（直接支持 ::1 等 IPv6 回环，getaddrinfo 在部分平台会失败），
@@ -1316,31 +1435,46 @@ def _build_http_app():
     img_secret = _resolve_img_secret(token)
     state = {"token": token, "public_base": public_base, "img_secret": img_secret}
 
+    def _auth_ok(scope) -> bool:
+        """Bearer 校验判定（MCP 端点与 /status 共用同一份逻辑）。
+
+        未设置 token 时（显式 COOLAPK_ALLOW_ANONYMOUS=1）一律放行。
+        全程按字节比较：先 decode 成 str 再 encode 会变成 UTF-8 往返，
+        非 ASCII token 在标准客户端上恒定 401、在 latin-1 原始字节下反而通过。
+        """
+        if not state["token"]:
+            return True
+        raw_headers = scope.get("headers") or []
+        auth_values = [v for k, v in raw_headers if k.lower() == b"authorization"]
+        if len(auth_values) != 1:
+            # 缺失或重复：重复头会让反代与进程各自取到不同的 Authorization
+            return False
+        scheme, _, cred = auth_values[0].partition(b" ")
+        return scheme.lower() == b"bearer" and hmac.compare_digest(
+            cred, state["token"].encode("utf-8")
+        )
+
+    def _unauthorized():
+        return JSONResponse(
+            {"error": "unauthorized", "detail": "缺少或错误的 Bearer Token"},
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    async def _status(_request):
+        """/status：一次拿到版本、登录态、限速、缓存与请求指标（与 MCP 同鉴权）"""
+        if not _auth_ok(_request.scope):
+            return _unauthorized()
+        client = await _get_client()
+        return JSONResponse(await _status_payload(client))
+
     def _bearer_endpoint(inner_app):
         """Bearer Token 校验包裹 MCP 端点：/health 免鉴权，MCP 一律校验。"""
 
         async def _endpoint(scope, receive, send):
-            if state["token"]:
-                # 全程按字节比较：先 decode 成 str 再 encode 会变成 UTF-8 往返，
-                # 非 ASCII token 在标准客户端上恒定 401、在 latin-1 原始字节下反而通过
-                raw_headers = scope.get("headers") or []
-                auth_values = [v for k, v in raw_headers if k.lower() == b"authorization"]
-                if len(auth_values) == 1:
-                    scheme, _, cred = auth_values[0].partition(b" ")
-                    ok = scheme.lower() == b"bearer" and hmac.compare_digest(
-                        cred, state["token"].encode("utf-8")
-                    )
-                else:
-                    # 缺失或重复：重复头会让反代与进程各自取到不同的 Authorization
-                    ok = False
-                if not ok:
-                    resp = JSONResponse(
-                        {"error": "unauthorized", "detail": "缺少或错误的 Bearer Token"},
-                        status_code=401,
-                        headers={"WWW-Authenticate": "Bearer"},
-                    )
-                    await resp(scope, receive, send)
-                    return
+            if not _auth_ok(scope):
+                await _unauthorized()(scope, receive, send)
+                return
             await inner_app(scope, receive, send)
 
         return _endpoint
@@ -1403,6 +1537,9 @@ def _build_http_app():
         # 上游非 200 自动回落原图；COOLAPK_IMG_THUMBNAIL=0 关闭。
         want_thumb = os.environ.get("COOLAPK_IMG_THUMBNAIL", "1").lower() not in ("0", "false")
         thumb_url = _thumb_variant(url) if want_thumb else None
+        # HEAD 只做探活：不读上游正文，也不把图片塞进响应体
+        is_head = request.method == "HEAD"
+        fetch_method = "HEAD" if is_head else "GET"
         fetch_headers = {
             "User-Agent": IMAGE_UA,
             "Referer": "https://www.coolapk.com/",
@@ -1415,12 +1552,12 @@ def _build_http_app():
             # 占掉 300MB 常驻内存
             async with img_semaphore:
                 status, body, ctype, err, err_status = await _fetch_upstream_image(
-                    client, thumb_url or url, fetch_headers
+                    client, thumb_url or url, fetch_headers, method=fetch_method
                 )
                 if thumb_url and status != 200 and err is None:
                     # 缩略不存在（404 等）：回落原图
                     status, body, ctype, err, err_status = await _fetch_upstream_image(
-                        client, url, fetch_headers
+                        client, url, fetch_headers, method=fetch_method
                     )
         except Exception as exc:  # 网络异常统一 502，不泄漏细节
             return JSONResponse(
@@ -1441,7 +1578,7 @@ def _build_http_app():
         # 缓存寿命跟随签名：固定 86400 会让过期链接被中间层继续供给一天
         max_age = max(0, exp - int(time.time()))
         return Response(
-            body,
+            b"" if is_head else body,
             media_type=base_ctype,
             headers={
                 "Cache-Control": f"public, max-age={max_age}",
@@ -1468,6 +1605,7 @@ def _build_http_app():
 
     routes = [
         Route("/health", _health, methods=["GET"]),
+        Route("/status", _status, methods=["GET"]),
         Route("/img", _img, methods=["GET", "HEAD"]),
         Mount(
             "/",
