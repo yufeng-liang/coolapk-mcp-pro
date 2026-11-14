@@ -1,5 +1,11 @@
 # 更新日志
 
+## 0.7.1（2026-11-14）
+
+### 修复
+
+- Windows 等非 UTF-8 控制台下 `coolapk --help` 与所有中文输出直接崩掉（`UnicodeEncodeError: 'charmap' codec can't encode characters`）：控制台默认 cp1252 时连帮助文本都打不出来。现在 CLI 入口在解析参数之前把 stdout/stderr 切到 UTF-8（画不出的字符用替换符兜底），`--help`、列表输出与错误信息都能正常打印。
+
 ## 0.7.0（2026-11-14）
 
 ### 新增

@@ -1,6 +1,6 @@
 [project]
 name = "coolapk-mcp-pro"
-version = "0.7.0"
+version = "0.7.1"
 description = "酷安社区 MCP Server — AI 原生搜索工具"
 readme = "README.md"
 license = "MIT"
@@ -49,7 +49,7 @@ dev = [
 ]
 
 [project.scripts]
-coolapk = "coolapk_mcp.cli:cli"
+coolapk = "coolapk_mcp.cli:main"
 coolapk-mcp = "coolapk_mcp.server:main"
 
 [project.urls]

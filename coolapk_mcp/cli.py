@@ -94,6 +94,30 @@ def _parse_feeds(raw) -> list[FeedModel]:
     return feeds
 
 
+def _ensure_utf8_stdio() -> None:
+    """把 stdout/stderr 切到 UTF-8：Windows 控制台默认 cp1252/cp936 时中文会直接崩。
+
+    为什么放在入口而不是 cli() 里：click 的 --help 在 parse_args 阶段就打印，那时
+    群组回调还没执行，改编码已经晚了（CI 的 windows 腿上 `coolapk --help` 就是
+    这么报 UnicodeEncodeError: 'charmap' codec can't encode characters 的）。
+    errors=replace 是兜底：控制台字体画不出某个字符时输出替换符，也比整体崩掉好。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
+
+
+def main() -> None:
+    """console_scripts 入口：先修编码再交给 click 解析参数。"""
+    _ensure_utf8_stdio()
+    cli()
+
+
 @click.group()
 def cli():
     """酷安社区 CLI — AI 原生搜索工具"""
@@ -156,7 +180,7 @@ async def home(tab, page):
 @cli.command("main")
 @click.option("--page", default=1, type=int)
 @async_command
-async def main(page):
+async def main_tab(page):
     """首页推荐（main/indexV8）"""
     async with CoolapkClient() as client:
         raw = await client.get_main_feeds(page)
@@ -925,4 +949,4 @@ def _extract_cookie_from_adb() -> str | None:
 
 
 if __name__ == "__main__":
-    cli()
+    main()

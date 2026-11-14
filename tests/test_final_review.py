@@ -389,3 +389,43 @@ def test_cli_home_reports_paging_meta(monkeypatch) -> None:
 )
 def test_parse_feed_id_boundaries(value, expected) -> None:
     assert parse_feed_id(value) == expected
+
+
+# ---------- ⑨ Windows 控制台编码 ----------
+
+
+def test_cli_entry_switches_stdio_to_utf8(monkeypatch) -> None:
+    """Windows 默认 cp1252 控制台，中文帮助会 UnicodeEncodeError；入口必须先改编码。
+
+    必须钉在 main() 而不是 cli() 里：click 的 --help 在 parse_args 阶段就打印，
+    群组回调那时还没跑，窗口期只能靠入口提前收掉。
+    """
+    calls: list[dict] = []
+
+    class _Stream:
+        def reconfigure(self, **kwargs) -> None:
+            calls.append(kwargs)
+
+    monkeypatch.setattr(cli_mod.sys, "stdout", _Stream())
+    monkeypatch.setattr(cli_mod.sys, "stderr", _Stream())
+    cli_mod._ensure_utf8_stdio()
+    assert calls == [{"encoding": "utf-8", "errors": "replace"}] * 2
+
+
+def test_cli_entry_tolerates_streams_without_reconfigure(monkeypatch, capsys) -> None:
+    """被重定向到非 TextIOWrapper（如纯写入对象）时不该抛，且不能吞掉正常输出。"""
+
+    class _Dumb:
+        def write(self, text: str) -> int:
+            return len(text)
+
+    monkeypatch.setattr(cli_mod.sys, "stdout", _Dumb())
+    cli_mod._ensure_utf8_stdio()
+
+    class _Frozen:
+        def reconfigure(self, **kwargs) -> None:
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr(cli_mod.sys, "stdout", _Frozen())
+    monkeypatch.setattr(cli_mod.sys, "stderr", _Dumb())
+    cli_mod._ensure_utf8_stdio()
