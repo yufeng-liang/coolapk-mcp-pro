@@ -15,6 +15,10 @@ import pytest
 
 from coolapk_mcp import throttle
 
+# 时间断言的上界容差：在大数上（monotonic 是开机秒数）加小间隔必然舍入，
+# ulp 量级 1e-9 足够吃掉噪声，又远小于任何真实行为差异。
+_EPS = 1e-9
+
 
 class _FakeClock:
     """可控单调时钟，替换 throttle.time 用（不污染全局 time 模块）"""
@@ -108,8 +112,11 @@ async def test_rate_limiter_enforces_min_interval(fake_tick_sleep):
     await limiter.acquire()
 
     assert len(fake_tick_sleep) == 1
-    # wait = _last + min_interval - now，只可能 ≤ min_interval 且接近它
-    assert 0.04 < fake_tick_sleep[0] <= 0.05
+    # wait = _last + min_interval - now 且 now ≥ _last，名义上 ≤ min_interval。
+    # 但 _last + 0.05 是在大数上加小数：Windows 的 monotonic 是开机秒数（量级 1e5+），
+    # 舍入后能比 min_interval 大一个 ulp —— CI 上真的量到 0.05000000000001137，
+    # 所以上界给 _EPS 容差，别把浮点噪声当行为错误。
+    assert 0.04 < fake_tick_sleep[0] <= 0.05 + _EPS
 
 
 @pytest.mark.asyncio
@@ -131,7 +138,7 @@ async def test_rate_limiter_serializes_concurrent_callers(fake_tick_sleep):
     await asyncio.gather(*(limiter.acquire() for _ in range(3)))
 
     assert len(fake_tick_sleep) == 2
-    assert all(0.015 < delay <= 0.02 for delay in fake_tick_sleep)
+    assert all(0.015 < delay <= 0.02 + _EPS for delay in fake_tick_sleep)
 
 
 # --------------------------------------------------------------- backoff
