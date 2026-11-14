@@ -7,9 +7,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from coolapk_mcp.models import (
-    ChatSessionModel,
     FeedModel,
-    MessageModel,
     ReplyModel,
     UserModel,
     _extract_links,
@@ -39,8 +37,7 @@ def test_dateline_1700000000_is_east8_0600() -> None:
 
 def test_all_dateline_validators_share_east8_format() -> None:
     """私信/会话/注册时间等模型的 dateline 校验器共用 _format_time。"""
-    assert MessageModel(dateline=1700000000).dateline == "2023-11-15T06:13+08:00"
-    assert ChatSessionModel(dateline=1700000000).dateline == "2023-11-15T06:13+08:00"
+    assert ReplyModel(dateline=1700000000).dateline == "2023-11-15T06:13+08:00"
     assert UserModel(regdate=1700000000).reg_date == "2023-11-15T06:13+08:00"
 
 

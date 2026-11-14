@@ -61,12 +61,36 @@ def has_valid_sessid(cookie_str: str) -> bool:
     return False
 
 
+_JSON_CACHE: dict[str, tuple[tuple[int, int], object]] = {}
+
+
+def _read_json_cached(path: Path) -> object:
+    """按 (mtime_ns, size) 复用 JSON 解析结果。
+
+    AppConfig.load() 每次工具调用都会读一遍 config.json 与桌面端 accounts.json；
+    解析结果只随内容变化，按签名缓存可以省掉重复 IO 与解析，同时保留「改文件 →
+    下一次调用即生效」的热加载语义（签名一变就重读）。
+    """
+    try:
+        st = path.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        _JSON_CACHE.pop(str(path), None)
+        raise
+    cached = _JSON_CACHE.get(str(path))
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+    data = json.loads(path.read_text(encoding="utf-8"))
+    _JSON_CACHE[str(path)] = (sig, data)
+    return data
+
+
 def _load_desktop_login() -> dict[str, str] | None:
     """读桌面端 accounts.json，取当前账号登录数据；无有效登录态返回 None"""
     if not DESKTOP_ACCOUNTS_FILE.exists():
         return None
     try:
-        data = json.loads(DESKTOP_ACCOUNTS_FILE.read_text(encoding="utf-8"))
+        data = _read_json_cached(DESKTOP_ACCOUNTS_FILE)
     except (json.JSONDecodeError, OSError, ValueError):
         return None
     # 桌面端文件被写坏时可能是 null/list/str 等非法结构，不能让 AttributeError 崩穿 load()
@@ -154,7 +178,7 @@ class AppConfig:
         config = cls()
         if CONFIG_FILE.exists():
             try:
-                data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                data = _read_json_cached(CONFIG_FILE)
                 # 配置被写坏时可能是 null/list/str，dict 预防防止 AttributeError 崩穿 load()
                 if not isinstance(data, dict):
                     data = {}

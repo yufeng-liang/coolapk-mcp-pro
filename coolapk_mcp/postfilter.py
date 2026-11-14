@@ -34,6 +34,11 @@ def _norm(s: str | None) -> str:
     return re.sub(r"[\s#＃_]+", "", s or "").lower()
 
 
+def normalize_text(s: str | None) -> str:
+    """对外的归一化入口：关键词匹配与去重共用同一口径。"""
+    return _norm(s)
+
+
 def _feed_full_text(item: dict) -> str:
     """帖子全文 = 标题 + 正文(HTML先剥掉) + 作者名，用于关键词判定"""
     parts = [

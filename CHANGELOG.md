@@ -9,7 +9,6 @@
 - 新增 `error_type=rate_limit`：HTTP 429 单独归类并解析服务端 `Retry-After`；建议等待时间超过退避上限（`COOLAPK_MAX_BACKOFF`，默认 30 秒）时不再重试，直接交回调用方，避免加重封禁；未超过时重试前的等待取「退避曲线」与 `Retry-After` 的较大值，不再只按本地曲线白撞一次限流窗口。
 - 新增 4 个工具，补齐此前只能靠 `coolapk_get_url` 手拼路径的能力：`coolapk_board`（21 个板块，支持板块 id / 中文名）、`coolapk_secondhand`（二手市场，可按品牌过滤）、`coolapk_app_detail`（应用详情）、`coolapk_notify`（@/评论/点赞/关注/私信，可选未读数）；工具总数 13 → 17。`coolapk_board` 的 `board` 参数同时接受板块 id、中文名与 page_name；`coolapk_notify` 条目的 `dateline` 与其它工具同口径（ISO8601+08:00）。
 - `coolapk_user_feeds` / `coolapk_author_digest` 新增 `keyword_mode=any|all`：`all` 要求关键词全部命中，用于精确圈定同一主题，避免「解锁」这类泛词把整页都召回。
-- 新增 `COOLAPK_GET_URL_STRICT=1` 严格模式：`coolapk_get_url` 除写端点黑名单外，还要求末段形态像只读端点（`detail`/`list`/`info`/`space`…），未来新增的写端点也会被挡住；默认关闭以保留只读透传的逃生舱。
 
 ### 变更
 
@@ -17,6 +16,7 @@
 - 所有时间字段统一为 ISO8601 + 东八区偏移（如 `2023-11-15T06:13+08:00`）：此前用 UTC 且不带时区标记，东八区用户看到的时间比实际早 8 小时，跨日帖还会认错日期。
 - `coolapk_feed_detail` / `coolapk_user_feeds` / `coolapk_author_digest` 新增 `truncated` / `next_page`（及 `sub_replies_truncated`）：撞到页数或请求预算上限时明确告知「还有没取的」，此前只能靠条数猜。
 - `coolapk_topic` 详情与动态拆分降级：话题详情接口被风控时仍返回动态列表，并在 `topic_error` / `feeds_error` 标注原因；此前任一路失败即整次失败。
+- `coolapk_get_url` 严格模式改为默认开启（`COOLAPK_GET_URL_STRICT=1`）：除写端点黑名单外，还要求末段形态像只读端点（`detail`/`list`/`info`/`space`/`search`…）或以纯数字 id 结尾，未来新增的写端点也会被挡住；确需透传非常规只读路径时设 `COOLAPK_GET_URL_STRICT=0`。
 - streamable-http 鉴权默认收紧：绑定回环地址且未设 `COOLAPK_HTTP_TOKEN` 时同样拒绝启动（此前只有非回环才拒绝，而 README 推荐的反代拓扑恰好落在回环上，等于公网可达却零鉴权）。确需无鉴权的内网联调必须显式设 `COOLAPK_ALLOW_ANONYMOUS=1`。
 
 ### 修复
@@ -39,6 +39,11 @@
 - 图片响应增加 15MB 硬上限：`/img` 与读图都按 `Content-Length` 与累计流长度双重校验，超限返回 413；`/img` 还校验重定向后的最终 host 仍在酷安图片域内，防止签名链接被 302 带到任意地址。
 - `/img` 与 `coolapk_image_link` 不再共用硬编码 `coolapk-mcp-dev` 默认密钥（`COOLAPK_IMG_SECRET` 可显式指定，缺省生成随机密钥并持久化到 `~/.coolapk-mcp/img_secret`）。
 - Docker 镜像改为非 root 运行（用户 `coolapk`，uid 10001），持久化目录相应改为 `/home/coolapk/.coolapk-mcp`。
+- 分页末页判定阈值可配（`COOLAPK_PAGE_SIZE`，默认 10）：此前硬编码「不足 10 条即末页」，接口页大小一变就会提前截断或多翻一页。
+- 单页请求纳入时间预算：`Budget.deadline` 此前只约束页与页之间，单页卡在 httpx 超时里仍可超出整个预算；现在每页用剩余时间包一层 `asyncio.wait_for`，超时按截断返回已取部分。
+- 配置文件解析结果按 stat 签名缓存：`AppConfig.load()` 此前每次调用都读盘并 `json.loads`（远程 HTTP 下每个工具调用都会走到），现在文件未变即复用解析结果、文件一改立刻失效，热加载行为不变。
+- 关键词过滤与 `coolapk_search` 共用同一归一化（去空白 / `#` / `＃` / `_`）：`#解锁#` 这类带话题符号的关键词此前在 `coolapk_user_feeds` / `coolapk_author_digest` 里匹配不到正文，与搜索口径不一致。
+- 内部清理：删除从未被引用的 V2 token 算法（`auth/token.py`）与私信模型（`MessageModel` / `ChatSessionModel`），包内 `__version__` 与 `pyproject.toml` 对齐到 0.7.0。
 - `X-App-Token` 增加短 TTL 复用（`COOLAPK_TOKEN_TTL`，默认 60 秒）并移出事件循环（`asyncio.to_thread`）：此前每个请求都在事件循环里同步跑一次 bcrypt（约 60ms 纯 CPU），既浪费算力又阻塞其它并发任务。
 - `uid_index.json` 改为合并写盘（`COOLAPK_INDEX_SAVE_DELAY`，默认 1 秒）并线程卸载：此前每来一个新 feed_id 就把整份索引（最多 2000 条）同步写一次盘，翻页时等于每页一次阻塞 I/O；退出前由 `close()` 兜底刷盘。
 - 限速器支持分桶（`COOLAPK_RATE_LIMIT_MODE=bucket`）：按 `/v6/<资源>` 分桶各自计时，跨桶可并行、桶内仍严格串行；默认 `global` 与历史行为完全一致。

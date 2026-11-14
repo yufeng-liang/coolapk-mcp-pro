@@ -245,7 +245,7 @@ _READ_SUFFIXES = (
 
 # 少数只读端点的路径就是「模块名」本身（/v6/search、/v6/main/init 的近亲），
 # 没有子段可判形态，单独放行
-_READ_MODULES = ("search", "main", "board", "notification")
+_READ_MODULES = ("search", "main", "board", "notification", "message-like")
 
 
 def _looks_read_only(path_part: str) -> bool:
@@ -321,6 +321,14 @@ def _consume_future_exception(fut: asyncio.Future) -> None:
     fut.exception()
 
 
+def _env_int(name: str, default: int) -> int:
+    """读整数环境变量；空值或非法值静默回退默认值。"""
+    try:
+        return int(float(os.environ.get(name, "") or default))
+    except (TypeError, ValueError):
+        return default
+
+
 class CoolapkClient:
     """酷安 API 客户端"""
 
@@ -332,6 +340,9 @@ class CoolapkClient:
     CAPTCHA_UNLOCK_PATHS = ("/v6/account/requestValidate",)
     # 详情回落时最多翻作者动态的页数
     FALLBACK_SCAN_PAGES = 3
+    # 一页的基准条数：末页判定与可翻页上限都由它推导。酷安接口哪天换页大小，
+    # 只改 COOLAPK_PAGE_SIZE 即可，不用满仓库找魔数 10
+    PAGE_SIZE = _env_int("COOLAPK_PAGE_SIZE", 10)
     # feed_id → 作者uid 索引，持久化到 ~/.coolapk-mcp/uid_index.json
     INDEX_FILE = Path.home() / ".coolapk-mcp" / "uid_index.json"
     INDEX_MAX = 2000
@@ -341,7 +352,7 @@ class CoolapkClient:
     INDEX_SAVE_DELAY = _env_float("COOLAPK_INDEX_SAVE_DELAY", 1.0)
     # get_url 严格模式：默认关（保留「未覆盖只读接口」的逃生舱），
     # 打开后除黑名单外还要求末段形态像只读端点，未知新写端点也会被挡住
-    GET_URL_STRICT = _env_flag("COOLAPK_GET_URL_STRICT", False)
+    GET_URL_STRICT = _env_flag("COOLAPK_GET_URL_STRICT", True)
 
     def __init__(self, config: AppConfig | None = None):
         self.config = config or AppConfig.load()
@@ -969,8 +980,8 @@ class CoolapkClient:
                     error_code=403, kind="api",
                 )
         # 严格模式：黑名单之上再加正向白名单（末段形态像只读端点才放行）。
-        # 默认关闭，因为 get_url 的定位是「上表未覆盖只读接口」的逃生舱；
-        # 需要「未知新写端点也进不来」的场景再打开。
+        # 默认开启：黑名单只能拦已知写端点，接口新上的写动作必须靠正向白名单兜住；
+        # 需要透传非常规只读路径时设 COOLAPK_GET_URL_STRICT=0 临时关闭。
         if cls.GET_URL_STRICT and not _looks_read_only(path_part):
             raise CoolapkError(
                 f"严格模式拒绝非常规只读形态的路径: {path}"
@@ -1168,6 +1179,27 @@ class CoolapkClient:
             return ("title", title)
         return None
 
+    @staticmethod
+    async def _fetch_page_within(
+        budget: Budget, page: int, fetch_page: Callable[[int], Awaitable[Any]]
+    ) -> Any:
+        """在预算剩余时间内取一页。
+
+        没有这层时 deadline 只约束「页与页之间」：单页内部还要走限速、重试与
+        httpx 30s 超时，focus 的 25s 预算实际会拖到 30s 以上才返回。超时按可
+        重试的 network 错误抛出，由 _collect_paged 决定保留已取页还是上抛。
+        """
+        remaining = budget.remaining()
+        try:
+            return await asyncio.wait_for(fetch_page(page), timeout=max(1.0, remaining))
+        except asyncio.TimeoutError:
+            raise CoolapkError(
+                f"第 {page} 页超过时间预算（剩余 {remaining:.0f}s）",
+                kind="network",
+                retryable=True,
+            ) from None
+
+
     async def _collect_paged(
         self,
         fetch_page: Callable[[int], Awaitable[Any]],
@@ -1180,8 +1212,8 @@ class CoolapkClient:
 
         截断语义（server 端按此消费）：
         - 预算耗尽：truncated=True，next_page=还没发出去的那一页；
-        - 跑满 max_pages 且末页仍满（>=10 条）：truncated=True，next_page=下一页；
-        - 空页 / 末页不足 10 条 / 整页重复：确实到底，truncated=False。
+        - 跑满 max_pages 且末页仍满（>= PAGE_SIZE 条）：truncated=True，next_page=下一页；
+        - 空页 / 末页不足 PAGE_SIZE 条 / 整页重复：确实到底，truncated=False。
 
         中途某页抛 CoolapkError 时保留已取内容并把该页标成可续抓；requests 按
         本次真实发出的页请求数计（budget 被多路共享时也不重复计）。
@@ -1203,7 +1235,7 @@ class CoolapkClient:
                 break
             taken += 1
             try:
-                batch = await fetch_page(page)
+                batch = await self._fetch_page_within(budget, page, fetch_page)
             except CoolapkError as exc:
                 # 某一页失败：前面已取到的必须保留下来。丢掉它们等于把「有 30 条
                 # 评论」变成「没有评论」，用户完全无法察觉。整批为空时才往上抛。
@@ -1228,7 +1260,7 @@ class CoolapkClient:
             if fresh == 0:
                 # 整页都是重复（置顶帖重复页等），说明已经翻到底
                 break
-            if len(batch) < 10:
+            if len(batch) < self.PAGE_SIZE:
                 # 末页不足一屏：到底了
                 break
             page += 1
@@ -1339,7 +1371,7 @@ class CoolapkClient:
                 fresh += 1
             first_item = str(batch[0].get("id", "")) if isinstance(batch[0], dict) else ""
             last_item = str(batch[-1].get("id", "")) if isinstance(batch[-1], dict) else ""
-            if fresh == 0 or len(batch) < 10:
+            if fresh == 0 or len(batch) < self.PAGE_SIZE:
                 break
             current += 1
         else:
@@ -1444,7 +1476,7 @@ class CoolapkClient:
                     if isinstance(item, dict) and str(item.get("id")) == str(feed_id):
                         detail_raw = item
                         break
-                if detail_raw is not None or len(feeds) < 10:
+                if detail_raw is not None or len(feeds) < self.PAGE_SIZE:
                     break
             if detail_raw is None:
                 raise CoolapkError(
@@ -1585,7 +1617,7 @@ class CoolapkClient:
             if fresh == 0:
                 # 整页都是重复，说明已经翻到底（置顶帖重复页）
                 break
-            if len(items) < 10:
+            if len(items) < self.PAGE_SIZE:
                 break
         else:
             # 跑满页数上限且末页仍满：还有更早的动态可翻

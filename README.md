@@ -102,7 +102,7 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `coolapk_image_link` | 把酷安图片转成可在任意聊天窗口显示的签名 https 链接（仅远程 HTTP 模式，需 `COOLAPK_PUBLIC_BASE`） | `urls`（逗号/空格/换行分隔）、`ttl_minutes`（默认 120） |
 | `coolapk_login_status` | 查询当前登录态与登录方式 | 无 |
 | `coolapk_suggest` | 搜索联想词（把口语化需求改写成酷安习惯用词） | `keyword` |
-| `coolapk_get_url` | 只读 GET 透传（访问上表未覆盖的酷安只读接口）；`COOLAPK_GET_URL_STRICT=1` 时只放行形态像只读的末段（`detail`/`list`/`space` 等） | 接口路径与参数 |
+| `coolapk_get_url` | 只读 GET 透传（访问上表未覆盖的酷安只读接口）；严格模式默认开启，只放行形态像只读的末段（`detail`/`list`/`space`/纯数字 id 等），确需透传非常规只读路径时设 `COOLAPK_GET_URL_STRICT=0` 关闭 | 接口路径与参数 |
 | `coolapk_author` | 作者画像与权威度评分（`author_tier` / `is_expert` / `fans_per_feed` / `expertise`），判断「这人是不是该领域大佬」 | `uid` |
 | `coolapk_author_digest` | 作者深挖聚合：一次抓多页他的帖子、按主题过滤并按热度排序，拿到完整攻略链；同样带 `truncated`/`next_page` 续抓 | `uid`、`keyword`、`pages=1-5`（默认 2）、`top`（默认 10）、`keyword_mode=any\|all` |
 
@@ -138,7 +138,8 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `COOLAPK_RATE_LIMIT_MODE` | `global` | `global` = 全局串行（最保守，默认，与历史行为一致）；`bucket` = 按资源分桶各自计时，不同端点可并行、同一端点仍串行（延迟更低，瞬时并发数最多等于桶数） |
 | `COOLAPK_TOKEN_TTL` | `60` | `X-App-Token` 复用窗口（秒）：一次 v3 生成约 60ms 纯 CPU，窗口内复用；设 `0` 则每次重算（排障用） |
 | `COOLAPK_INDEX_SAVE_DELAY` | `1` | `uid_index.json` 落盘合并窗口（秒）：窗口内的新 id 累积成一次写盘，退出前自动刷盘 |
-| `COOLAPK_GET_URL_STRICT` | 未设 | 设为 `1` 开启 `coolapk_get_url` 严格模式：在写端点黑名单之上再加正向白名单，只放行末段形态像只读端点的路径（`detail`/`list`/`info`/`space`/`search`…），未知的新写端点也进不来。默认关闭，保留「透传未覆盖只读接口」的逃生舱 |
+| `COOLAPK_GET_URL_STRICT` | `1` | `coolapk_get_url` 严格模式（默认开启）：在写端点黑名单之上再加正向白名单，只放行末段形态像只读端点的路径（`detail`/`list`/`info`/`space`/`search`…）或以纯数字 id 结尾的路径，未知的新写端点也进不来。设为 `0` 才回到黑名单模式，保留「透传任意只读路径」的逃生舱 |
+| `COOLAPK_PAGE_SIZE` | `10` | 分页接口的「短页即末页」判定阈值：某页返回条数小于该值即认为到底。接口页大小改版时调这个，不用改代码 |
 | `COOLAPK_NO_CACHE` | 未设 | 设为 `1` 禁用 GET 缓存（调试用） |
 | `COOLAPK_MAX_REPLY_PAGES` | `30` | `all_replies` 全量评论翻页上限（1-100，大帖防刷屏防风控） |
 | `COOLAPK_BROWSER` | 未设 | 指定浏览器可执行文件路径（`coolapk login --web` 用）；不设则自动查找 Chrome / Edge |

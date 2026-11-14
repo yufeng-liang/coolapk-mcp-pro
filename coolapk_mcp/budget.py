@@ -38,6 +38,11 @@ class Budget:
     def elapsed(self) -> float:
         return time.monotonic() - self.started
 
+    def remaining(self) -> float:
+        """距离时间预算耗尽还剩多少秒（可能为负，调用方自行夹紧）。"""
+        return self.deadline - self.elapsed
+
+
     def meta(self) -> dict:
         return {"requests": self.used, "elapsed_ms": int(self.elapsed * 1000)}
 

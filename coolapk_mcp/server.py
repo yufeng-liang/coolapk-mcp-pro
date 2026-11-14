@@ -413,8 +413,8 @@ def _prepare_feeds(
 
     keyword 空格分隔多词：keyword_mode=any（默认）任一命中标题或正文即保留；
     all 要求全部命中，用于精确圈定同一主题。注意与 coolapk_search 的 strict
-    并不等价：这里是「标题+正文的纯子串匹配」，不做 #话题# 归一化、也不匹配
-    作者名，所以带话题符号的词在 search 能命中、在这里可能漏。
+    并不等价：这里是「标题+正文的子串匹配」，与 search 共用去空白/#/_ 的归一化，
+    但不匹配作者名，所以词只出现在作者名时会漏。
     sort=hot 按 post_score（点赞+评论×3+转发×2）降序，latest 按发布时间降序。
     """
     keyword_mode = _normalize_keyword_mode(keyword_mode)
@@ -424,10 +424,12 @@ def _prepare_feeds(
         _dump(FeedModel.from_api(f)) for f in raw if isinstance(f, dict)
     ]
     total = len(items)
-    words = [w for w in (keyword or "").lower().split() if w]
+    words = [w for w in (postfilter.normalize_text(x) for x in (keyword or "").split()) if w]
     if words:
         def _hit(it: dict) -> bool:
-            haystack = f"{it.get('title') or ''} {it.get('content') or ''}".lower()
+            haystack = postfilter.normalize_text(
+                f"{it.get('title') or ''} {it.get('content') or ''}"
+            )
             hits = [w in haystack for w in words]
             return all(hits) if keyword_mode == "all" else any(hits)
 
@@ -1216,8 +1218,9 @@ async def coolapk_get_url(path: str) -> str:
     （点赞/回复/关注/发帖/私信等）一律 403 拒绝。响应保留原始
     结构（键名为酷安原始 camelCase），仅剔除 cookie/token 等敏感字段。
     适合获取列表页未覆盖的数据（应用详情、板块、二级评论等）。
-    设 COOLAPK_GET_URL_STRICT=1 时额外要求末段形态像只读端点
-    （detail/list/info/space 等），未知写端点会被提前挡住。
+    默认开启严格模式：额外要求末段形态像只读端点
+    （detail/list/info/space 等），未知写端点会被提前挡住；
+    设 COOLAPK_GET_URL_STRICT=0 可关闭（透传非常规只读路径时用）。
 
     Args:
         path: 接口路径或完整 URL，如 /v6/apk/detail?id=com.tencent.mm
