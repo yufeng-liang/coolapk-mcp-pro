@@ -1,0 +1,57 @@
+name: Release
+
+# tag 是唯一触发源：版本号以 pyproject 为准，tag 必须写成 vX.Y.Z。
+# 只把 sdist/wheel 作为 Release 资产，不推 PyPI（本项目按 git 安装分发）。
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 校验 tag 与包版本一致
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+          import tomllib
+
+          project = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
+          version = project["project"]["version"]
+          init = pathlib.Path("coolapk_mcp/__init__.py").read_text(encoding="utf-8")
+          match = re.search(r'__version__\s*=\s*"([^"]+)"', init)
+          pkg_version = match.group(1) if match else ""
+          tag = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          if not (version == pkg_version == tag):
+              raise SystemExit(
+                  f"版本不一致：tag={tag} pyproject={version} __version__={pkg_version}"
+              )
+          print(f"版本一致：{version}")
+          PY
+
+      - name: 安装构建工具
+        run: python -m pip install --upgrade build
+
+      - name: 构建 sdist 与 wheel
+        run: python -m build
+
+      - name: 创建/更新 GitHub Release 并附加产物
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

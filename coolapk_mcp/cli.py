@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 from functools import wraps
@@ -10,18 +11,22 @@ from urllib.parse import unquote
 
 import click
 
+from coolapk_mcp import scoring
 from coolapk_mcp.boards import BOARD_URLS
 from coolapk_mcp.budget import Budget, BudgetExceeded
 from coolapk_mcp.client import CoolapkClient, CoolapkError
 from coolapk_mcp.config import AppConfig, has_valid_sessid, parse_cookie_str
+from coolapk_mcp.logging_utils import setup_logging
 from coolapk_mcp.models import (
     _format_time,
     _strip_html,
+    AppModel,
     FeedDetail,
     FeedModel,
     ReplyModel,
     TopicModel,
     UserModel,
+    apply_tool_whitelist,
 )
 
 
@@ -89,7 +94,7 @@ def _parse_feeds(raw) -> list[FeedModel]:
 @click.group()
 def cli():
     """酷安社区 CLI — AI 原生搜索工具"""
-    pass
+    setup_logging()
 
 
 # ---- 浏览 ----
@@ -348,6 +353,108 @@ async def notify(ntype, page):
             data = await client.get_notifications(ntype, page)
     _output(data)
 
+
+# ---- 应用 / 作者 / 联想 / 透传 / 图片外链 ----
+
+
+@cli.command("app-detail")
+@click.argument("package_name")
+@async_command
+async def app_detail(package_name):
+    """应用详情（按包名，如 com.coolapk.market）"""
+    async with CoolapkClient() as client:
+        raw = await client.get_app_detail(package_name)
+    if isinstance(raw, list) and raw:
+        raw = raw[0]
+    _output(AppModel.from_api(raw) if isinstance(raw, dict) else raw)
+
+
+@cli.command("author")
+@click.argument("uid", type=int)
+@click.option("--top", default=10, type=int, help="附带评分最高的 N 条动态（0=不带，上限 50）")
+@async_command
+async def author(uid, top):
+    """作者画像：等级/粉丝/专长推断 + 高分动态"""
+    limit = max(0, min(top, 50))
+    async with CoolapkClient() as client:
+        raw = await client.get_user_space(uid)
+        if isinstance(raw, list) and raw:
+            raw = raw[0]
+        profile = UserModel.from_api(raw) if isinstance(raw, dict) else None
+        data = profile.model_dump(mode="json", exclude_defaults=True) if profile else {}
+        posts: list[dict] = []
+        if data and limit:
+            feeds = await client.get_user_feeds(uid, 1)
+            for item in _parse_feeds(feeds):
+                entry = item.model_dump(mode="json", exclude_defaults=True)
+                entry["post_score"] = scoring.post_score(
+                    item.like_num, item.reply_num, item.forward_num
+                )
+                posts.append(entry)
+            posts.sort(key=lambda p: p["post_score"], reverse=True)
+            # 专长推断看正文关键词，取前 5 条足够（不做全量抓取，CLI 要快）
+            data["posts_texts"] = [str(p.get("content") or "")[:600] for p in posts[:5]]
+    if not data:
+        _output(None)
+    data.update(scoring.summarize_author(data))
+    if posts:
+        data["top_posts"] = posts[:limit]
+    _output(data)
+
+
+@cli.command("suggest")
+@click.argument("keyword")
+@async_command
+async def suggest(keyword):
+    """搜索联想词（把口语化需求改写成酷安习惯用词）"""
+    async with CoolapkClient() as client:
+        data = await client.get_topic_suggest(keyword)
+    words: list[str] = []
+    for card in data if isinstance(data, list) else []:
+        if not isinstance(card, dict):
+            continue
+        word = str(card.get("title") or "").strip()
+        # 联想卡是 title + searchTab:// 链接，没有 searchWord；剔除「搜索用户：」类前缀卡
+        if word and not word.startswith("搜索"):
+            words.append(word)
+    _output({"suggests": words[:8]})
+
+
+@cli.command("get-url")
+@click.argument("path")
+@async_command
+async def get_url(path):
+    """只读透传任意 /v6/ 接口（严格白名单默认开启）"""
+    async with CoolapkClient() as client:
+        data = await client.get_url(path)
+    # 与 MCP 工具同口径：先剔敏感键再输出，别把 token / cookie 打到终端
+    _output(apply_tool_whitelist("get_url", data))
+
+
+@cli.command("image-link")
+@click.argument("urls", nargs=-1, required=True)
+@click.option("--ttl", "ttl_minutes", default=120, type=int, help="有效期分钟（1-10080）")
+@async_command
+async def image_link(urls, ttl_minutes):
+    """把酷安图片转成 /img 签名外链（需 COOLAPK_PUBLIC_BASE）"""
+    # 延迟导入：只有这个命令需要签名密钥与 FastMCP 所在的 server 模块
+    from coolapk_mcp.img_link import build_image_links
+    from coolapk_mcp.server import _resolve_img_secret
+
+    public_base = os.environ.get("COOLAPK_PUBLIC_BASE", "").rstrip("/")
+    if not public_base:
+        click.echo(
+            json.dumps(
+                {
+                    "error": "未配置 COOLAPK_PUBLIC_BASE",
+                    "hint": "远程 HTTP 部署时设为对外地址，例如 https://mcp.example.com",
+                },
+                ensure_ascii=False,
+            )
+        )
+        sys.exit(1)
+    secret = _resolve_img_secret(os.environ.get("COOLAPK_HTTP_TOKEN", "").strip())
+    _output(build_image_links(" ".join(urls), public_base, secret, ttl_minutes))
 
 # ---- 登录 ----
 

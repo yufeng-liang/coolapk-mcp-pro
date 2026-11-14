@@ -42,6 +42,7 @@ git ls-remote --tags origin vX.Y.Z     # 远端一致
 gh release create vX.Y.Z --title "X.Y.Z：<一句话卖点>" --notes-file <notes.md> --latest
 ```
 
+- 仓库已配置 `.github/workflows/release.yml`：推送 `v*` tag 后自动校验「tag / `pyproject.toml` version / `__version__`」三者一致、`python -m build` 出 sdist+wheel，并创建或更新 Release 附加 `dist/*`（说明由 `generate_release_notes` 按 PR 标题生成）。**因此第 5 步可省**：push tag 后等 Action 变绿，再 `gh release view vX.Y.Z` 核对资产与说明；Action 失败（版本不一致等）时再按上面 `gh release create` 手工兜底，并在 Release 说明里按下方模板补齐三段式。
 - `--latest` 给当前最新正式版；补历史 release 时不要加。
 - notes 文件放临时目录（`/h/tmp/rel/` 或 `mktemp`），不进仓库。
 - 验收：`gh release list` 能看到新 release 且标题/说明正确；`gh release view vX.Y.Z` 说明渲染正常。

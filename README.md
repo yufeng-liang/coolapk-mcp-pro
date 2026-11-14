@@ -84,6 +84,24 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 
 查看登录状态：`.venv\Scripts\coolapk login --status`，或让 agent 调用 `coolapk_login_status` 工具。
 
+## 命令行（coolapk）
+
+服务端工具之外，同一套客户端逻辑也提供命令行入口（输出紧凑 JSON，适合脚本与 agent 直接调）。常用：
+
+| 命令 | 作用 |
+| - | - |
+| `coolapk home / main / hot / boards / board / secondhand` | 首页、热门、板块与二手市场浏览 |
+| `coolapk feed <id>` | 帖子详情，支持 `--focus smart\|author\|hot\|all`、`--grep`、`--all-replies`、`--history`、`--expand-sub-replies` |
+| `coolapk search <keyword>` | 搜索，`--type` / `--sort hot\|reply\|default` / `--strict` |
+| `coolapk user <uid>` | 用户资料或 `--feeds` 动态列表 |
+| `coolapk author <uid>` | 作者画像：等级、粉丝、专长推断与高分动态（`--top N`） |
+| `coolapk topic <tag> / suggest <词> / app-detail <包名> / notify <类型>` | 话题、联想词、应用详情、通知 |
+| `coolapk get-url <路径>` | 只读透传任意 `/v6/` 接口，严格白名单默认开启 |
+| `coolapk image-link <图片URL...>` | 生成 `/img` 签名外链（需 `COOLAPK_PUBLIC_BASE`） |
+| `coolapk login ...` | 四条登录通道，见上一节 |
+
+远程部署（`coolapk-mcp` 服务）才是 agent 的常规接入方式；CLI 主要用于排障、脚本与手工核对。
+
 ## 工具一览
 
 | 工具 | 作用 | 关键参数 |
@@ -148,6 +166,8 @@ MCP 服务启动即自动管理登录态，无需在客户端配置里塞 Cookie
 | `COOLAPK_IMG_THUMBNAIL` | `1` | 图片缩略优先开关（默认开）：`coolapk_read_image` 与 `/img` 中转对带尺寸后缀的图先取酷安服务端缩略 `.m.jpg`（长边约 1080px，仍在多模态模型视觉窗口内，大图省约 70~80% 流量），上游非 200 自动回落原图；设 `0` 关闭 |
 | `COOLAPK_IMG_SECRET` | 未设 | `/img` 中转与 `coolapk_image_link` 的 HMAC 签名密钥。不设时随机生成并持久化到 `~/.coolapk-mcp/img_secret`（POSIX 权限 600）；**不复用** `COOLAPK_HTTP_TOKEN`，也不再有硬编码默认值 |
 | `COOLAPK_PUBLIC_BASE` | 未设 | 远程 HTTP 模式下的对外访问前缀（如 `https://mcp.example.com`）。设置后 `coolapk_image_link` 才能生成图片外链，`/img` 中转也随之生效 |
+| `COOLAPK_LOG_JSON` | 未设 | 设为 `1` 时日志改为 JSON Lines 输出到 stderr（`ts`/`level`/`logger`/`msg`，异常只留最后一行），供容器与采集器按行解析；stdio 下 stdout 让给协议帧，日志一律走 stderr |
+| `COOLAPK_LOG_LEVEL` | `INFO` | 仅在开启 `COOLAPK_LOG_JSON` 时生效的根日志级别（`DEBUG`/`INFO`/`WARNING`…） |
 
 数据文件（自动生成，勿提交仓库）：`~/.coolapk-mcp/config.json`（设备码与登录态）、`~/.coolapk-mcp/uid_index.json`（feed_id → 作者 uid 索引，供详情回落）。
 
@@ -409,14 +429,23 @@ python -m pip install -e ".[dev]"     # 或 pip install -e . -r requirements-dev
 ruff check .                          # 静态检查
 mypy                                  # 类型检查（配置在 pyproject [tool.mypy]）
 pytest -q                             # 单元测试
-pytest -q --cov=coolapk_mcp           # 带覆盖率（只打印不设门槛，用来盯 /img、cli 这些盲区）
+pytest -q --cov=coolapk_mcp --cov-fail-under=60   # 带覆盖率门槛（当前基线 67%，CI 同款）
 ```
 
 - 测试覆盖模型解析、白名单裁剪、限速/分桶/退避、缓存键与单飞、预算截断、HTTP 图片中转、配置与板块映射等；`pytest -q` 应全绿。
 - `tests/manual/regression_probe.py` 是零真实网络的离线回归探针（99 项断言），不进 CI，改协议/解析逻辑后可手动跑一遍做冒烟。
-- 覆盖率当前基线约 66%：`server.py` 80%、`client.py` 58%，`cli.py`（40%）与 `browser_login.py`（47%）仍在低位，属于优先补测区。
+- 覆盖率当前基线约 67%：`server.py` 80%、`client.py` 58%，`cli.py`（50%）与 `browser_login.py`（47%）仍在低位，属于优先补测区。
 - 测试不依赖本机登录态：`conftest.py` 默认把 `generate_token_v3` 打桩成假 token，并把 `~/.coolapk-mcp` 下所有导入期路径常量重定向到临时目录，跑测试不会碰真实 `config.json` / `img_secret` / `auth_blob`。
-- CI（`.github/workflows/ci.yml`）在 Python 3.10 / 3.12 / 3.14 上执行 ruff + mypy + pytest（带覆盖率）+ `coolapk --help` + compileall。
+- CI（`.github/workflows/ci.yml`）三条腿：Linux 上 Python 3.10 / 3.12 / 3.14 跑 ruff + mypy + pytest（覆盖率门槛 60%）+ `coolapk --help` + compileall；Windows 上 Python 3.12 跑同一套（覆盖权限与路径分支）；另有 Docker 腿做镜像构建与容器内 CLI 冒烟。
+- 结构化日志：设 `COOLAPK_LOG_JSON=1` 后日志变成一行一条 JSON（stderr），字段 `ts`/`level`/`logger`/`msg`，异常只保留最后一行；容器采集直接按行解析。
+
+## 发布流程
+
+1. 版本三处对齐：`pyproject.toml` 的 `version`、`coolapk_mcp/__init__.py` 的 `__version__`、`CHANGELOG.md` 顶部段；
+2. 提交并打带注释 tag：`git tag -a vX.Y.Z -m "…"`，推分支与 tag；
+3. tag 推送后 `.github/workflows/release.yml` 自动校验三处版本一致 → `python -m build` 产出 sdist/wheel → 创建/更新 GitHub Release 并附加 `dist/*`（`generate_release_notes` 自动生成说明）。
+
+本项目按 git 安装分发，不往 PyPI 发布；需要手工补 release 说明时仍按 `skills/coolapk-mcp-release/SKILL.md` 的模板。
 
 ## 故障排查
 

@@ -10,7 +10,10 @@
 - 新增 4 个工具，补齐此前只能靠 `coolapk_get_url` 手拼路径的能力：`coolapk_board`（21 个板块，支持板块 id / 中文名）、`coolapk_secondhand`（二手市场，可按品牌过滤）、`coolapk_app_detail`（应用详情）、`coolapk_notify`（@/评论/点赞/关注/私信，可选未读数）；工具总数 13 → 17。`coolapk_board` 的 `board` 参数同时接受板块 id、中文名与 page_name；`coolapk_notify` 条目的 `dateline` 与其它工具同口径（ISO8601+08:00）。
 - `coolapk_user_feeds` / `coolapk_author_digest` 新增 `keyword_mode=any|all`：`all` 要求关键词全部命中，用于精确圈定同一主题，避免「解锁」这类泛词把整页都召回。
 - 新增 `COOLAPK_ALLOWED_HOSTS` / `COOLAPK_ALLOWED_ORIGINS`：配置后开启 FastMCP 的 DNS rebinding 防护并只放行列出的 Host/Origin；不设仍保持关闭，兼容「公网 IP:端口」直连部署。
-- streamable-http 新增 `/status` 端点（与 `/mcp` 同一 Bearer 鉴权）：返回版本、运行时长、登录态、限速参数、缓存命中与按 `error_type` 分类的请求/重试指标，便于外部监控抓取；`/health` 保持极简不碰磁盘。
+- streamable-http 新增 `/status` 端点（与 `/mcp` 同一 Bearer 鉴权）：返回版本、运行时长、登录态、限速参数、缓存命中、按 `error_type` 分类的请求/重试指标与调用延迟（`calls` / `latency_ms.total|max|avg`），便于外部监控抓取；`/health` 保持极简不碰磁盘。
+- CLI 补齐 5 个与服务端对齐的命令：`app-detail`（应用详情）、`author`（画像 + 专长推断 + 高分动态）、`suggest`（联想词）、`get-url`（只读透传，输出前剔除敏感键）、`image-link`（`/img` 签名外链，需 `COOLAPK_PUBLIC_BASE`）。
+- 新增 `COOLAPK_LOG_JSON` / `COOLAPK_LOG_LEVEL`：开启后日志输出 JSON Lines 到 stderr（`ts`/`level`/`logger`/`msg`），容器与采集器可直接按行解析，stdio 模式不污染协议帧。
+- 新增 `.github/workflows/release.yml`：推送 `vX.Y.Z` tag 时校验 tag 与 `pyproject` / `__version__` 一致，构建 sdist/wheel 并附加到 GitHub Release（不推 PyPI）。
 
 ### 变更
 
@@ -21,6 +24,12 @@
 - `coolapk_get_url` 严格模式改为默认开启（`COOLAPK_GET_URL_STRICT=1`）：除写端点黑名单外，还要求末段形态像只读端点（`detail`/`list`/`info`/`space`/`search`…）或以纯数字 id 结尾，未来新增的写端点也会被挡住；确需透传非常规只读路径时设 `COOLAPK_GET_URL_STRICT=0`。
 - `COOLAPK_ALLOW_ANONYMOUS=1` 现在真正生效：此前它只解除 HTTP 启动拦截，客户端仍会在本地预检里把未登录请求判成 `auth_expired`（匿名只读实际不可用）；现在未登录时按匿名发请求、不带 `X-App-Token`/Cookie。
 - streamable-http 鉴权默认收紧：绑定回环地址且未设 `COOLAPK_HTTP_TOKEN` 时同样拒绝启动（此前只有非回环才拒绝，而 README 推荐的反代拓扑恰好落在回环上，等于公网可达却零鉴权）。确需无鉴权的内网联调必须显式设 `COOLAPK_ALLOW_ANONYMOUS=1`。
+
+### 优化
+
+- 图片外链签名收敛为单一实现（`coolapk_mcp/img_link.py`）：`/img` 端点、`coolapk_image_link` 工具与 CLI `image-link` 共用同一份域名白名单、TTL 夹取与 HMAC 拼接，避免三处各写一遍后的静默 403。
+- CI 增 Windows 腿（Python 3.12，覆盖 icacls/路径分支）与 Docker 腿（镜像构建 + 非 root 容器内 CLI 冒烟），Linux 覆盖率改为 `--cov-fail-under=60` 门槛，挡住「新增整块代码零测试」。
+- /status 的 `requests` 增加 `calls` 与 `latency_ms`：延迟按逻辑调用统计（含缓存命中与单飞搭车），排障时能直接看出是慢在限速还是上游。
 
 ### 修复
 

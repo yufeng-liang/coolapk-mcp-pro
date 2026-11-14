@@ -38,13 +38,57 @@ jobs:
       - name: Mypy 类型检查
         run: mypy
 
-      - name: Pytest 单元测试 + 覆盖率
+      - name: Pytest 单元测试 + 覆盖率门槛
         # pyproject 的 addopts 已带 -q，这里再传 -q 会叠成 -qq 把通过数一起吞掉。
-        # 覆盖率只打印不卡门槛（先在 PR 日志里暴露 /img、CLI、热加载等盲区）
-        run: pytest -q -o addopts="" -rs --cov=coolapk_mcp --cov-report=term-missing:skip-covered
+        # 门槛 60%：当前基线 67%，留出波动空间，但挡住“新增整块代码零测试”。
+        run: pytest -q -o addopts="" -rs --cov=coolapk_mcp --cov-report=term-missing:skip-covered --cov-fail-under=60
 
       - name: CLI 冒烟（入口点装配是否完好）
         run: coolapk --help > /dev/null
 
       - name: 字节码编译检查（语法级冒烟）
         run: python -m compileall -q coolapk_mcp
+
+  windows:
+    # 本项目主要用户在 Windows 跑桌面端，权限/路径分支（icacls、chmod skip）
+    # 只有这条腿能真实覆盖；单版本即可，不复制三份 matrix。
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Mypy
+        run: mypy
+
+      - name: Pytest
+        run: pytest -q -o addopts="" -rs
+
+      - name: CLI 冒烟
+        run: coolapk --help | Out-Null
+
+  docker:
+    # 镜像能 build 且非 root 用户能跑起 CLI，才算 Dockerfile 没腐化
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 构建镜像
+        run: docker build -t coolapk-mcp:ci .
+
+      - name: 容器内 CLI 冒烟（验证 USER 与依赖层）
+        run: docker run --rm --entrypoint coolapk coolapk-mcp:ci --help

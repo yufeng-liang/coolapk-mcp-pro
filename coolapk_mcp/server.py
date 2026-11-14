@@ -12,7 +12,7 @@ import os
 import secrets
 import time
 from typing import Any
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -47,9 +47,9 @@ from coolapk_mcp.models import (
     apply_tool_whitelist,
 )
 from coolapk_mcp.config import CONFIG_DIR, AppConfig, restrict_to_owner
-
-# 图片中转只允许这些酷安域名，避免被当成任意 URL 的开放代理
-IMAGE_HOSTS = frozenset({"image.coolapk.com", "avatar.coolapk.com", "static.coolapk.com"})
+# 图片中转的域名白名单与签名拼装只有一份实现（CLI image-link 也用这份）
+from coolapk_mcp.img_link import IMAGE_HOSTS, build_image_links
+from coolapk_mcp.logging_utils import setup_logging
 IMAGE_UA = (
     "Dalvik/2.1.0 (Linux; U; Android 16; 23113RKC6C Build/AQ3A.250226.002) "
     "(#Build; Redmi; 23113RKC6C; AQ3A.250226.002; HyperOS_3.0; 3.0.1.0) "
@@ -1266,29 +1266,8 @@ async def coolapk_image_link(urls: str, ttl_minutes: int = 120) -> str:
     # "coolapk-mcp-dev"，与端点侧（随机持久化密钥）不一致时签名必然对不上，
     # 且硬编码密钥等于公开签名——任何知道字符串的人都能伪造 /img 链接。
     secret = _resolve_img_secret(os.environ.get("COOLAPK_HTTP_TOKEN", "").strip())
-    try:
-        ttl = max(1, min(int(ttl_minutes), 10080))
-    except (TypeError, ValueError):
-        ttl = 120
-    exp = int(time.time()) + ttl * 60
-
-    items: list[dict[str, Any]] = []
-    _sep = chr(10)
-    for raw in [part for part in urls.replace(_sep, " ").replace(",", " ").split() if part]:
-        parsed = urlsplit(raw)
-        host = (parsed.hostname or "").lower()
-        if parsed.scheme not in ("http", "https") or host not in IMAGE_HOSTS:
-            items.append({"url": raw, "error": "只支持酷安图片域名（image/avatar/static.coolapk.com）"})
-            continue
-        sig = hmac.new(secret.encode(), f"{raw}|{exp}".encode(), hashlib.sha256).hexdigest()[:32]
-        items.append(
-            {
-                "url": raw,
-                "link": f"{public_base}/img?u={quote(raw, safe='')}&exp={exp}&sig={sig}",
-                "expires_at": exp,
-            }
-        )
-    return json.dumps({"count": len(items), "ttl_minutes": ttl, "items": items}, ensure_ascii=False)
+    payload = build_image_links(urls, public_base, secret, ttl_minutes)
+    return json.dumps(payload, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -1618,6 +1597,7 @@ def _build_http_app():
 
 
 def main():
+    setup_logging()
     transport = os.environ.get("COOLAPK_MCP_TRANSPORT", "stdio").strip().lower()
     if transport in ("http", "streamable-http", "streamable_http"):
         _warn_login_state()

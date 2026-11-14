@@ -381,8 +381,10 @@ class CoolapkClient:
         # 运行指标：只统计不落盘，供 streamable-http 的 /status 观测
         self._started_at = time.monotonic()
         self._metrics: dict[str, Any] = {
-            "requests": 0, "retries": 0, "cache_hits": 0, "cache_misses": 0,
-            "shared": 0, "errors": {},
+            "calls": 0, "requests": 0, "retries": 0, "cache_hits": 0,
+            "cache_misses": 0, "shared": 0, "errors": {},
+            # 延迟按「逻辑调用」统计（含缓存命中与搭车），单位毫秒
+            "latency_ms_total": 0.0, "latency_ms_max": 0.0,
         }
         self._load_uid_index()
 
@@ -608,13 +610,20 @@ class CoolapkClient:
         return f"{self.config.uid}:{token8}:{self.config.device_code}:{path}?{norm}"
 
     async def _request(self, method: str, path: str, **kwargs) -> Any:
-        """统一入口：按错误 kind 记账后原样抛出（指标只给 /status 看，不影响语义）"""
+        """统一入口：按错误 kind 与耗时记账后原样抛出（指标只给 /status 看，不影响语义）"""
+        started = time.monotonic()
+        self._metrics["calls"] += 1
         try:
             return await self._request_inner(method, path, **kwargs)
         except CoolapkError as exc:
             errors = self._metrics["errors"]
             errors[exc.kind] = errors.get(exc.kind, 0) + 1
             raise
+        finally:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            self._metrics["latency_ms_total"] += elapsed_ms
+            if elapsed_ms > self._metrics["latency_ms_max"]:
+                self._metrics["latency_ms_max"] = elapsed_ms
 
     async def _request_inner(self, method: str, path: str, **kwargs) -> Any:
         """统一请求方法：本地登录预检 → GET 缓存 → 单飞合并 → 限速/重试 → 错误分类
@@ -1980,8 +1989,16 @@ class CoolapkClient:
 
     def metrics(self) -> dict:
         """请求统计（供 /status）：累计请求/重试/缓存/单飞搭车与按 kind 的错误分布"""
+        calls = self._metrics["calls"]
+        total_ms = self._metrics["latency_ms_total"]
         return {
             "uptime_s": round(time.monotonic() - self._started_at, 1),
+            "calls": calls,
+            "latency_ms": {
+                "total": round(total_ms, 1),
+                "max": round(self._metrics["latency_ms_max"], 1),
+                "avg": round(total_ms / calls, 1) if calls else 0.0,
+            },
             "requests": self._metrics["requests"],
             "retries": self._metrics["retries"],
             "cache_hits": self._metrics["cache_hits"],
